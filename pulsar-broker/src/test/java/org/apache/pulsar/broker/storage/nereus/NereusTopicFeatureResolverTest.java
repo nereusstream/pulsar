@@ -22,17 +22,26 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatCode;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.when;
+import io.netty.buffer.ByteBuf;
+import io.netty.buffer.Unpooled;
+import java.nio.charset.StandardCharsets;
 import java.util.List;
 import java.util.Optional;
 import java.util.Set;
 import org.apache.bookkeeper.mledger.ManagedLedgerConfig;
 import org.apache.bookkeeper.mledger.intercept.ManagedLedgerInterceptor;
 import org.apache.pulsar.broker.ServiceConfiguration;
+import org.apache.pulsar.broker.service.Producer;
+import org.apache.pulsar.common.api.proto.CommandSubscribe.SubType;
+import org.apache.pulsar.common.api.proto.MarkerType;
+import org.apache.pulsar.common.api.proto.MessageMetadata;
 import org.apache.pulsar.common.naming.TopicName;
 import org.apache.pulsar.common.policies.data.BacklogQuota;
 import org.apache.pulsar.common.policies.data.BacklogQuota.BacklogQuotaType;
 import org.apache.pulsar.common.policies.data.Policies;
 import org.apache.pulsar.common.policies.data.TopicPolicies;
+import org.apache.pulsar.common.protocol.Commands;
 import org.testng.annotations.DataProvider;
 import org.testng.annotations.Test;
 
@@ -143,6 +152,79 @@ public class NereusTopicFeatureResolverTest {
                 .hasMessage("NEREUS_UNSUPPORTED_TOPIC_FEATURE:AUTO_SKIP_NON_RECOVERABLE_DATA");
     }
 
+    @Test
+    public void validatesPublishMetadataWithoutChangingBufferState() throws Exception {
+        NereusTopicFeatureValidator validator = new NereusTopicFeatureValidator();
+        ByteBuf ordinary = entry(new MessageMetadata()
+                .setProducerName("producer")
+                .setSequenceId(1)
+                .setPublishTime(10));
+        int readerIndex = ordinary.readerIndex();
+        int writerIndex = ordinary.writerIndex();
+        int referenceCount = ordinary.refCnt();
+        try {
+            validator.validatePublish(ordinary, false);
+            assertThat(ordinary.readerIndex()).isEqualTo(readerIndex);
+            assertThat(ordinary.writerIndex()).isEqualTo(writerIndex);
+            assertThat(ordinary.refCnt()).isEqualTo(referenceCount);
+        } finally {
+            ordinary.release();
+        }
+
+        ByteBuf delayed = entry(new MessageMetadata()
+                .setProducerName("producer")
+                .setSequenceId(2)
+                .setPublishTime(10)
+                .setDeliverAtTime(11));
+        try {
+            assertThatThrownBy(() -> validator.validatePublish(delayed, false))
+                    .hasMessage("NEREUS_UNSUPPORTED_PUBLISH:DELAYED_DELIVERY");
+            assertThat(delayed.readerIndex()).isZero();
+        } finally {
+            delayed.release();
+        }
+
+        ByteBuf marker = entry(new MessageMetadata()
+                .setProducerName("producer")
+                .setSequenceId(3)
+                .setPublishTime(10)
+                .setMarkerType(MarkerType.TXN_ABORT_VALUE));
+        try {
+            assertThatThrownBy(() -> validator.validatePublish(marker, false))
+                    .hasMessage("NEREUS_UNSUPPORTED_PUBLISH:MARKER");
+        } finally {
+            marker.release();
+        }
+    }
+
+    @Test
+    public void rejectsTransactionalPublishRemoteProducerAndUnsafeSubscriptions() {
+        NereusTopicFeatureValidator validator = new NereusTopicFeatureValidator();
+        ByteBuf invalidButTransactional = Unpooled.wrappedBuffer(new byte[] {1});
+        try {
+            assertThatThrownBy(() -> validator.validatePublish(invalidButTransactional, true))
+                    .hasMessage("NEREUS_UNSUPPORTED_PUBLISH:TRANSACTIONAL");
+        } finally {
+            invalidButTransactional.release();
+        }
+
+        Producer remote = mock(Producer.class);
+        when(remote.isRemote()).thenReturn(true);
+        assertThatThrownBy(() -> validator.validateProducer(remote))
+                .hasMessage("NEREUS_UNSUPPORTED_PRODUCER:REMOTE_REPLICATION");
+        assertThatThrownBy(() -> validator.validateSubscribe(
+                SubType.Shared, false, false, false, null))
+                .hasMessage("NEREUS_UNSUPPORTED_SUBSCRIPTION:SUBSCRIPTION_TYPE");
+        assertThatThrownBy(() -> validator.validateSubscribe(
+                SubType.Exclusive, true, false, false, null))
+                .hasMessage("NEREUS_UNSUPPORTED_SUBSCRIPTION:DURABLE");
+        assertThatThrownBy(() -> validator.validateExistingDurableCursors(true))
+                .hasMessage("NEREUS_UNSUPPORTED_SUBSCRIPTION:EXISTING_DURABLE_CURSOR");
+        assertThatCode(() -> validator.validateExistingDurableCursors(false)).doesNotThrowAnyException();
+        assertThatCode(() -> validator.validateSubscribe(
+                SubType.Failover, false, false, false, null)).doesNotThrowAnyException();
+    }
+
     private static NereusResolvedTopicFeatures safeFeatures() {
         return new NereusResolvedTopicFeatures(
                 Set.of(), false, 0, 0, 0, false, false, false, false, false, false);
@@ -174,5 +256,14 @@ public class NereusTopicFeatureResolverTest {
                     Set.of(), false, 0, 0, 0, false, false, false, false, true, false);
             default -> throw new IllegalArgumentException("unknown feature " + feature);
         };
+    }
+
+    private static ByteBuf entry(MessageMetadata metadata) {
+        ByteBuf payload = Unpooled.copiedBuffer("payload", StandardCharsets.UTF_8);
+        try {
+            return Commands.serializeMetadataAndPayload(Commands.ChecksumType.Crc32c, metadata, payload);
+        } finally {
+            payload.release();
+        }
     }
 }

@@ -29,6 +29,7 @@ import static org.apache.pulsar.compaction.Compactor.COMPACTION_SUBSCRIPTION;
 import com.carrotsearch.hppc.ObjectObjectHashMap;
 import com.carrotsearch.hppc.cursors.ObjectObjectCursor;
 import com.google.common.annotations.VisibleForTesting;
+import com.nereusstream.managedledger.NereusManagedLedger;
 import io.github.merlimat.slog.Logger;
 import io.netty.buffer.ByteBuf;
 import io.netty.util.concurrent.FastThreadLocal;
@@ -142,6 +143,9 @@ import org.apache.pulsar.broker.service.schema.exceptions.NotExistSchemaExceptio
 import org.apache.pulsar.broker.stats.ClusterReplicationMetrics;
 import org.apache.pulsar.broker.stats.NamespaceStats;
 import org.apache.pulsar.broker.stats.ReplicationMetrics;
+import org.apache.pulsar.broker.storage.nereus.NereusResolvedTopicFeatures;
+import org.apache.pulsar.broker.storage.nereus.NereusTopicFeatureValidator;
+import org.apache.pulsar.broker.storage.nereus.NereusTopicOpenContext;
 import org.apache.pulsar.broker.transaction.buffer.TransactionBuffer;
 import org.apache.pulsar.broker.transaction.buffer.impl.TopicTransactionBuffer;
 import org.apache.pulsar.broker.transaction.buffer.impl.TransactionBufferDisable;
@@ -212,10 +216,13 @@ import org.jspecify.annotations.NonNull;
 public class PersistentTopic extends AbstractTopic implements Topic, AddEntryCallback {
 
     private static final Logger LOG = Logger.get(PersistentTopic.class);
+    private static final NereusTopicFeatureValidator NEREUS_FEATURE_VALIDATOR = new NereusTopicFeatureValidator();
     protected final Logger log;
 
     // Managed ledger associated with the topic
     protected final ManagedLedger ledger;
+    private final boolean nereusManagedLedger;
+    private volatile NereusResolvedTopicFeatures nereusFeatures;
 
     // Subscriptions to this topic
     private final Map<String, PersistentSubscription> subscriptions = new ConcurrentHashMap<>();
@@ -417,6 +424,7 @@ public class PersistentTopic extends AbstractTopic implements Topic, AddEntryCal
                 ? brokerService.getTopicOrderedExecutor().chooseThread(topic)
                 : null;
         this.ledger = ledger;
+        this.nereusManagedLedger = ledger instanceof NereusManagedLedger;
         this.backloggedCursorThresholdEntries =
                 brokerService.pulsar().getConfiguration().getManagedLedgerCursorBackloggedThreshold();
         this.messageDeduplication = new MessageDeduplication(brokerService.pulsar(), this, ledger);
@@ -425,7 +433,8 @@ public class PersistentTopic extends AbstractTopic implements Topic, AddEntryCal
         }
 
         TopicName topicName = TopicName.get(topic);
-        if (brokerService.getPulsar().getConfiguration().isTransactionCoordinatorEnabled()
+        if (!nereusManagedLedger
+                && brokerService.getPulsar().getConfiguration().isTransactionCoordinatorEnabled()
                 && !isEventSystemTopic(topicName)
                 && !SystemTopicNames.isTransactionInternalName(topicName)
                 && !SystemTopicNames.isTransactionBufferOrPendingAckSystemTopicName(topicName)
@@ -454,11 +463,12 @@ public class PersistentTopic extends AbstractTopic implements Topic, AddEntryCal
                 ? brokerService.getTopicOrderedExecutor().chooseThread(topic)
                 : null;
         this.ledger = ledger;
+        this.nereusManagedLedger = ledger instanceof NereusManagedLedger;
         this.messageDeduplication = messageDeduplication;
         this.backloggedCursorThresholdEntries =
                 brokerService.pulsar().getConfiguration().getManagedLedgerCursorBackloggedThreshold();
 
-        if (brokerService.pulsar().getConfiguration().isTransactionCoordinatorEnabled()) {
+        if (!nereusManagedLedger && brokerService.pulsar().getConfiguration().isTransactionCoordinatorEnabled()) {
             this.transactionBuffer = brokerService.getPulsar()
                     .getTransactionBufferProvider().newTransactionBuffer(this);
         } else {
@@ -467,8 +477,28 @@ public class PersistentTopic extends AbstractTopic implements Topic, AddEntryCal
         shadowSourceTopic = null;
     }
 
+    public synchronized void installNereusTopicOpenContext(NereusTopicOpenContext openContext) {
+        java.util.Objects.requireNonNull(openContext, "openContext");
+        if (!nereusManagedLedger) {
+            throw new IllegalStateException("Nereus topic context cannot be installed on a BookKeeper topic");
+        }
+        if (nereusFeatures != null) {
+            throw new IllegalStateException("Nereus topic context is already installed");
+        }
+        nereusFeatures = openContext.features();
+    }
+
     @Override
     public CompletableFuture<Void> initialize() {
+        if (nereusManagedLedger) {
+            try {
+                requireNereusAdmissionContext();
+                NEREUS_FEATURE_VALIDATOR.validateExistingDurableCursors(
+                        ledger.getCursors().iterator().hasNext());
+            } catch (NotAllowedException error) {
+                return FutureUtil.failedFuture(error);
+            }
+        }
         List<CompletableFuture<Void>> futures = new ArrayList<>();
         futures.add(brokerService.getPulsar().newTopicCompactionService(topic).thenAccept(service -> {
             PersistentTopic.this.topicCompactionService = service;
@@ -646,6 +676,15 @@ public class PersistentTopic extends AbstractTopic implements Topic, AddEntryCal
 
     @Override
     public void publishMessage(ByteBuf headersAndPayload, PublishContext publishContext) {
+        if (nereusManagedLedger) {
+            try {
+                requireNereusAdmissionContext();
+                NEREUS_FEATURE_VALIDATOR.validatePublish(headersAndPayload, false);
+            } catch (NotAllowedException error) {
+                publishContext.completed(error, -1, -1);
+                return;
+            }
+        }
         pendingWriteOps.incrementAndGet();
         if (isFenced) {
             publishContext.completed(new TopicFencedException("fenced"), -1, -1);
@@ -842,6 +881,14 @@ public class PersistentTopic extends AbstractTopic implements Topic, AddEntryCal
     @Override
     public CompletableFuture<Optional<Long>> addProducer(Producer producer,
             CompletableFuture<Void> producerQueuedFuture) {
+        if (nereusManagedLedger) {
+            try {
+                requireNereusAdmissionContext();
+                NEREUS_FEATURE_VALIDATOR.validateProducer(producer);
+            } catch (NotAllowedException error) {
+                return FutureUtil.failedFuture(error);
+            }
+        }
         return super.addProducer(producer, producerQueuedFuture).thenCompose(topicEpoch -> {
             messageDeduplication.producerAdded(producer.getProducerName());
             return CompletableFuture.completedFuture(topicEpoch);
@@ -924,6 +971,19 @@ public class PersistentTopic extends AbstractTopic implements Topic, AddEntryCal
                                                           Map<String, String> subscriptionProperties,
                                                           long consumerEpoch,
                                                           SchemaType schemaType) {
+        if (nereusManagedLedger) {
+            try {
+                requireNereusAdmissionContext();
+                NEREUS_FEATURE_VALIDATOR.validateSubscribe(
+                        subType,
+                        isDurable,
+                        readCompacted,
+                        Boolean.TRUE.equals(replicatedSubscriptionStateArg),
+                        keySharedMeta);
+            } catch (NotAllowedException error) {
+                return FutureUtil.failedFuture(error);
+            }
+        }
         if (readCompacted && !(subType == SubType.Failover || subType == SubType.Exclusive)) {
             return FutureUtil.failedFuture(new NotAllowedException(
                     "readCompacted only allowed on failover or exclusive subscriptions"));
@@ -1292,6 +1352,14 @@ public class PersistentTopic extends AbstractTopic implements Topic, AddEntryCal
     public CompletableFuture<Subscription> createSubscription(String subscriptionName, InitialPosition initialPosition,
                                                               boolean replicateSubscriptionState,
                                                               Map<String, String> subscriptionProperties) {
+        if (nereusManagedLedger) {
+            try {
+                requireNereusAdmissionContext();
+                NEREUS_FEATURE_VALIDATOR.validateCreateSubscription();
+            } catch (NotAllowedException error) {
+                return FutureUtil.failedFuture(error);
+            }
+        }
         return getDurableSubscription(subscriptionName, initialPosition,
                 0 /*avoid reseting cursor*/, replicateSubscriptionState, subscriptionProperties);
     }
@@ -4748,6 +4816,15 @@ public class PersistentTopic extends AbstractTopic implements Topic, AddEntryCal
 
     @Override
     public void publishTxnMessage(TxnID txnID, ByteBuf headersAndPayload, PublishContext publishContext) {
+        if (nereusManagedLedger) {
+            try {
+                requireNereusAdmissionContext();
+                NEREUS_FEATURE_VALIDATOR.validatePublish(headersAndPayload, true);
+            } catch (NotAllowedException error) {
+                publishContext.completed(error, -1, -1);
+                return;
+            }
+        }
         pendingWriteOps.incrementAndGet();
 
         if (isFenced) {
@@ -4811,6 +4888,14 @@ public class PersistentTopic extends AbstractTopic implements Topic, AddEntryCal
 
     @Override
     public CompletableFuture<Void> endTxn(TxnID txnID, int txnAction, long lowWaterMark) {
+        if (nereusManagedLedger) {
+            try {
+                requireNereusAdmissionContext();
+                NEREUS_FEATURE_VALIDATOR.validateEndTransaction();
+            } catch (NotAllowedException error) {
+                return FutureUtil.failedFuture(error);
+            }
+        }
         if (TxnAction.COMMIT_VALUE == txnAction) {
             return transactionBuffer.commitTxn(txnID, lowWaterMark);
         } else if (TxnAction.ABORT_VALUE == txnAction) {
@@ -4827,6 +4912,12 @@ public class PersistentTopic extends AbstractTopic implements Topic, AddEntryCal
 
     public long getDelayedDeliveryTickTimeMillis() {
         return topicPolicies.getDelayedDeliveryTickTimeMillis().get();
+    }
+
+    private void requireNereusAdmissionContext() throws NotAllowedException {
+        if (nereusFeatures == null) {
+            throw new NotAllowedException("NEREUS_TOPIC_ADMISSION_NOT_READY");
+        }
     }
 
     public boolean isDelayedDeliveryEnabled() {
