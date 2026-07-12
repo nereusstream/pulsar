@@ -66,6 +66,7 @@ import org.apache.pulsar.broker.service.Topic;
 import org.apache.pulsar.broker.service.persistent.PersistentReplicator;
 import org.apache.pulsar.broker.service.persistent.PersistentTopic;
 import org.apache.pulsar.broker.service.scalable.AutoScaleConfig;
+import org.apache.pulsar.broker.storage.nereus.NereusAdminOperation;
 import org.apache.pulsar.broker.topiclistlimit.TopicListMemoryLimiter;
 import org.apache.pulsar.broker.topiclistlimit.TopicListSizeResultCache;
 import org.apache.pulsar.broker.web.RestException;
@@ -2319,9 +2320,11 @@ public abstract class NamespacesBase extends AdminResource {
                                     if (!(loaded instanceof PersistentTopic persistentTopic)) {
                                         return CompletableFuture.completedFuture(null);
                                     }
-                                    return finalSubscription != null
-                                            ? persistentTopic.clearBacklog(finalSubscription)
-                                            : persistentTopic.clearBacklog();
+                                    return persistentTopic
+                                            .validateNereusAdminOperation(NereusAdminOperation.CLEAR_BACKLOG)
+                                            .thenCompose(__ -> finalSubscription != null
+                                                    ? persistentTopic.clearBacklog(finalSubscription)
+                                                    : persistentTopic.clearBacklog());
                                 }));
                     }
 
@@ -2355,11 +2358,18 @@ public abstract class NamespacesBase extends AdminResource {
                                         return CompletableFuture.completedFuture(null);
                                     }
                                     Topic loaded = optTopic.get();
-                                    Subscription sub = loaded.getSubscription(subscription);
-                                    if (sub == null) {
-                                        return CompletableFuture.completedFuture(null);
-                                    }
-                                    return sub.delete();
+                                    CompletableFuture<Void> admission =
+                                            loaded instanceof PersistentTopic persistentTopic
+                                            ? persistentTopic.validateNereusAdminOperation(
+                                                    NereusAdminOperation.DELETE_DURABLE_SUBSCRIPTION)
+                                            : CompletableFuture.completedFuture(null);
+                                    return admission.thenCompose(__ -> {
+                                        Subscription sub = loaded.getSubscription(subscription);
+                                        if (sub == null) {
+                                            return CompletableFuture.completedFuture(null);
+                                        }
+                                        return sub.delete();
+                                    });
                                 }));
                     }
                     return FutureUtil.waitForAll(futures);

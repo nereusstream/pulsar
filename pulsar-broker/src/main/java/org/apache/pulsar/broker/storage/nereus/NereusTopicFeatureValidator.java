@@ -114,6 +114,19 @@ public final class NereusTopicFeatureValidator {
         throw new NotAllowedException("NEREUS_UNSUPPORTED_TRANSACTION");
     }
 
+    public void validateAdminOperation(NereusAdminOperation operation) throws NotAllowedException {
+        java.util.Objects.requireNonNull(operation, "operation");
+        switch (operation) {
+            case TERMINATE_TOPIC, DELETE_TOPIC, UNLOAD_TOPIC -> {
+                return;
+            }
+            case DELETE_DURABLE_SUBSCRIPTION, CLEAR_BACKLOG, SKIP_MESSAGES, EXPIRE_MESSAGES, RESET_CURSOR,
+                    TRIGGER_COMPACTION, READ_COMPACTION_STATUS, TRIGGER_OFFLOAD, READ_OFFLOAD_STATUS, TRUNCATE_TOPIC,
+                    SET_SHADOW_TOPICS, MIGRATE_TOPIC -> throw new NotAllowedException(
+                            "NEREUS_UNSUPPORTED_ADMIN_OPERATION:" + operation.name());
+        }
+    }
+
     private static void reject(boolean rejected, String feature) throws NotAllowedException {
         if (rejected) {
             throw new NotAllowedException("NEREUS_UNSUPPORTED_TOPIC_FEATURE:" + feature);

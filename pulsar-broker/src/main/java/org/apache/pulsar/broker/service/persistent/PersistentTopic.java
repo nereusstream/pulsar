@@ -143,6 +143,7 @@ import org.apache.pulsar.broker.service.schema.exceptions.NotExistSchemaExceptio
 import org.apache.pulsar.broker.stats.ClusterReplicationMetrics;
 import org.apache.pulsar.broker.stats.NamespaceStats;
 import org.apache.pulsar.broker.stats.ReplicationMetrics;
+import org.apache.pulsar.broker.storage.nereus.NereusAdminOperation;
 import org.apache.pulsar.broker.storage.nereus.NereusResolvedTopicFeatures;
 import org.apache.pulsar.broker.storage.nereus.NereusTopicFeatureValidator;
 import org.apache.pulsar.broker.storage.nereus.NereusTopicOpenContext;
@@ -3452,6 +3453,10 @@ public class PersistentTopic extends AbstractTopic implements Topic, AddEntryCal
                 return CompletableFuture.<Void>completedFuture(null);
             }
 
+            if (nereusManagedLedger) {
+                return validateNereusAdminOperation(NereusAdminOperation.MIGRATE_TOPIC);
+            }
+
             if (isReplicated()) {
                 if (isReplicationBacklogExist()) {
                     if (!ledger.isMigrated()) {
@@ -4918,6 +4923,23 @@ public class PersistentTopic extends AbstractTopic implements Topic, AddEntryCal
         if (nereusFeatures == null) {
             throw new NotAllowedException("NEREUS_TOPIC_ADMISSION_NOT_READY");
         }
+    }
+
+    public CompletableFuture<Void> validateNereusAdminOperation(NereusAdminOperation operation) {
+        if (!nereusManagedLedger) {
+            return CompletableFuture.completedFuture(null);
+        }
+        try {
+            requireNereusAdmissionContext();
+            NEREUS_FEATURE_VALIDATOR.validateAdminOperation(operation);
+            return CompletableFuture.completedFuture(null);
+        } catch (NotAllowedException error) {
+            return FutureUtil.failedFuture(error);
+        }
+    }
+
+    public boolean isNereusManagedLedger() {
+        return nereusManagedLedger;
     }
 
     public boolean isDelayedDeliveryEnabled() {
