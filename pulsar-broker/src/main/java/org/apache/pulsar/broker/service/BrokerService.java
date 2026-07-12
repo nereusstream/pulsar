@@ -153,6 +153,7 @@ import org.apache.pulsar.broker.storage.nereus.NereusResolvedTopicFeatures;
 import org.apache.pulsar.broker.storage.nereus.NereusTopicFeatureResolver;
 import org.apache.pulsar.broker.storage.nereus.NereusTopicFeatureValidator;
 import org.apache.pulsar.broker.storage.nereus.NereusTopicOpenContext;
+import org.apache.pulsar.broker.storage.nereus.NereusTopicPolicySnapshot;
 import org.apache.pulsar.broker.storage.nereus.StorageClassBindingRecord;
 import org.apache.pulsar.broker.storage.nereus.StorageClassDeletePermit;
 import org.apache.pulsar.broker.storage.nereus.StorageClassOpenPermit;
@@ -2371,6 +2372,10 @@ public class BrokerService implements Closeable {
     }
 
     public CompletableFuture<NereusTopicOpenContext> getNereusTopicOpenContext(@NonNull TopicName topicName) {
+        return getNereusTopicPolicySnapshot(topicName).thenApply(NereusTopicPolicySnapshot::openContext);
+    }
+
+    public CompletableFuture<NereusTopicPolicySnapshot> getNereusTopicPolicySnapshot(@NonNull TopicName topicName) {
         if (topicName == null) {
             return FutureUtil.failedFuture(new NullPointerException("topicName"));
         }
@@ -2574,13 +2579,18 @@ public class BrokerService implements Closeable {
                     serviceConfig.isAcknowledgmentAtBatchIndexLevelEnabled());
             managedLedgerConfig.setNewEntriesCheckDelayInMillis(
                     serviceConfig.getManagedLedgerNewEntriesCheckDelayInMillis());
+            Policies namespacePolicies = policies.orElseGet(Policies::new);
             NereusResolvedTopicFeatures features = NereusTopicFeatureResolver.resolve(
                     serviceConfig,
-                    policies.orElseGet(Policies::new),
+                    namespacePolicies,
                     topicP,
                     globalTopicP,
                     topicName);
-            return new NereusTopicOpenContext(managedLedgerConfig, features);
+            return new NereusTopicPolicySnapshot(
+                    new NereusTopicOpenContext(managedLedgerConfig, features),
+                    namespacePolicies,
+                    topicP,
+                    globalTopicP);
         }).exceptionally(ex -> {
             final Throwable rc = FutureUtil.unwrapCompletionException(ex);
             log.error().attr("topic", topicName)
