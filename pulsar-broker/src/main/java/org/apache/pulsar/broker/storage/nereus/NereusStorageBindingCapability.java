@@ -1,0 +1,48 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+package org.apache.pulsar.broker.storage.nereus;
+
+import java.util.HashMap;
+import java.util.Map;
+import org.apache.pulsar.broker.ServiceConfiguration;
+
+/** Publishes the non-spoofable storage-binding protocol capability in broker lookup data. */
+public final class NereusStorageBindingCapability {
+    public static final String PROPERTY = "nereus.storage-binding-protocol";
+    public static final String VERSION = "1";
+
+    private NereusStorageBindingCapability() {
+    }
+
+    public static Map<String, String> lookupProperties(
+            ServiceConfiguration configuration, Map<String, String> configuredProperties) {
+        java.util.Objects.requireNonNull(configuration, "configuration");
+        java.util.Objects.requireNonNull(configuredProperties, "configuredProperties");
+        if (configuredProperties.containsKey(PROPERTY)) {
+            throw new IllegalArgumentException(PROPERTY + " is reserved by the broker");
+        }
+        Map<String, String> properties = new HashMap<>(configuredProperties);
+        if (configuration.isNereusEnabled()
+                && NereusManagedLedgerStorage.class.getName().equals(
+                        configuration.getManagedLedgerStorageClassName())) {
+            properties.put(PROPERTY, VERSION);
+        }
+        return Map.copyOf(properties);
+    }
+}
