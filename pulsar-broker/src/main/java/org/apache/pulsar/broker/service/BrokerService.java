@@ -29,6 +29,7 @@ import static org.apache.pulsar.common.naming.SystemTopicNames.isTransactionInte
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.collect.Queues;
 import com.google.common.util.concurrent.RateLimiter;
+import com.nereusstream.managedledger.NereusManagedLedger;
 import io.github.merlimat.slog.LoggerBuilder;
 import io.netty.bootstrap.ServerBootstrap;
 import io.netty.buffer.ByteBuf;
@@ -2228,6 +2229,9 @@ public class BrokerService implements Closeable {
                                 PersistentTopic persistentTopic = isSystemTopic(topic)
                                         ? new SystemTopic(topic, ledger, BrokerService.this)
                                         : newTopic(topic, ledger, BrokerService.this, PersistentTopic.class);
+                                if (ledger instanceof NereusManagedLedger) {
+                                    persistentTopic.installNereusTopicOpenContext(openContext);
+                                }
                                 persistentTopic.setCreateFuture(topicFuture);
                                 persistentTopic
                                         .initialize()

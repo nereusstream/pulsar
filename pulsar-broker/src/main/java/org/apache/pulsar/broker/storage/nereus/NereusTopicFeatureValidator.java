@@ -18,9 +18,15 @@
  */
 package org.apache.pulsar.broker.storage.nereus;
 
+import io.netty.buffer.ByteBuf;
 import org.apache.bookkeeper.mledger.ManagedLedgerConfig;
 import org.apache.pulsar.broker.service.BrokerServiceException.NotAllowedException;
+import org.apache.pulsar.broker.service.Producer;
+import org.apache.pulsar.common.api.proto.CommandSubscribe.SubType;
+import org.apache.pulsar.common.api.proto.KeySharedMeta;
+import org.apache.pulsar.common.api.proto.MessageMetadata;
 import org.apache.pulsar.common.naming.TopicName;
+import org.apache.pulsar.common.protocol.Commands;
 
 /** Closed F2 topic-open admission gate for the Nereus storage class. */
 public final class NereusTopicFeatureValidator {
@@ -47,9 +53,76 @@ public final class NereusTopicFeatureValidator {
         reject(config.getShadowSource() != null, "SHADOW_SOURCE");
     }
 
+    public void validateProducer(Producer producer) throws NotAllowedException {
+        java.util.Objects.requireNonNull(producer, "producer");
+        if (producer.isRemote()) {
+            throw new NotAllowedException("NEREUS_UNSUPPORTED_PRODUCER:REMOTE_REPLICATION");
+        }
+    }
+
+    public void validateSubscribe(
+            SubType type,
+            boolean durable,
+            boolean readCompacted,
+            boolean replicated,
+            KeySharedMeta keySharedMeta) throws NotAllowedException {
+        java.util.Objects.requireNonNull(type, "type");
+        rejectSubscription(durable, "DURABLE");
+        rejectSubscription(type != SubType.Exclusive && type != SubType.Failover, "SUBSCRIPTION_TYPE");
+        rejectSubscription(readCompacted, "READ_COMPACTED");
+        rejectSubscription(replicated, "REPLICATED");
+        rejectSubscription(keySharedMeta != null, "KEY_SHARED_META");
+    }
+
+    public void validateCreateSubscription() throws NotAllowedException {
+        throw new NotAllowedException("NEREUS_UNSUPPORTED_SUBSCRIPTION:DURABLE_CREATE");
+    }
+
+    public void validateExistingDurableCursors(boolean hasExistingDurableCursor) throws NotAllowedException {
+        rejectSubscription(hasExistingDurableCursor, "EXISTING_DURABLE_CURSOR");
+    }
+
+    public void validatePublish(ByteBuf entry, boolean transactional) throws NotAllowedException {
+        java.util.Objects.requireNonNull(entry, "entry");
+        if (transactional) {
+            throw new NotAllowedException("NEREUS_UNSUPPORTED_PUBLISH:TRANSACTIONAL");
+        }
+        int readerIndex = entry.readerIndex();
+        int writerIndex = entry.writerIndex();
+        int referenceCount = entry.refCnt();
+        try {
+            MessageMetadata metadata = Commands.parseMessageMetadata(entry);
+            if (metadata.hasMarkerType()) {
+                throw new NotAllowedException("NEREUS_UNSUPPORTED_PUBLISH:MARKER");
+            }
+            if (metadata.hasDeliverAtTime()) {
+                throw new NotAllowedException("NEREUS_UNSUPPORTED_PUBLISH:DELAYED_DELIVERY");
+            }
+        } catch (NotAllowedException error) {
+            throw error;
+        } catch (RuntimeException parseFailure) {
+            throw new NotAllowedException("NEREUS_UNSUPPORTED_PUBLISH:INVALID_METADATA");
+        } finally {
+            entry.setIndex(readerIndex, writerIndex);
+            if (entry.refCnt() != referenceCount) {
+                throw new IllegalStateException("message metadata validation changed ByteBuf reference count");
+            }
+        }
+    }
+
+    public void validateEndTransaction() throws NotAllowedException {
+        throw new NotAllowedException("NEREUS_UNSUPPORTED_TRANSACTION");
+    }
+
     private static void reject(boolean rejected, String feature) throws NotAllowedException {
         if (rejected) {
             throw new NotAllowedException("NEREUS_UNSUPPORTED_TOPIC_FEATURE:" + feature);
+        }
+    }
+
+    private static void rejectSubscription(boolean rejected, String reason) throws NotAllowedException {
+        if (rejected) {
+            throw new NotAllowedException("NEREUS_UNSUPPORTED_SUBSCRIPTION:" + reason);
         }
     }
 }
