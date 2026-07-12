@@ -148,6 +148,9 @@ import org.apache.pulsar.broker.storage.nereus.NereusAdminOperation;
 import org.apache.pulsar.broker.storage.nereus.NereusResolvedTopicFeatures;
 import org.apache.pulsar.broker.storage.nereus.NereusTopicFeatureValidator;
 import org.apache.pulsar.broker.storage.nereus.NereusTopicOpenContext;
+import org.apache.pulsar.broker.storage.nereus.NereusTopicPolicySnapshot;
+import org.apache.pulsar.broker.storage.nereus.NereusTopicPolicyUpdateCoordinator;
+import org.apache.pulsar.broker.storage.nereus.StorageClassBindingRecord;
 import org.apache.pulsar.broker.transaction.buffer.TransactionBuffer;
 import org.apache.pulsar.broker.transaction.buffer.impl.TopicTransactionBuffer;
 import org.apache.pulsar.broker.transaction.buffer.impl.TransactionBufferDisable;
@@ -224,7 +227,10 @@ public class PersistentTopic extends AbstractTopic implements Topic, AddEntryCal
     // Managed ledger associated with the topic
     protected final ManagedLedger ledger;
     private final boolean nereusManagedLedger;
+    private final NereusTopicPolicyUpdateCoordinator nereusPolicyUpdateCoordinator =
+            new NereusTopicPolicyUpdateCoordinator();
     private volatile NereusResolvedTopicFeatures nereusFeatures;
+    private volatile boolean nereusPolicyAdmissionFailed;
 
     // Subscriptions to this topic
     private final Map<String, PersistentSubscription> subscriptions = new ConcurrentHashMap<>();
@@ -490,6 +496,7 @@ public class PersistentTopic extends AbstractTopic implements Topic, AddEntryCal
 
     @Override
     public CompletableFuture<Void> initialize() {
+        CompletableFuture<Void> policyReady = CompletableFuture.completedFuture(null);
         if (nereusManagedLedger) {
             try {
                 requireNereusAdmissionContext();
@@ -498,12 +505,15 @@ public class PersistentTopic extends AbstractTopic implements Topic, AddEntryCal
             } catch (NotAllowedException error) {
                 return FutureUtil.failedFuture(error);
             }
+            policyReady = refreshNereusPolicies();
         }
         List<CompletableFuture<Void>> futures = new ArrayList<>();
-        futures.add(brokerService.getPulsar().newTopicCompactionService(topic).thenAccept(service -> {
-            PersistentTopic.this.topicCompactionService = service;
-            this.createPersistentSubscriptions();
-        }));
+        futures.add(policyReady
+                .thenCompose(__ -> brokerService.getPulsar().newTopicCompactionService(topic))
+                .thenAccept(service -> {
+                    PersistentTopic.this.topicCompactionService = service;
+                    this.createPersistentSubscriptions();
+                }));
 
         return FutureUtil.waitForAll(futures).thenCompose(__ ->
             brokerService.pulsar().getPulsarResources().getNamespaceResources()
@@ -3917,6 +3927,9 @@ public class PersistentTopic extends AbstractTopic implements Topic, AddEntryCal
     }
 
     public CompletableFuture<Void> onLocalPoliciesUpdate() {
+        if (nereusManagedLedger) {
+            return refreshNereusPolicies();
+        }
         return checkPersistencePolicies();
     }
 
@@ -3929,6 +3942,9 @@ public class PersistentTopic extends AbstractTopic implements Topic, AddEntryCal
     @Override
     public CompletableFuture<Void> onPoliciesUpdate(@NonNull Policies data) {
         requireNonNull(data);
+        if (nereusManagedLedger) {
+            return refreshNereusPolicies();
+        }
         log.debug()
                 .attr("isEncryptionRequired", isEncryptionRequired)
                 .attr("encryption_required", data.encryption_required)
@@ -3967,6 +3983,10 @@ public class PersistentTopic extends AbstractTopic implements Topic, AddEntryCal
     }
 
     private List<CompletableFuture<Void>> applyUpdatedTopicPolicies() {
+        return applyUpdatedTopicPolicies(true);
+    }
+
+    private List<CompletableFuture<Void>> applyUpdatedTopicPolicies(boolean applyPersistencePolicy) {
         List<CompletableFuture<Void>> applyPoliciesFutureList = new ArrayList<>();
 
         // Client permission check.
@@ -3992,7 +4012,9 @@ public class PersistentTopic extends AbstractTopic implements Topic, AddEntryCal
         // Other components.
         applyPoliciesFutureList.add(FutureUtil.runWithCurrentThread(() -> checkReplicationAndRetryOnFailure()));
         applyPoliciesFutureList.add(FutureUtil.runWithCurrentThread(() -> checkDeduplicationStatus()));
-        applyPoliciesFutureList.add(FutureUtil.runWithCurrentThread(() -> checkPersistencePolicies()));
+        if (applyPersistencePolicy) {
+            applyPoliciesFutureList.add(FutureUtil.runWithCurrentThread(() -> checkPersistencePolicies()));
+        }
         applyPoliciesFutureList.add(FutureUtil.runWithCurrentThread(
                 () -> preCreateSubscriptionForCompactionIfNeeded()));
         applyPoliciesFutureList.add(FutureUtil.runWithCurrentThread(
@@ -4967,9 +4989,70 @@ public class PersistentTopic extends AbstractTopic implements Topic, AddEntryCal
     }
 
     private void requireNereusAdmissionContext() throws NotAllowedException {
+        if (nereusPolicyAdmissionFailed) {
+            throw new NotAllowedException("NEREUS_TOPIC_POLICY_ADMISSION_FAILED");
+        }
         if (nereusFeatures == null) {
             throw new NotAllowedException("NEREUS_TOPIC_ADMISSION_NOT_READY");
         }
+    }
+
+    private CompletableFuture<Void> refreshNereusPolicies() {
+        TopicName topicName = TopicName.get(topic);
+        return nereusPolicyUpdateCoordinator.refresh(
+                        () -> brokerService.getNereusTopicPolicySnapshot(topicName),
+                        getPoliciesNotifyThread(),
+                        snapshot -> {
+                            applyNereusPolicySnapshot(snapshot);
+                            return FutureUtil.waitForAll(applyUpdatedTopicPolicies(false));
+                        })
+                .exceptionallyCompose(error -> {
+                    Throwable cause = FutureUtil.unwrapCompletionException(error);
+                    nereusPolicyAdmissionFailed = true;
+                    close().exceptionally(closeError -> {
+                        log.error()
+                                .exception(FutureUtil.unwrapCompletionException(closeError))
+                                .log("Failed to close topic after Nereus policy rejection");
+                        return null;
+                    });
+                    return FutureUtil.failedFuture(cause);
+                });
+    }
+
+    @VisibleForTesting
+    void applyNereusPolicySnapshot(NereusTopicPolicySnapshot snapshot) {
+        NereusTopicOpenContext openContext = snapshot.openContext();
+        try {
+            if (!StorageClassBindingRecord.NEREUS.equals(
+                    openContext.managedLedgerConfig().getStorageClassName())) {
+                throw new NotAllowedException("NEREUS_STORAGE_CLASS_CHANGE_NOT_SUPPORTED");
+            }
+            NEREUS_FEATURE_VALIDATOR.validateTopicOpen(
+                    TopicName.get(topic), openContext.managedLedgerConfig(), openContext.features());
+        } catch (NotAllowedException error) {
+            throw new CompletionException(error);
+        }
+
+        TopicPolicies emptyLocal = new TopicPolicies();
+        emptyLocal.setIsGlobal(false);
+        updateTopicPolicy(emptyLocal);
+        TopicPolicies emptyGlobal = new TopicPolicies();
+        emptyGlobal.setIsGlobal(true);
+        updateTopicPolicy(emptyGlobal);
+        updateTopicPolicyByNamespacePolicy(snapshot.namespacePolicies());
+        snapshot.globalPolicies().ifPresent(this::updateTopicPolicy);
+        snapshot.localPolicies().ifPresent(this::updateTopicPolicy);
+
+        ledger.setConfig(openContext.managedLedgerConfig());
+        nereusFeatures = openContext.features();
+        nereusPolicyAdmissionFailed = false;
+        shadowTopics = Collections.emptyList();
+        isEncryptionRequired = snapshot.namespacePolicies().encryption_required;
+        isAllowAutoUpdateSchema = snapshot.namespacePolicies().is_allow_auto_update_schema;
+        isAllowAutoUpdateSchemaWithReplicator =
+                snapshot.namespacePolicies().is_allow_auto_update_schema_with_replicator;
+        checkReplicatedSubscriptionControllerState();
+        updateResourceGroupLimiter(snapshot.namespacePolicies());
     }
 
     public CompletableFuture<Void> validateNereusAdminOperation(NereusAdminOperation operation) {
@@ -5023,6 +5106,15 @@ public class PersistentTopic extends AbstractTopic implements Topic, AddEntryCal
     @Override
     public void onUpdate(TopicPolicies policies) {
         log.debug().attr("policies", policies).log("Update topic policies");
+        if (nereusManagedLedger) {
+            refreshNereusPolicies().exceptionally(error -> {
+                log.error()
+                        .exception(FutureUtil.unwrapCompletionException(error))
+                        .log("Nereus topic-policy refresh failed");
+                return null;
+            });
+            return;
+        }
         if (policies == null) {
             return;
         }

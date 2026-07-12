@@ -20,7 +20,10 @@ package org.apache.pulsar.broker.service.persistent;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 import com.nereusstream.managedledger.NereusManagedLedger;
 import java.util.Set;
@@ -34,6 +37,8 @@ import org.apache.pulsar.broker.service.BrokerService;
 import org.apache.pulsar.broker.storage.nereus.NereusAdminOperation;
 import org.apache.pulsar.broker.storage.nereus.NereusResolvedTopicFeatures;
 import org.apache.pulsar.broker.storage.nereus.NereusTopicOpenContext;
+import org.apache.pulsar.broker.storage.nereus.NereusTopicPolicySnapshot;
+import org.apache.pulsar.common.policies.data.Policies;
 import org.testng.annotations.Test;
 
 public class PersistentTopicNereusAdmissionTest {
@@ -65,6 +70,32 @@ public class PersistentTopicNereusAdmissionTest {
         bookKeeperTopic.validateNereusAdminOperation(NereusAdminOperation.TRUNCATE_TOPIC).get();
     }
 
+    @Test
+    public void rejectsUnsafeLiveSnapshotBeforeLedgerConfigMutation() {
+        BrokerService brokerService = brokerService();
+        NereusManagedLedger ledger = mock(NereusManagedLedger.class);
+        PersistentTopic topic = new PersistentTopic(
+                "persistent://tenant/ns/nereus-policy",
+                brokerService,
+                ledger,
+                mock(MessageDeduplication.class));
+        topic.installNereusTopicOpenContext(new NereusTopicOpenContext(
+                new ManagedLedgerConfig(),
+                safeFeatures()));
+        ManagedLedgerConfig unsafeConfig = new ManagedLedgerConfig();
+        unsafeConfig.setStorageClassName("nereus");
+        NereusResolvedTopicFeatures unsafeFeatures = new NereusResolvedTopicFeatures(
+                Set.of(), false, 1, 0, 0, false, false, false, false, false, false);
+
+        assertThatThrownBy(() -> topic.applyNereusPolicySnapshot(new NereusTopicPolicySnapshot(
+                new NereusTopicOpenContext(unsafeConfig, unsafeFeatures),
+                new Policies(),
+                java.util.Optional.empty(),
+                java.util.Optional.empty())))
+                .hasRootCauseMessage("NEREUS_UNSUPPORTED_TOPIC_FEATURE:MESSAGE_TTL");
+        verify(ledger, never()).setConfig(any());
+    }
+
     private static BrokerService brokerService() {
         BrokerService brokerService = mock(BrokerService.class);
         PulsarService pulsar = mock(PulsarService.class);
@@ -74,5 +105,10 @@ public class PersistentTopicNereusAdmissionTest {
         when(pulsar.getConfiguration()).thenReturn(new ServiceConfiguration());
         when(pulsar.getMonotonicClock()).thenReturn(AsyncTokenBucket.DEFAULT_SNAPSHOT_CLOCK);
         return brokerService;
+    }
+
+    private static NereusResolvedTopicFeatures safeFeatures() {
+        return new NereusResolvedTopicFeatures(
+                Set.of(), false, 0, 0, 0, false, false, false, false, false, false);
     }
 }

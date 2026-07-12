@@ -26,9 +26,11 @@ import static org.mockito.Mockito.when;
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.Unpooled;
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.CompletableFuture;
 import org.apache.bookkeeper.mledger.ManagedLedgerConfig;
 import org.apache.bookkeeper.mledger.intercept.ManagedLedgerInterceptor;
 import org.apache.pulsar.broker.ServiceConfiguration;
@@ -245,9 +247,82 @@ public class NereusTopicFeatureResolverTest {
         }
     }
 
+    @Test
+    public void dropsStalePolicyRefreshCompletion() {
+        NereusTopicPolicyUpdateCoordinator coordinator = new NereusTopicPolicyUpdateCoordinator();
+        CompletableFuture<NereusTopicPolicySnapshot> firstLoad = new CompletableFuture<>();
+        CompletableFuture<NereusTopicPolicySnapshot> secondLoad = new CompletableFuture<>();
+        List<NereusTopicPolicySnapshot> applied = new ArrayList<>();
+
+        CompletableFuture<Void> first = coordinator.refresh(
+                () -> firstLoad, Runnable::run, snapshot -> {
+                    applied.add(snapshot);
+                    return CompletableFuture.completedFuture(null);
+                });
+        CompletableFuture<Void> second = coordinator.refresh(
+                () -> secondLoad, Runnable::run, snapshot -> {
+                    applied.add(snapshot);
+                    return CompletableFuture.completedFuture(null);
+                });
+        NereusTopicPolicySnapshot firstSnapshot = safePolicySnapshot();
+        NereusTopicPolicySnapshot secondSnapshot = safePolicySnapshot();
+        secondLoad.complete(secondSnapshot);
+        second.join();
+        firstLoad.complete(firstSnapshot);
+        first.join();
+
+        assertThat(applied).containsExactly(secondSnapshot);
+    }
+
+    @Test
+    public void stalePolicyRefreshWaitsForLatestFailure() {
+        NereusTopicPolicyUpdateCoordinator coordinator = new NereusTopicPolicyUpdateCoordinator();
+        CompletableFuture<NereusTopicPolicySnapshot> firstLoad = new CompletableFuture<>();
+        CompletableFuture<NereusTopicPolicySnapshot> secondLoad = new CompletableFuture<>();
+        CompletableFuture<Void> first = coordinator.refresh(
+                () -> firstLoad, Runnable::run, ignored -> CompletableFuture.completedFuture(null));
+        CompletableFuture<Void> second = coordinator.refresh(
+                () -> secondLoad, Runnable::run, ignored -> CompletableFuture.completedFuture(null));
+
+        firstLoad.complete(safePolicySnapshot());
+        assertThat(first).isNotDone();
+        secondLoad.completeExceptionally(new IllegalStateException("latest failed"));
+
+        assertThatThrownBy(first::join).hasRootCauseMessage("latest failed");
+        assertThatThrownBy(second::join).hasRootCauseMessage("latest failed");
+    }
+
+    @Test
+    public void stalePolicyRefreshFailureWaitsForLatestSuccess() {
+        NereusTopicPolicyUpdateCoordinator coordinator = new NereusTopicPolicyUpdateCoordinator();
+        CompletableFuture<NereusTopicPolicySnapshot> firstLoad = new CompletableFuture<>();
+        CompletableFuture<NereusTopicPolicySnapshot> secondLoad = new CompletableFuture<>();
+        CompletableFuture<Void> first = coordinator.refresh(
+                () -> firstLoad, Runnable::run, ignored -> CompletableFuture.completedFuture(null));
+        CompletableFuture<Void> second = coordinator.refresh(
+                () -> secondLoad, Runnable::run, ignored -> CompletableFuture.completedFuture(null));
+
+        firstLoad.completeExceptionally(new IllegalStateException("stale failed"));
+        assertThat(first).isNotDone();
+        secondLoad.complete(safePolicySnapshot());
+
+        first.join();
+        second.join();
+    }
+
     private static NereusResolvedTopicFeatures safeFeatures() {
         return new NereusResolvedTopicFeatures(
                 Set.of(), false, 0, 0, 0, false, false, false, false, false, false);
+    }
+
+    private static NereusTopicPolicySnapshot safePolicySnapshot() {
+        ManagedLedgerConfig config = new ManagedLedgerConfig();
+        config.setStorageClassName("nereus");
+        return new NereusTopicPolicySnapshot(
+                new NereusTopicOpenContext(config, safeFeatures()),
+                new Policies(),
+                Optional.empty(),
+                Optional.empty());
     }
 
     private static NereusResolvedTopicFeatures unsupported(String feature) {
