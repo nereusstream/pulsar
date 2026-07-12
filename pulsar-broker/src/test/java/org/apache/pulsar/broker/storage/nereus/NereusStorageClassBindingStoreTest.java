@@ -35,16 +35,19 @@ import org.apache.pulsar.metadata.api.extended.MetadataStoreExtended;
 import org.testng.annotations.Test;
 
 public class NereusStorageClassBindingStoreTest {
+    private static final String PERSISTENCE_NAME = "tenant/ns/persistent/topic";
+
     @Test
     public void refusesToClaimExistingBookKeeperStorage() {
         MetadataStoreExtended metadata = mock(MetadataStoreExtended.class);
         ManagedLedgerFactory bookkeeper = mock(ManagedLedgerFactory.class);
+        when(metadata.sync(anyString())).thenReturn(CompletableFuture.completedFuture(null));
         when(metadata.get(anyString())).thenReturn(CompletableFuture.completedFuture(Optional.empty()));
-        when(bookkeeper.asyncExists("tenant/ns/topic")).thenReturn(CompletableFuture.completedFuture(true));
+        when(bookkeeper.asyncExists(PERSISTENCE_NAME)).thenReturn(CompletableFuture.completedFuture(true));
         NereusStorageClassBindingStore store =
                 new NereusStorageClassBindingStore(metadata, bookkeeper, Duration.ofSeconds(1));
 
-        assertThatThrownBy(() -> store.creationGuard().acquire("tenant/ns/topic").join())
+        assertThatThrownBy(() -> store.creationGuard().acquire(PERSISTENCE_NAME).join())
                 .hasRootCauseInstanceOf(IllegalStateException.class)
                 .hasRootCauseMessage("existing BookKeeper storage cannot be opened as Nereus");
         verify(metadata, never()).put(anyString(), any(), any());
@@ -54,16 +57,17 @@ public class NereusStorageClassBindingStoreTest {
     public void claimsMissingStorageAtGenerationOne() {
         MetadataStoreExtended metadata = mock(MetadataStoreExtended.class);
         ManagedLedgerFactory bookkeeper = mock(ManagedLedgerFactory.class);
+        when(metadata.sync(anyString())).thenReturn(CompletableFuture.completedFuture(null));
         when(metadata.get(anyString())).thenReturn(CompletableFuture.completedFuture(Optional.empty()));
         when(metadata.put(anyString(), any(), any()))
                 .thenReturn(CompletableFuture.completedFuture(mock(Stat.class)));
-        when(bookkeeper.asyncExists("tenant/ns/topic")).thenReturn(CompletableFuture.completedFuture(false));
+        when(bookkeeper.asyncExists(PERSISTENCE_NAME)).thenReturn(CompletableFuture.completedFuture(false));
         NereusStorageClassBindingStore store =
                 new NereusStorageClassBindingStore(metadata, bookkeeper, Duration.ofSeconds(1));
 
-        var permit = store.creationGuard().acquire("tenant/ns/topic").join();
+        var permit = store.creationGuard().acquire(PERSISTENCE_NAME).join();
 
-        assertThat(permit.persistenceName()).isEqualTo("tenant/ns/topic");
+        assertThat(permit.persistenceName()).isEqualTo(PERSISTENCE_NAME);
         assertThat(permit.bindingGeneration()).isEqualTo(1);
     }
 }

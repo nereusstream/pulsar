@@ -18,32 +18,27 @@
  */
 package org.apache.pulsar.broker.storage.nereus;
 
-import com.nereusstream.api.keys.DeterministicIds;
 import com.nereusstream.managedledger.integration.NereusCreationGuard;
 import com.nereusstream.managedledger.integration.NereusCreationPermit;
-import java.nio.ByteBuffer;
-import java.nio.charset.CharacterCodingException;
-import java.nio.charset.CodingErrorAction;
-import java.nio.charset.StandardCharsets;
 import java.time.Duration;
-import java.util.Arrays;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import org.apache.bookkeeper.mledger.ManagedLedgerFactory;
+import org.apache.pulsar.common.naming.TopicName;
 import org.apache.pulsar.metadata.api.GetResult;
 import org.apache.pulsar.metadata.api.MetadataStoreException;
 import org.apache.pulsar.metadata.api.extended.MetadataStoreExtended;
 
 /** Single-key Nereus storage-class claim used before projection publication. */
 public final class NereusStorageClassBindingStore implements AutoCloseable {
-    private static final byte[] MAGIC = new byte[] {'N', 'S', 'B', '1'};
-    private static final String ROOT = "/managed-ledger-storage-bindings/v1/";
     private final MetadataStoreExtended metadataStore;
     private final ManagedLedgerFactory bookkeeperFactory;
     private final Duration timeout;
+    private final StorageClassBindingKeyspace keyspace = new StorageClassBindingKeyspace();
+    private final StorageClassBindingCodec codec = new StorageClassBindingCodec();
     private final AtomicBoolean closed = new AtomicBoolean();
 
     public NereusStorageClassBindingStore(
@@ -75,11 +70,17 @@ public final class NereusStorageClassBindingStore implements AutoCloseable {
         if (closed.get()) {
             return CompletableFuture.failedFuture(new IllegalStateException("Nereus binding store is closed"));
         }
-        String path = path(persistenceName);
-        byte[] candidate = encode(persistenceName, 1);
-        CompletableFuture<NereusCreationPermit> operation = metadataStore.get(path).thenCompose(existing -> {
+        TopicName topicName = TopicName.get(TopicName.fromPersistenceNamingEncoding(persistenceName));
+        String path = keyspace.bindingKey(topicName.getNamespaceObject(), persistenceName);
+        StorageClassBindingRecord candidate = StorageClassBindingRecord.claimed(
+                persistenceName,
+                StorageClassBindingRecord.NEREUS,
+                1,
+                System.currentTimeMillis());
+        CompletableFuture<NereusCreationPermit> operation = metadataStore.sync(path)
+                .thenCompose(ignored -> metadataStore.get(path)).thenCompose(existing -> {
             if (existing.isPresent()) {
-                Binding binding = decode(existing.orElseThrow().getValue(), persistenceName);
+                StorageClassBindingRecord binding = decode(existing.orElseThrow(), persistenceName);
                 return CompletableFuture.completedFuture(permit(path, binding));
             }
             return bookkeeperFactory.asyncExists(persistenceName).thenCompose(bookkeeperExists -> {
@@ -87,8 +88,8 @@ public final class NereusStorageClassBindingStore implements AutoCloseable {
                     return CompletableFuture.failedFuture(new IllegalStateException(
                             "existing BookKeeper storage cannot be opened as Nereus"));
                 }
-                return metadataStore.put(path, candidate, Optional.of(-1L))
-                    .thenApply(ignored -> permit(path, new Binding(persistenceName, 1)))
+                return metadataStore.put(path, codec.encode(candidate), Optional.of(-1L))
+                    .thenApply(stat -> permit(path, candidate.withMetadataVersion(stat.getVersion())))
                     .exceptionallyCompose(failure -> {
                         if (!isBadVersion(failure)) {
                             return CompletableFuture.failedFuture(unwrap(failure));
@@ -96,7 +97,7 @@ public final class NereusStorageClassBindingStore implements AutoCloseable {
                         return metadataStore.get(path).thenApply(raced -> {
                             GetResult result = raced.orElseThrow(() ->
                                     new IllegalStateException("binding disappeared after create conflict"));
-                            return permit(path, decode(result.getValue(), persistenceName));
+                            return permit(path, decode(result, persistenceName));
                         });
                     });
             });
@@ -104,7 +105,8 @@ public final class NereusStorageClassBindingStore implements AutoCloseable {
         return operation.orTimeout(timeout.toNanos(), TimeUnit.NANOSECONDS);
     }
 
-    private NereusCreationPermit permit(String path, Binding binding) {
+    private NereusCreationPermit permit(String path, StorageClassBindingRecord binding) {
+        requireNereusOpenState(binding);
         return new NereusCreationPermit() {
             @Override
             public String persistenceName() {
@@ -113,7 +115,7 @@ public final class NereusStorageClassBindingStore implements AutoCloseable {
 
             @Override
             public long bindingGeneration() {
-                return binding.generation();
+                return binding.bindingGeneration();
             }
 
             @Override
@@ -122,7 +124,7 @@ public final class NereusStorageClassBindingStore implements AutoCloseable {
                     return CompletableFuture.failedFuture(
                             new IllegalStateException("Nereus binding store is closed"));
                 }
-                return metadataStore.get(path).thenCombine(
+                return metadataStore.sync(path).thenCompose(ignored -> metadataStore.get(path)).thenCombine(
                         bookkeeperFactory.asyncExists(binding.persistenceName()),
                         (current, bookkeeperExists) -> {
                     if (bookkeeperExists) {
@@ -131,7 +133,7 @@ public final class NereusStorageClassBindingStore implements AutoCloseable {
                     }
                     GetResult result = current.orElseThrow(() ->
                             new IllegalStateException("Nereus binding disappeared before projection publish"));
-                    Binding actual = decode(result.getValue(), binding.persistenceName());
+                    StorageClassBindingRecord actual = decode(result, binding.persistenceName());
                     if (!actual.equals(binding)) {
                         throw new IllegalStateException("Nereus binding changed before projection publish");
                     }
@@ -141,52 +143,21 @@ public final class NereusStorageClassBindingStore implements AutoCloseable {
         };
     }
 
-    private static String path(String persistenceName) {
-        return ROOT + DeterministicIds.stableHashComponent(
-                "pulsar-storage-binding-v1\0" + persistenceName);
-    }
-
-    private static byte[] encode(String persistenceName, long generation) {
-        byte[] name = persistenceName.getBytes(StandardCharsets.UTF_8);
-        ByteBuffer buffer = ByteBuffer.allocate(MAGIC.length + Long.BYTES + Integer.BYTES + name.length);
-        buffer.put(MAGIC).putLong(generation).putInt(name.length).put(name);
-        return buffer.array();
-    }
-
-    private static Binding decode(byte[] bytes, String expectedName) {
-        try {
-            ByteBuffer buffer = ByteBuffer.wrap(bytes).asReadOnlyBuffer();
-            byte[] magic = new byte[MAGIC.length];
-            buffer.get(magic);
-            if (!Arrays.equals(magic, MAGIC)) {
-                throw new IllegalArgumentException("invalid Nereus binding magic");
-            }
-            long generation = buffer.getLong();
-            int length = buffer.getInt();
-            if (generation <= 0 || length < 0 || length != buffer.remaining()) {
-                throw new IllegalArgumentException("invalid Nereus binding fields");
-            }
-            byte[] name = new byte[length];
-            buffer.get(name);
-            String persistenceName = strictUtf8(name);
-            if (!persistenceName.equals(expectedName)) {
-                throw new IllegalStateException("Nereus binding hash collision");
-            }
-            return new Binding(persistenceName, generation);
-        } catch (RuntimeException failure) {
-            throw new IllegalStateException("corrupt Nereus storage-class binding", failure);
+    private StorageClassBindingRecord decode(GetResult result, String expectedName) {
+        StorageClassBindingRecord binding = codec.decode(result.getValue(), result.getStat().getVersion());
+        if (!binding.persistenceName().equals(expectedName)) {
+            throw new IllegalStateException("Nereus storage-class binding hash collision");
         }
+        return binding;
     }
 
-    private static String strictUtf8(byte[] value) {
-        try {
-            return StandardCharsets.UTF_8.newDecoder()
-                    .onMalformedInput(CodingErrorAction.REPORT)
-                    .onUnmappableCharacter(CodingErrorAction.REPORT)
-                    .decode(ByteBuffer.wrap(value))
-                    .toString();
-        } catch (CharacterCodingException error) {
-            throw new IllegalArgumentException("binding name is not strict UTF-8", error);
+    private static void requireNereusOpenState(StorageClassBindingRecord binding) {
+        if (!StorageClassBindingRecord.NEREUS.equals(binding.storageClass())) {
+            throw new IllegalStateException("storage-class migration is required before Nereus open");
+        }
+        if (binding.state() != StorageClassBindingState.CLAIMED
+                && binding.state() != StorageClassBindingState.ACTIVE) {
+            throw new IllegalStateException("Nereus binding is not openable");
         }
     }
 
@@ -200,8 +171,5 @@ public final class NereusStorageClassBindingStore implements AutoCloseable {
             current = current.getCause();
         }
         return current;
-    }
-
-    private record Binding(String persistenceName, long generation) {
     }
 }
