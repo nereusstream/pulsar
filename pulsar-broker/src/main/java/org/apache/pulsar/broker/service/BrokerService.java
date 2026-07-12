@@ -148,6 +148,7 @@ import org.apache.pulsar.broker.storage.ManagedLedgerStorage;
 import org.apache.pulsar.broker.storage.ManagedLedgerStorageClass;
 import org.apache.pulsar.broker.storage.nereus.NereusManagedLedgerStorage;
 import org.apache.pulsar.broker.storage.nereus.StorageClassBindingRecord;
+import org.apache.pulsar.broker.storage.nereus.StorageClassDeletePermit;
 import org.apache.pulsar.broker.storage.nereus.StorageClassOpenPermit;
 import org.apache.pulsar.broker.topiclistlimit.TopicListMemoryLimiter;
 import org.apache.pulsar.broker.topiclistlimit.TopicListSizeResultCache;
@@ -1479,6 +1480,10 @@ public class BrokerService implements Closeable {
             return CompletableFuture.completedFuture(null);
         }
 
+        if (managedLedgerStorage instanceof NereusManagedLedgerStorage hybridStorage) {
+            return deleteUnloadedTopicWithStorageBinding(tn, hybridStorage);
+        }
+
         CompletableFuture<Void> future = new CompletableFuture<>();
         CompletableFuture<Void> deleteTopicAuthenticationFuture = new CompletableFuture<>();
         deleteTopicAuthenticationWithRetry(topic, deleteTopicAuthenticationFuture, 5);
@@ -1519,6 +1524,100 @@ public class BrokerService implements Closeable {
          });
 
         return future;
+    }
+
+    private CompletableFuture<Void> deleteUnloadedTopicWithStorageBinding(
+            TopicName topicName, NereusManagedLedgerStorage hybridStorage) {
+        CompletableFuture<ManagedLedgerConfig> configFuture = getManagedLedgerConfig(topicName);
+        CompletableFuture<Optional<StorageClassDeletePermit>> permitFuture =
+                hybridStorage.bindingStore().prepareStorageClassDelete(
+                        topicName.getPersistenceNamingEncoding());
+        CompletableFuture<DeletePreparation> preparation = configFuture.thenCombine(
+                permitFuture, DeletePreparation::new);
+
+        return preparation.thenCompose(prepared -> {
+            CompletableFuture<Void> authenticationFuture = new CompletableFuture<>();
+            deleteTopicAuthenticationWithRetry(topicName.toString(), authenticationFuture, 5);
+            return authenticationFuture
+                    .thenCompose(ignored -> deleteSchema(topicName))
+                    .thenCompose(ignored -> topicName.isPartitioned()
+                            ? CompletableFuture.completedFuture(null)
+                            : pulsar.getTopicPoliciesService().deleteTopicPoliciesAsync(topicName))
+                    .thenCompose(ignored -> {
+                    if (prepared.permit().isEmpty()) {
+                        return CompletableFuture.completedFuture(null);
+                    }
+                    StorageClassDeletePermit permit = prepared.permit().orElseThrow();
+                    return deleteManagedLedger(
+                            topicName,
+                            permit.storageClass(),
+                            CompletableFuture.completedFuture(prepared.config()))
+                            .thenCompose(deleteIgnored ->
+                                    hybridStorage.bindingStore().completeStorageClassDelete(permit));
+                    });
+        });
+    }
+
+    private CompletableFuture<Void> deleteManagedLedger(
+            TopicName topicName,
+            String storageClass,
+            CompletableFuture<ManagedLedgerConfig> configFuture) {
+        CompletableFuture<Void> result = new CompletableFuture<>();
+        ManagedLedgerFactory factory;
+        try {
+            factory = getManagedLedgerFactoryForTopic(topicName, storageClass);
+        } catch (RuntimeException error) {
+            return CompletableFuture.failedFuture(error);
+        }
+        factory.asyncDelete(
+                topicName.getPersistenceNamingEncoding(),
+                configFuture,
+                new DeleteLedgerCallback() {
+                    @Override
+                    public void deleteLedgerComplete(Object context) {
+                        result.complete(null);
+                    }
+
+                    @Override
+                    public void deleteLedgerFailed(ManagedLedgerException exception, Object context) {
+                        if (exception instanceof ManagedLedgerNotFoundException
+                                || exception.getCause() instanceof MetadataStoreException.NotFoundException) {
+                            result.complete(null);
+                        } else {
+                            result.completeExceptionally(exception);
+                        }
+                    }
+                },
+                null);
+        return result;
+    }
+
+    private record DeletePreparation(
+            ManagedLedgerConfig config,
+            Optional<StorageClassDeletePermit> permit) {
+    }
+
+    public boolean usesStorageClassBindings() {
+        return managedLedgerStorage instanceof NereusManagedLedgerStorage;
+    }
+
+    public CompletableFuture<Optional<StorageClassDeletePermit>> prepareStorageClassDelete(TopicName topicName) {
+        if (!(managedLedgerStorage instanceof NereusManagedLedgerStorage hybridStorage)) {
+            return CompletableFuture.completedFuture(Optional.empty());
+        }
+        return hybridStorage.bindingStore().prepareStorageClassDelete(
+                topicName.getPersistenceNamingEncoding());
+    }
+
+    public CompletableFuture<Void> completeStorageClassDelete(StorageClassDeletePermit permit) {
+        if (permit == null) {
+            return CompletableFuture.completedFuture(null);
+        }
+        if (!(managedLedgerStorage instanceof NereusManagedLedgerStorage hybridStorage)) {
+            return CompletableFuture.failedFuture(
+                    new IllegalStateException("storage-class delete permit has no binding store"));
+        }
+        return hybridStorage.bindingStore().completeStorageClassDelete(permit);
     }
 
     public CompletableFuture<ManagedLedgerFactory> getManagedLedgerFactoryForTopic(TopicName topicName) {

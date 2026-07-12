@@ -1666,7 +1666,15 @@ public class PersistentTopic extends AbstractTopic implements Topic, AddEntryCal
                     return null;
                 });
 
-                closeClientFuture.thenAccept(__ -> {
+                closeClientFuture
+                        .thenCompose(__ -> brokerService.prepareStorageClassDelete(TopicName.get(topic)))
+                        .thenApply(optionalPermit -> {
+                            if (brokerService.usesStorageClassBindings() && optionalPermit.isEmpty()) {
+                                throw new IllegalStateException(
+                                        "loaded topic has a terminal storage-class binding");
+                            }
+                            return optionalPermit.orElse(null);
+                        }).thenAccept(deletePermit -> {
                     CompletableFuture<Void> deleteTopicAuthenticationFuture = new CompletableFuture<>();
                     brokerService.deleteTopicAuthenticationWithRetry(topic, deleteTopicAuthenticationFuture, 5);
 
@@ -1693,16 +1701,29 @@ public class PersistentTopic extends AbstractTopic implements Topic, AddEntryCal
                                             ledger.asyncDelete(new AsyncCallbacks.DeleteLedgerCallback() {
                                                 @Override
                                                 public void deleteLedgerComplete(Object ctx) {
-                                                    brokerService.removeTopicFromCache(PersistentTopic.this);
+                                                    brokerService.completeStorageClassDelete(deletePermit)
+                                                            .whenComplete((ignored, bindingError) -> {
+                                                        if (bindingError != null) {
+                                                            log.error()
+                                                                    .exception(bindingError)
+                                                                    .log("Error completing storage-class delete");
+                                                            // Storage deletion is irreversible. Keep the topic fenced
+                                                            // while a retry repairs the durable binding tombstone.
+                                                            alreadyUnFenced.set(true);
+                                                            deleteFuture.completeExceptionally(bindingError);
+                                                            return;
+                                                        }
+                                                        brokerService.removeTopicFromCache(PersistentTopic.this);
 
-                                                    dispatchRateLimiter.ifPresent(DispatchRateLimiter::close);
+                                                        dispatchRateLimiter.ifPresent(DispatchRateLimiter::close);
 
-                                                    subscribeRateLimiter.ifPresent(SubscribeRateLimiter::close);
+                                                        subscribeRateLimiter.ifPresent(SubscribeRateLimiter::close);
 
-                                                    unregisterTopicPolicyListener();
+                                                        unregisterTopicPolicyListener();
 
-                                                    log.info("Topic deleted");
-                                                    deleteFuture.complete(null);
+                                                        log.info("Topic deleted");
+                                                        deleteFuture.complete(null);
+                                                    });
                                                 }
 
                                                 @Override
