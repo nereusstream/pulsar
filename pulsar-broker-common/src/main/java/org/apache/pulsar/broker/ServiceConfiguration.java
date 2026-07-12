@@ -2634,6 +2634,113 @@ public class ServiceConfiguration implements PulsarConfiguration {
         doc = "The class of the managed ledger storage"
     )
     private String managedLedgerStorageClassName = "org.apache.pulsar.broker.ManagedLedgerClientFactory";
+    @FieldContext(category = CATEGORY_STORAGE_ML, doc = "Enable the Nereus managed-ledger storage class")
+    private boolean nereusEnabled = false;
+    @FieldContext(category = CATEGORY_STORAGE_ML, doc = "Nereus runtime provider class")
+    private String nereusRuntimeProviderClassName = "com.nereusstream.pulsar.DefaultNereusRuntimeProvider";
+    @FieldContext(category = CATEGORY_STORAGE_ML, doc = "Nereus Oxia service address")
+    private String nereusOxiaServiceAddress = "";
+    @FieldContext(category = CATEGORY_STORAGE_ML, doc = "Nereus Oxia namespace")
+    private String nereusOxiaNamespace = "";
+    @FieldContext(category = CATEGORY_STORAGE_ML, doc = "Nereus Oxia session timeout in seconds")
+    private long nereusOxiaSessionTimeoutSeconds = 30;
+    @FieldContext(category = CATEGORY_STORAGE_ML, doc = "Maximum pending operations on the shared Nereus Oxia client")
+    private int nereusMaxOxiaPendingOperations = 1024;
+    @FieldContext(category = CATEGORY_STORAGE_ML, doc = "Nereus object-store provider class")
+    private String nereusObjectStoreProviderClassName =
+            "com.nereusstream.objectstore.S3CompatibleObjectStoreProvider";
+    @FieldContext(category = CATEGORY_STORAGE_ML, doc = "Nereus object-store HTTP(S) origin")
+    private String nereusObjectStoreEndpoint = "";
+    @FieldContext(category = CATEGORY_STORAGE_ML, doc = "Nereus object-store region")
+    private String nereusObjectStoreRegion = "";
+    @FieldContext(category = CATEGORY_STORAGE_ML, doc = "Nereus object-store bucket")
+    private String nereusObjectStoreBucket = "";
+    @FieldContext(category = CATEGORY_STORAGE_ML, doc = "Nereus canonical object-store prefix")
+    private String nereusObjectStorePrefix = "";
+    @FieldContext(category = CATEGORY_STORAGE_ML, doc = "Use path-style S3 requests for Nereus")
+    private boolean nereusObjectStorePathStyleAccess = false;
+    @FieldContext(category = CATEGORY_STORAGE_ML, doc = "Nereus object-store request timeout in seconds")
+    private long nereusObjectStoreRequestTimeoutSeconds = 30;
+    @FieldContext(category = CATEGORY_STORAGE_ML, doc = "Maximum Nereus object-store connections")
+    private int nereusObjectStoreMaxConnections = 64;
+    @FieldContext(category = CATEGORY_STORAGE_ML, doc = "Secret reference for the Nereus object-store access key")
+    private String nereusObjectStoreAccessKeySecretRef = "";
+    @FieldContext(category = CATEGORY_STORAGE_ML, doc = "Secret reference for the Nereus object-store secret key")
+    private String nereusObjectStoreSecretKeySecretRef = "";
+    @FieldContext(category = CATEGORY_STORAGE_ML, doc = "Secret reference for the Nereus object-store session token")
+    private String nereusObjectStoreSessionTokenSecretRef = "";
+    @FieldContext(category = CATEGORY_STORAGE_ML, doc = "Nereus object-store secret resolver class")
+    private String nereusObjectStoreSecretResolverClassName =
+            "com.nereusstream.objectstore.NoopObjectStoreSecretResolver";
+    @FieldContext(category = CATEGORY_STORAGE_ML, doc = "Nereus metadata operation timeout in seconds")
+    private long nereusMetadataTimeoutSeconds = 30;
+    @FieldContext(category = CATEGORY_STORAGE_ML, doc = "Nereus append timeout in seconds")
+    private long nereusAppendTimeoutSeconds = 30;
+    @FieldContext(category = CATEGORY_STORAGE_ML, doc = "Nereus callback append-recovery timeout in seconds")
+    private long nereusAppendRecoveryTimeoutSeconds = 30;
+    @FieldContext(category = CATEGORY_STORAGE_ML, doc = "Nereus read timeout in seconds")
+    private long nereusReadTimeoutSeconds = 30;
+    @FieldContext(category = CATEGORY_STORAGE_ML, doc = "Nereus close timeout in seconds")
+    private long nereusCloseTimeoutSeconds = 75;
+    @FieldContext(category = CATEGORY_STORAGE_ML, doc = "Nereus tail polling interval in milliseconds")
+    private long nereusTailPollIntervalMillis = 1000;
+    @FieldContext(category = CATEGORY_STORAGE_ML, doc = "Nereus append-recovery attempt timeout in seconds")
+    private long nereusAppendRecoveryAttemptTimeoutSeconds = 5;
+    @FieldContext(category = CATEGORY_STORAGE_ML, doc = "Nereus append-recovery minimum backoff in milliseconds")
+    private long nereusAppendRecoveryBackoffMinMillis = 100;
+    @FieldContext(category = CATEGORY_STORAGE_ML, doc = "Nereus append-recovery maximum backoff in seconds")
+    private long nereusAppendRecoveryBackoffMaxSeconds = 5;
+    @FieldContext(category = CATEGORY_STORAGE_ML, doc = "Nereus recovered-attempt terminal retention in seconds")
+    private long nereusAppendRecoveryTerminalTtlSeconds = 600;
+    @FieldContext(category = CATEGORY_STORAGE_ML, doc = "Nereus append-session TTL in seconds")
+    private long nereusAppendSessionTtlSeconds = 30;
+    @FieldContext(category = CATEGORY_STORAGE_ML, doc = "Nereus append-session renew-before interval in seconds")
+    private long nereusAppendSessionRenewBeforeSeconds = 10;
+    @FieldContext(category = CATEGORY_STORAGE_ML, doc = "Minimum remaining Nereus append-session lease in seconds")
+    private long nereusAppendSessionMinCommitRemainingSeconds = 5;
+    @FieldContext(category = CATEGORY_STORAGE_ML,
+            doc = "Maximum persisted Nereus entry bytes; zero derives from maxMessageSize")
+    private int nereusMaxEntryBytes = 0;
+    @FieldContext(category = CATEGORY_STORAGE_ML, doc = "Maximum entries per Nereus read")
+    private int nereusMaxReadEntries = 100;
+    @FieldContext(category = CATEGORY_STORAGE_ML, doc = "Maximum open Nereus managed ledgers")
+    private int nereusMaxOpenLedgers = 10000;
+    @FieldContext(category = CATEGORY_STORAGE_ML, doc = "Maximum pending Nereus callbacks")
+    private int nereusMaxPendingCallbacks = 1024;
+    @FieldContext(category = CATEGORY_STORAGE_ML, doc = "Maximum retained Nereus append attempts")
+    private int nereusMaxRetainedAppendAttempts = 1024;
+    @FieldContext(category = CATEGORY_STORAGE_ML, doc = "Maximum Nereus append-recovery terminals")
+    private int nereusMaxAppendRecoveryTerminals = 2048;
+    @FieldContext(category = CATEGORY_STORAGE_ML, doc = "Maximum entries scanned by a Nereus facade operation")
+    private int nereusMaxScanEntries = 10000;
+    @FieldContext(category = CATEGORY_STORAGE_ML, doc = "Maximum pending Nereus projection metadata operations")
+    private int nereusMaxProjectionMetadataPendingOperations = 1024;
+    @FieldContext(category = CATEGORY_STORAGE_ML, doc = "Maximum encoded Nereus projection value bytes")
+    private int nereusProjectionMetadataMaxValueBytes = 65536;
+    @FieldContext(category = CATEGORY_STORAGE_ML, doc = "Maximum ranges resolved by one Nereus read")
+    private int nereusMaxResolveRanges = 64;
+    @FieldContext(category = CATEGORY_STORAGE_ML, doc = "Maximum Nereus commit-chain scan entries")
+    private int nereusMaxCommitChainScan = 10000;
+    @FieldContext(category = CATEGORY_STORAGE_ML, doc = "Maximum derived-index repairs per Nereus call")
+    private int nereusMaxDerivedIndexRepairCommitsPerCall = 256;
+    @FieldContext(category = CATEGORY_STORAGE_ML, doc = "Maximum cached Nereus streams")
+    private int nereusMaxCachedStreams = 10000;
+    @FieldContext(category = CATEGORY_STORAGE_ML, doc = "Maximum in-flight Nereus appends")
+    private int nereusMaxInFlightAppends = 1024;
+    @FieldContext(category = CATEGORY_STORAGE_ML, doc = "Maximum Nereus append buffer bytes")
+    private long nereusMaxBufferedBytes = 67108864;
+    @FieldContext(category = CATEGORY_STORAGE_ML, doc = "Maximum concurrent Nereus object reads")
+    private int nereusMaxConcurrentObjectReads = 64;
+    @FieldContext(category = CATEGORY_STORAGE_ML, doc = "Maximum Nereus read buffer bytes")
+    private long nereusMaxReadBufferBytes = 134217728;
+    @FieldContext(category = CATEGORY_STORAGE_ML, doc = "Maximum Nereus Object WAL object bytes")
+    private int nereusMaxObjectBytes = 16777216;
+    @FieldContext(category = CATEGORY_STORAGE_ML, doc = "Nereus offset-index cache TTL in seconds")
+    private long nereusOffsetIndexCacheTtlSeconds = 5;
+    @FieldContext(category = CATEGORY_STORAGE_ML, doc = "Enable Nereus metadata watch invalidation")
+    private boolean nereusEnableMetadataWatch = false;
+    @FieldContext(category = CATEGORY_STORAGE_ML, doc = "Enable the Nereus offset-index cache")
+    private boolean nereusEnableOffsetIndexCache = true;
     @FieldContext(
         category = CATEGORY_STORAGE_ML,
         doc = "Number of threads to be used for managed ledger scheduled tasks"

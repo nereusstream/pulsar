@@ -36,6 +36,7 @@ dependencies {
     implementation(project(":pulsar-transaction:pulsar-transaction-common"))
     api(project(":pulsar-transaction:pulsar-transaction-coordinator"))
     api(project(":pulsar-opentelemetry"))
+    implementation(libs.nereus.pulsar.adapter)
     implementation(project(":pulsar-client-messagecrypto-bc"))
     api(project(":pulsar-functions:pulsar-functions-worker"))
     implementation(project(":pulsar-docs-tools")) {
@@ -141,6 +142,7 @@ dependencies {
         exclude(group = "com.google.protobuf")
     }
 }
+
 
 // Ensure parent projects are configured before resolving cross-project task references.
 // Required for --configure-on-demand: the Kotlin DSL needs parent ClassLoaderScopes to be locked.

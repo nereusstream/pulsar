@@ -91,6 +91,7 @@ dependencies {
     // Version constraints from the enforced platform (inherited via implementation,
     // which distLib extends) ensure consistent versions without manual resolutionStrategy.
     distLib(project(":pulsar-broker"))
+    distLib(libs.nereus.pulsar.adapter)
     distLib(project(":pulsar-metadata"))
     distLib(project(":pulsar-docs-tools"))
     distLib(project(":pulsar-proxy"))
