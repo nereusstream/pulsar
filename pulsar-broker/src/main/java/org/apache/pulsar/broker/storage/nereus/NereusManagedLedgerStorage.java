@@ -109,6 +109,7 @@ public final class NereusManagedLedgerStorage implements ManagedLedgerStorage {
                     compatibilityFactoryConfig,
                     true);
             runtime = null;
+            bindingStore.attachNereusFactory(nereusFactory);
             nereusClass = new NereusManagedLedgerStorageClass(nereusFactory);
             storageClasses = List.of(bookkeeperClass, nereusClass);
         } catch (Throwable failure) {

@@ -26,10 +26,16 @@ import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
+import com.nereusstream.managedledger.NereusManagedLedgerFactory;
+import com.nereusstream.managedledger.NereusStorageStateSnapshot;
 import java.time.Duration;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
 import org.apache.bookkeeper.mledger.ManagedLedgerFactory;
+import org.apache.pulsar.metadata.api.GetResult;
 import org.apache.pulsar.metadata.api.Stat;
 import org.apache.pulsar.metadata.api.extended.MetadataStoreExtended;
 import org.testng.annotations.Test;
@@ -69,5 +75,133 @@ public class NereusStorageClassBindingStoreTest {
 
         assertThat(permit.persistenceName()).isEqualTo(PERSISTENCE_NAME);
         assertThat(permit.bindingGeneration()).isEqualTo(1);
+    }
+
+    @Test
+    public void preparesAndActivatesFirstNereusGeneration() {
+        MutableBindingMetadata bindingMetadata = new MutableBindingMetadata();
+        ManagedLedgerFactory bookkeeper = mock(ManagedLedgerFactory.class);
+        NereusManagedLedgerFactory nereus = mock(NereusManagedLedgerFactory.class);
+        when(bookkeeper.asyncExists(PERSISTENCE_NAME)).thenReturn(CompletableFuture.completedFuture(false));
+        when(nereus.inspectStorageState(PERSISTENCE_NAME))
+                .thenReturn(CompletableFuture.completedFuture(NereusStorageStateSnapshot.missing()));
+        NereusStorageClassBindingStore store = new NereusStorageClassBindingStore(
+                bindingMetadata.store(), bookkeeper, Duration.ofSeconds(1));
+        store.attachNereusFactory(nereus);
+
+        StorageClassOpenPermit permit = store.prepareStorageClassOpen(
+                PERSISTENCE_NAME, StorageClassBindingRecord.NEREUS, true).join();
+        store.completeStorageClassOpen(permit).join();
+
+        StorageClassBindingRecord active = bindingMetadata.record();
+        assertThat(permit.activationRequired()).isTrue();
+        assertThat(active.state()).isEqualTo(StorageClassBindingState.ACTIVE);
+        assertThat(active.storageClass()).isEqualTo(StorageClassBindingRecord.NEREUS);
+        assertThat(active.bindingGeneration()).isEqualTo(1);
+    }
+
+    @Test
+    public void adoptsExistingBookKeeperAndRejectsClassSwitch() {
+        MutableBindingMetadata bindingMetadata = new MutableBindingMetadata();
+        ManagedLedgerFactory bookkeeper = mock(ManagedLedgerFactory.class);
+        NereusManagedLedgerFactory nereus = mock(NereusManagedLedgerFactory.class);
+        when(bookkeeper.asyncExists(PERSISTENCE_NAME)).thenReturn(CompletableFuture.completedFuture(true));
+        when(nereus.inspectStorageState(PERSISTENCE_NAME))
+                .thenReturn(CompletableFuture.completedFuture(NereusStorageStateSnapshot.missing()));
+        NereusStorageClassBindingStore store = new NereusStorageClassBindingStore(
+                bindingMetadata.store(), bookkeeper, Duration.ofSeconds(1));
+        store.attachNereusFactory(nereus);
+
+        assertThatThrownBy(() -> store.prepareStorageClassOpen(
+                PERSISTENCE_NAME, StorageClassBindingRecord.NEREUS, true).join())
+                .hasRootCauseInstanceOf(IllegalStateException.class)
+                .hasRootCauseMessage("storage-class migration is required");
+        StorageClassOpenPermit bookkeeperPermit = store.prepareStorageClassOpen(
+                PERSISTENCE_NAME, StorageClassBindingRecord.BOOKKEEPER, true).join();
+
+        assertThat(bookkeeperPermit.activationRequired()).isFalse();
+        assertThat(bindingMetadata.record().state()).isEqualTo(StorageClassBindingState.ACTIVE);
+        assertThat(bindingMetadata.record().storageClass()).isEqualTo(StorageClassBindingRecord.BOOKKEEPER);
+    }
+
+    @Test
+    public void refusesDuplicateNereusFactoryAttachment() {
+        NereusStorageClassBindingStore store = new NereusStorageClassBindingStore(
+                mock(MetadataStoreExtended.class), mock(ManagedLedgerFactory.class), Duration.ofSeconds(1));
+        NereusManagedLedgerFactory first = mock(NereusManagedLedgerFactory.class);
+
+        store.attachNereusFactory(first);
+
+        assertThatThrownBy(() -> store.attachNereusFactory(mock(NereusManagedLedgerFactory.class)))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessage("Nereus managed-ledger factory is already attached");
+    }
+
+    @Test
+    public void deletesBoundBookKeeperClassAndStartsNextNereusGeneration() {
+        MutableBindingMetadata bindingMetadata = new MutableBindingMetadata();
+        ManagedLedgerFactory bookkeeper = mock(ManagedLedgerFactory.class);
+        NereusManagedLedgerFactory nereus = mock(NereusManagedLedgerFactory.class);
+        AtomicBoolean bookkeeperExists = new AtomicBoolean();
+        when(bookkeeper.asyncExists(PERSISTENCE_NAME)).thenAnswer(
+                ignored -> CompletableFuture.completedFuture(bookkeeperExists.get()));
+        when(nereus.inspectStorageState(PERSISTENCE_NAME))
+                .thenReturn(CompletableFuture.completedFuture(NereusStorageStateSnapshot.missing()));
+        NereusStorageClassBindingStore store = new NereusStorageClassBindingStore(
+                bindingMetadata.store(), bookkeeper, Duration.ofSeconds(1));
+        store.attachNereusFactory(nereus);
+        StorageClassOpenPermit openPermit = store.prepareStorageClassOpen(
+                PERSISTENCE_NAME, StorageClassBindingRecord.BOOKKEEPER, true).join();
+        store.completeStorageClassOpen(openPermit).join();
+        bookkeeperExists.set(true);
+
+        StorageClassDeletePermit deletePermit = store.prepareStorageClassDelete(PERSISTENCE_NAME)
+                .join().orElseThrow();
+        bookkeeperExists.set(false);
+        store.completeStorageClassDelete(deletePermit).join();
+        StorageClassOpenPermit next = store.prepareStorageClassOpen(
+                PERSISTENCE_NAME, StorageClassBindingRecord.NEREUS, true).join();
+
+        assertThat(deletePermit.storageClass()).isEqualTo(StorageClassBindingRecord.BOOKKEEPER);
+        assertThat(next.storageClass()).isEqualTo(StorageClassBindingRecord.NEREUS);
+        assertThat(next.bindingGeneration()).isEqualTo(2);
+        assertThat(bindingMetadata.record().state()).isEqualTo(StorageClassBindingState.CLAIMED);
+    }
+
+    private static final class MutableBindingMetadata {
+        private final MetadataStoreExtended store = mock(MetadataStoreExtended.class);
+        private final AtomicReference<byte[]> value = new AtomicReference<>();
+        private final AtomicLong version = new AtomicLong(-1);
+        private final StorageClassBindingCodec codec = new StorageClassBindingCodec();
+
+        private MutableBindingMetadata() {
+            when(store.sync(anyString())).thenReturn(CompletableFuture.completedFuture(null));
+            when(store.get(anyString())).thenAnswer(ignored -> {
+                byte[] current = value.get();
+                if (current == null) {
+                    return CompletableFuture.completedFuture(Optional.empty());
+                }
+                return CompletableFuture.completedFuture(Optional.of(
+                        new GetResult(current.clone(), stat(version.get()))));
+            });
+            when(store.put(anyString(), any(), any())).thenAnswer(invocation -> {
+                byte[] updated = invocation.getArgument(1);
+                long updatedVersion = version.incrementAndGet();
+                value.set(updated.clone());
+                return CompletableFuture.completedFuture(stat(updatedVersion));
+            });
+        }
+
+        private MetadataStoreExtended store() {
+            return store;
+        }
+
+        private StorageClassBindingRecord record() {
+            return codec.decode(value.get(), version.get());
+        }
+
+        private static Stat stat(long version) {
+            return new Stat("/binding", version, 0, 0, false, true);
+        }
     }
 }
