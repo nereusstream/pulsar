@@ -225,6 +225,26 @@ public class NereusTopicFeatureResolverTest {
                 SubType.Failover, false, false, false, null)).doesNotThrowAnyException();
     }
 
+    @Test
+    public void validatesTheClosedAdminOperationSet() {
+        NereusTopicFeatureValidator validator = new NereusTopicFeatureValidator();
+        assertThatCode(() -> validator.validateAdminOperation(NereusAdminOperation.TERMINATE_TOPIC))
+                .doesNotThrowAnyException();
+        assertThatCode(() -> validator.validateAdminOperation(NereusAdminOperation.DELETE_TOPIC))
+                .doesNotThrowAnyException();
+        assertThatCode(() -> validator.validateAdminOperation(NereusAdminOperation.UNLOAD_TOPIC))
+                .doesNotThrowAnyException();
+        for (NereusAdminOperation operation : NereusAdminOperation.values()) {
+            if (operation == NereusAdminOperation.TERMINATE_TOPIC
+                    || operation == NereusAdminOperation.DELETE_TOPIC
+                    || operation == NereusAdminOperation.UNLOAD_TOPIC) {
+                continue;
+            }
+            assertThatThrownBy(() -> validator.validateAdminOperation(operation))
+                    .hasMessage("NEREUS_UNSUPPORTED_ADMIN_OPERATION:" + operation.name());
+        }
+    }
+
     private static NereusResolvedTopicFeatures safeFeatures() {
         return new NereusResolvedTopicFeatures(
                 Set.of(), false, 0, 0, 0, false, false, false, false, false, false);

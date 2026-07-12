@@ -87,6 +87,7 @@ import org.apache.pulsar.broker.service.TopicPoliciesService;
 import org.apache.pulsar.broker.service.persistent.PersistentReplicator;
 import org.apache.pulsar.broker.service.persistent.PersistentSubscription;
 import org.apache.pulsar.broker.service.persistent.PersistentTopic;
+import org.apache.pulsar.broker.storage.nereus.NereusAdminOperation;
 import org.apache.pulsar.broker.web.RestException;
 import org.apache.pulsar.client.admin.LongRunningProcessStatus;
 import org.apache.pulsar.client.admin.OffloadProcessStatus;
@@ -163,6 +164,21 @@ public class PersistentTopicsBase extends AdminResource {
     private static final int OFFLINE_TOPIC_STAT_TTL_MINS = 10;
     private static final String DEPRECATED_CLIENT_VERSION_PREFIX = "Pulsar-CPP-v";
     private static final Version LEAST_SUPPORTED_CLIENT_VERSION_PREFIX = Version.forIntegers(1, 21);
+
+    private static CompletableFuture<Topic> validateNereusAdminOperation(
+            Topic topic, NereusAdminOperation operation) {
+        if (topic instanceof PersistentTopic persistentTopic && persistentTopic.isNereusManagedLedger()) {
+            return persistentTopic.validateNereusAdminOperation(operation).thenApply(__ -> topic);
+        }
+        return CompletableFuture.completedFuture(topic);
+    }
+
+    private CompletableFuture<Void> validateLoadedNereusAdminOperation(NereusAdminOperation operation) {
+        return pulsar().getBrokerService().getTopicIfExists(topicName.toString())
+                .thenCompose(optionalTopic -> optionalTopic
+                        .map(topic -> validateNereusAdminOperation(topic, operation).thenApply(__ -> (Void) null))
+                        .orElseGet(() -> CompletableFuture.completedFuture(null)));
+    }
 
     protected CompletableFuture<List<String>> internalGetListAsync(Optional<String> bundle,
                                                                    @Nullable Map<String, String> properties) {
@@ -1725,6 +1741,8 @@ public class PersistentTopicsBase extends AdminResource {
                                                                                           boolean force) {
         return validateTopicOwnershipAsync(topicName, authoritative)
                 .thenCompose(__ -> getTopicReferenceAsync(topicName))
+                .thenCompose(topic -> validateNereusAdminOperation(
+                        topic, NereusAdminOperation.DELETE_DURABLE_SUBSCRIPTION))
                 .thenCompose((topic) -> {
                     Subscription sub = topic.getSubscription(subName);
                     if (sub == null) {
@@ -1939,7 +1957,9 @@ public class PersistentTopicsBase extends AdminResource {
 
     private CompletableFuture<Void> internalSkipAllMessagesForNonPartitionedTopicAsync(AsyncResponse asyncResponse,
                                                                                        String subName) {
-        return getTopicReferenceAsync(topicName).thenCompose(t -> {
+        return getTopicReferenceAsync(topicName)
+                .thenCompose(topic -> validateNereusAdminOperation(topic, NereusAdminOperation.CLEAR_BACKLOG))
+                .thenCompose(t -> {
                     PersistentTopic topic = (PersistentTopic) t;
                     BiConsumer<Void, Throwable> biConsumer = (v, ex) -> {
                         if (ex != null) {
@@ -2006,7 +2026,10 @@ public class PersistentTopicsBase extends AdminResource {
                          .log("");
                  throw new  RestException(Status.METHOD_NOT_ALLOWED, msg);
              }
-             return getTopicReferenceAsync(topicName).thenCompose(t -> {
+             return getTopicReferenceAsync(topicName)
+                     .thenCompose(topic -> validateNereusAdminOperation(
+                             topic, NereusAdminOperation.SKIP_MESSAGES))
+                     .thenCompose(t -> {
                  PersistentTopic topic = (PersistentTopic) t;
                  if (topic == null) {
                      throw new RestException(new RestException(Status.NOT_FOUND,
@@ -2145,7 +2168,9 @@ public class PersistentTopicsBase extends AdminResource {
                                                                                  boolean authoritative) {
         // validate ownership and redirect if current broker is not owner
         validateTopicOwnershipAsync(topicName, authoritative)
-                .thenCompose(__ -> getTopicReferenceAsync(topicName).thenAccept(t -> {
+                .thenCompose(__ -> getTopicReferenceAsync(topicName))
+                .thenCompose(topic -> validateNereusAdminOperation(topic, NereusAdminOperation.EXPIRE_MESSAGES))
+                .thenAccept(t -> {
                      if (t == null) {
                          resumeAsyncResponseExceptionally(asyncResponse, new RestException(Status.NOT_FOUND,
                                  getTopicNotFoundErrorMessage(topicName.toString())));
@@ -2201,7 +2226,7 @@ public class PersistentTopicsBase extends AdminResource {
                         return null;
                     });
                         })
-                ).exceptionally(ex -> {
+                .exceptionally(ex -> {
             // If the exception is not redirect exception we need to log it.
             if (isNot307And404Exception(ex)) {
                 log.error()
@@ -2319,6 +2344,7 @@ public class PersistentTopicsBase extends AdminResource {
                         .log("Received reset cursor on subscription to time");
                 return getTopicReferenceAsync(topicName);
             })
+            .thenCompose(topic -> validateNereusAdminOperation(topic, NereusAdminOperation.RESET_CURSOR))
             .thenCompose(topic -> {
                 Subscription sub = topic.getSubscription(subName);
                 if (sub == null) {
@@ -2763,6 +2789,7 @@ public class PersistentTopicsBase extends AdminResource {
                     .log("received reset cursor on subscription to position");
             return validateTopicOwnershipAsync(topicName, authoritative);
         }).thenCompose(ignore -> getTopicReferenceAsync(topicName))
+        .thenCompose(topic -> validateNereusAdminOperation(topic, NereusAdminOperation.RESET_CURSOR))
         .thenAccept(topic -> {
             if (topic == null) {
                 asyncResponse.resume(new RestException(Status.NOT_FOUND,
@@ -3980,6 +4007,7 @@ public class PersistentTopicsBase extends AdminResource {
             }
         })
         .thenCompose(__ -> getTopicReferenceAsync(topicName))
+        .thenCompose(topic -> validateNereusAdminOperation(topic, NereusAdminOperation.TERMINATE_TOPIC))
         .thenCompose(topic -> {
             if (!(topic instanceof PersistentTopic)) {
                 throw new RestException(Status.METHOD_NOT_ALLOWED,
@@ -4175,7 +4203,10 @@ public class PersistentTopicsBase extends AdminResource {
             return FutureUtil.failedFuture(new IllegalStateException(msg));
         } else {
             final CompletableFuture<Void> resultFuture = new CompletableFuture<>();
-            getTopicReferenceAsync(topicName).thenAccept(t -> {
+            getTopicReferenceAsync(topicName)
+                    .thenCompose(topic -> validateNereusAdminOperation(
+                            topic, NereusAdminOperation.EXPIRE_MESSAGES))
+                    .thenAccept(t -> {
                  if (t == null) {
                      resultFuture.completeExceptionally(new RestException(Status.NOT_FOUND,
                              getTopicNotFoundErrorMessage(topicName.toString())));
@@ -4296,7 +4327,9 @@ public class PersistentTopicsBase extends AdminResource {
                                                                                         MessageIdImpl messageId,
                                                                                         boolean isExcluded,
                                                                                         int batchIndex) {
-        return getTopicReferenceAsync(topicName).thenAccept(t -> {
+        return getTopicReferenceAsync(topicName)
+                .thenCompose(topic -> validateNereusAdminOperation(topic, NereusAdminOperation.EXPIRE_MESSAGES))
+                .thenAccept(t -> {
             PersistentTopic topic = (PersistentTopic) t;
             if (topic == null) {
                 asyncResponse.resume(new RestException(Status.NOT_FOUND,
@@ -4485,6 +4518,7 @@ public class PersistentTopicsBase extends AdminResource {
         validateTopicOwnershipAsync(topicName, authoritative)
             .thenCompose(__ -> validateTopicOperationAsync(topicName, TopicOperation.COMPACT))
             .thenCompose(__ -> getTopicReferenceAsync(topicName))
+            .thenCompose(topic -> validateNereusAdminOperation(topic, NereusAdminOperation.TRIGGER_COMPACTION))
             .thenCompose(topic -> ((PersistentTopic) topic).triggerCompactionWithCheckHasMoreMessages()
                 .whenComplete((result, ex) -> {
                     if (ex == null) {
@@ -4519,6 +4553,8 @@ public class PersistentTopicsBase extends AdminResource {
         return validateTopicOperationAsync(topicName, TopicOperation.COMPACT)
                 .thenCompose(__ -> validateTopicOwnershipAsync(topicName, authoritative))
                 .thenCompose(__ -> getTopicReferenceAsync(topicName))
+                .thenCompose(topic -> validateNereusAdminOperation(
+                        topic, NereusAdminOperation.READ_COMPACTION_STATUS))
                 .thenApply(topic -> ((PersistentTopic) topic).compactionStatus());
     }
 
@@ -4527,6 +4563,7 @@ public class PersistentTopicsBase extends AdminResource {
         validateTopicOperationAsync(topicName, TopicOperation.OFFLOAD)
                 .thenCompose(__ -> validateTopicOwnershipAsync(topicName, authoritative))
                 .thenCompose(__ -> getTopicReferenceAsync(topicName))
+                .thenCompose(topic -> validateNereusAdminOperation(topic, NereusAdminOperation.TRIGGER_OFFLOAD))
                 .thenAccept(topic -> {
                     try {
                         ((PersistentTopic) topic).triggerOffload(messageId);
@@ -4557,6 +4594,7 @@ public class PersistentTopicsBase extends AdminResource {
         validateTopicOperationAsync(topicName, TopicOperation.OFFLOAD)
                 .thenCompose(__ -> validateTopicOwnershipAsync(topicName, authoritative))
                 .thenCompose(__ -> getTopicReferenceAsync(topicName))
+                .thenCompose(topic -> validateNereusAdminOperation(topic, NereusAdminOperation.READ_OFFLOAD_STATUS))
                 .thenAccept(topic -> {
                     OffloadProcessStatus offloadProcessStatus = ((PersistentTopic) topic).offloadStatus();
                     asyncResponse.resume(offloadProcessStatus);
@@ -5180,6 +5218,7 @@ public class PersistentTopicsBase extends AdminResource {
         return validateAdminAccessForTenantAsync(topicName.getTenant())
             .thenCompose(__ -> validateTopicOwnershipAsync(topicName, authoritative))
             .thenCompose(__ -> getTopicReferenceAsync(topicName))
+            .thenCompose(topic -> validateNereusAdminOperation(topic, NereusAdminOperation.TRUNCATE_TOPIC))
             .thenCompose(Topic::truncate);
     }
 
@@ -5637,6 +5676,7 @@ public class PersistentTopicsBase extends AdminResource {
         }
         return validatePoliciesReadOnlyAccessAsync()
                 .thenCompose(__ -> validateShadowTopics(shadowTopics))
+                .thenCompose(__ -> validateLoadedNereusAdminOperation(NereusAdminOperation.SET_SHADOW_TOPICS))
                 .thenCompose(__ -> pulsar().getTopicPoliciesService().updateTopicPoliciesAsync(topicName, false,
                         false, policies -> {
                     policies.setShadowTopics(shadowTopics);
