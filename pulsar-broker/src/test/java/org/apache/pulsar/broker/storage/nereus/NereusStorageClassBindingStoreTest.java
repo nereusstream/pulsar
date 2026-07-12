@@ -101,6 +101,25 @@ public class NereusStorageClassBindingStoreTest {
     }
 
     @Test
+    public void rejectsFirstNereusClaimBeforeBindingIoWhenClusterIsNotReady() {
+        MetadataStoreExtended metadata = mock(MetadataStoreExtended.class);
+        ManagedLedgerFactory bookkeeper = mock(ManagedLedgerFactory.class);
+        NereusManagedLedgerFactory nereus = mock(NereusManagedLedgerFactory.class);
+        NereusStorageClassBindingStore store = new NereusStorageClassBindingStore(
+                metadata,
+                bookkeeper,
+                Duration.ofSeconds(1),
+                () -> CompletableFuture.failedFuture(new IllegalStateException("cluster not ready")));
+        store.attachNereusFactory(nereus);
+
+        assertThatThrownBy(() -> store.prepareStorageClassOpen(
+                PERSISTENCE_NAME, StorageClassBindingRecord.NEREUS, true).join())
+                .hasRootCauseMessage("cluster not ready");
+        verify(metadata, never()).sync(anyString());
+        verify(metadata, never()).put(anyString(), any(), any());
+    }
+
+    @Test
     public void adoptsExistingBookKeeperAndRejectsClassSwitch() {
         MutableBindingMetadata bindingMetadata = new MutableBindingMetadata();
         ManagedLedgerFactory bookkeeper = mock(ManagedLedgerFactory.class);
