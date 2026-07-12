@@ -24,4 +24,8 @@ public record StorageClassDeletePermit(
         String storageClass,
         long bindingGeneration,
         long expectedMetadataVersion) {
+    public StorageClassDeletePermit {
+        StorageClassOpenPermit.requireIdentity(
+                persistenceName, storageClass, bindingGeneration, expectedMetadataVersion);
+    }
 }

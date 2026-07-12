@@ -25,4 +25,24 @@ public record StorageClassOpenPermit(
         long bindingGeneration,
         long expectedMetadataVersion,
         boolean activationRequired) {
+    public StorageClassOpenPermit {
+        requireIdentity(persistenceName, storageClass, bindingGeneration, expectedMetadataVersion);
+    }
+
+    static void requireIdentity(
+            String persistenceName,
+            String storageClass,
+            long bindingGeneration,
+            long expectedMetadataVersion) {
+        if (persistenceName == null || persistenceName.isBlank()) {
+            throw new IllegalArgumentException("persistenceName cannot be blank");
+        }
+        if (!StorageClassBindingRecord.BOOKKEEPER.equals(storageClass)
+                && !StorageClassBindingRecord.NEREUS.equals(storageClass)) {
+            throw new IllegalArgumentException("unsupported storage class");
+        }
+        if (bindingGeneration <= 0 || expectedMetadataVersion < 0) {
+            throw new IllegalArgumentException("invalid storage binding permit version");
+        }
+    }
 }

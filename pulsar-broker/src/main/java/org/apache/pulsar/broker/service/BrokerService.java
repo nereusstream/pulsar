@@ -80,11 +80,13 @@ import java.util.concurrent.locks.ReadWriteLock;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 import java.util.function.Consumer;
 import java.util.function.Predicate;
+import java.util.function.Supplier;
 import lombok.AccessLevel;
 import lombok.CustomLog;
 import lombok.Getter;
 import lombok.Setter;
 import org.apache.bookkeeper.common.util.OrderedExecutor;
+import org.apache.bookkeeper.mledger.AsyncCallbacks.CloseCallback;
 import org.apache.bookkeeper.mledger.AsyncCallbacks.DeleteLedgerCallback;
 import org.apache.bookkeeper.mledger.AsyncCallbacks.OpenLedgerCallback;
 import org.apache.bookkeeper.mledger.LedgerOffloader;
@@ -144,6 +146,9 @@ import org.apache.pulsar.broker.stats.prometheus.metrics.ObserverGauge;
 import org.apache.pulsar.broker.stats.prometheus.metrics.Summary;
 import org.apache.pulsar.broker.storage.ManagedLedgerStorage;
 import org.apache.pulsar.broker.storage.ManagedLedgerStorageClass;
+import org.apache.pulsar.broker.storage.nereus.NereusManagedLedgerStorage;
+import org.apache.pulsar.broker.storage.nereus.StorageClassBindingRecord;
+import org.apache.pulsar.broker.storage.nereus.StorageClassOpenPermit;
 import org.apache.pulsar.broker.topiclistlimit.TopicListMemoryLimiter;
 import org.apache.pulsar.broker.topiclistlimit.TopicListSizeResultCache;
 import org.apache.pulsar.broker.validator.BindAddressValidator;
@@ -1536,6 +1541,84 @@ public class BrokerService implements Closeable {
                 .getManagedLedgerFactory();
     }
 
+    void asyncOpenManagedLedgerWithStorageBinding(
+            TopicName topicName,
+            ManagedLedgerConfig managedLedgerConfig,
+            OpenLedgerCallback callback,
+            Supplier<CompletableFuture<Boolean>> ownershipChecker,
+            Object context) {
+        String persistenceName = topicName.getPersistenceNamingEncoding();
+        if (!(managedLedgerStorage instanceof NereusManagedLedgerStorage hybridStorage)) {
+            getManagedLedgerFactoryForTopic(topicName, managedLedgerConfig.getStorageClassName())
+                    .asyncOpen(persistenceName, managedLedgerConfig, callback, ownershipChecker, context);
+            return;
+        }
+        String selectedStorageClass = managedLedgerConfig.getStorageClassName() == null
+                ? StorageClassBindingRecord.BOOKKEEPER
+                : managedLedgerConfig.getStorageClassName();
+        hybridStorage.bindingStore().prepareStorageClassOpen(
+                persistenceName, selectedStorageClass, managedLedgerConfig.isCreateIfMissing())
+                .whenComplete((permit, preparationError) -> {
+                    if (preparationError != null) {
+                        callback.openLedgerFailed(ManagedLedgerException.getManagedLedgerException(
+                                FutureUtil.unwrapCompletionException(preparationError)), context);
+                        return;
+                    }
+                    ManagedLedgerFactory selectedFactory;
+                    try {
+                        selectedFactory = getManagedLedgerFactoryForTopic(topicName, permit.storageClass());
+                    } catch (RuntimeException lookupError) {
+                        callback.openLedgerFailed(
+                                ManagedLedgerException.getManagedLedgerException(lookupError), context);
+                        return;
+                    }
+                    selectedFactory.asyncOpen(
+                            persistenceName,
+                            managedLedgerConfig,
+                            bindingCompletionCallback(hybridStorage, permit, callback),
+                            ownershipChecker,
+                            context);
+                });
+    }
+
+    private static OpenLedgerCallback bindingCompletionCallback(
+            NereusManagedLedgerStorage hybridStorage,
+            StorageClassOpenPermit permit,
+            OpenLedgerCallback callback) {
+        return new OpenLedgerCallback() {
+            @Override
+            public void openLedgerComplete(ManagedLedger ledger, Object context) {
+                hybridStorage.bindingStore().completeStorageClassOpen(permit)
+                        .whenComplete((ignored, activationError) -> {
+                            if (activationError == null) {
+                                callback.openLedgerComplete(ledger, context);
+                                return;
+                            }
+                            Throwable cause = FutureUtil.unwrapCompletionException(activationError);
+                            ledger.asyncClose(new CloseCallback() {
+                                @Override
+                                public void closeComplete(Object closeContext) {
+                                    callback.openLedgerFailed(
+                                            ManagedLedgerException.getManagedLedgerException(cause), context);
+                                }
+
+                                @Override
+                                public void closeFailed(ManagedLedgerException closeError, Object closeContext) {
+                                    cause.addSuppressed(closeError);
+                                    callback.openLedgerFailed(
+                                            ManagedLedgerException.getManagedLedgerException(cause), context);
+                                }
+                            }, null);
+                        });
+            }
+
+            @Override
+            public void openLedgerFailed(ManagedLedgerException exception, Object context) {
+                callback.openLedgerFailed(exception, context);
+            }
+        };
+    }
+
     public void deleteTopicAuthenticationWithRetry(String topic, CompletableFuture<Void> future, int count) {
         if (count == 0) {
             log.error().attr("topic", topic).log("The number of retries has exhausted for topic");
@@ -2015,8 +2098,6 @@ public class BrokerService implements Closeable {
             topicEventsDispatcher.notifyOnCompletion(loadFuture, topic, TopicEvent.LOAD);
 
             // Once we have the configuration, we can proceed with the async open operation
-            ManagedLedgerFactory managedLedgerFactory =
-                    getManagedLedgerFactoryForTopic(topicName, managedLedgerConfig.getStorageClassName());
             LoggerBuilder loggerContextBuilder = log.with();
             if (topicName.isSegment()) {
                 loggerContextBuilder
@@ -2027,7 +2108,7 @@ public class BrokerService implements Closeable {
                 loggerContextBuilder.attr("topic", topicName.toString());
             }
             managedLedgerConfig.setLoggerContext(loggerContextBuilder.build());
-            managedLedgerFactory.asyncOpen(topicName.getPersistenceNamingEncoding(), managedLedgerConfig,
+            asyncOpenManagedLedgerWithStorageBinding(topicName, managedLedgerConfig,
                     new OpenLedgerCallback() {
                         @Override
                         public void openLedgerComplete(ManagedLedger ledger, Object ctx) {
