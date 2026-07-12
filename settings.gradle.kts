@@ -29,6 +29,15 @@ dependencyResolutionManagement {
     @Suppress("UnstableApiUsage")
     repositories {
         mavenCentral()
+        settings.providers.gradleProperty("nereusDevelopmentRepository").orNull?.let { repositoryPath ->
+            maven {
+                name = "nereusDevelopment"
+                url = uri(repositoryPath)
+                content {
+                    includeGroup("com.nereusstream")
+                }
+            }
+        }
         maven {
             url = uri("https://packages.confluent.io/maven/")
             content {

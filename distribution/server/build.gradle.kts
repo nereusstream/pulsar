@@ -94,6 +94,7 @@ dependencies {
     // Version constraints from the enforced platform (inherited via implementation,
     // which distLib extends) ensure consistent versions without manual resolutionStrategy.
     distLib(project(":pulsar-broker"))
+    distLib(libs.nereus.pulsar.adapter)
     // Minimized fastutil (replaces the full fastutil jar excluded from distLib above): only the
     // fastutil classes reachable from the broker and the bundled pulsar-client-original.
     distLib(project(":pulsar-broker-fastutil-minimized"))

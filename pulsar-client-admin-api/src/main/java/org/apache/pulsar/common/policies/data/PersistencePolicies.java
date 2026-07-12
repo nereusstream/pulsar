@@ -90,7 +90,7 @@ public class PersistencePolicies implements Cloneable {
                     && bookkeeperWriteQuorum == other.bookkeeperWriteQuorum
                     && bookkeeperAckQuorum == other.bookkeeperAckQuorum
                     && managedLedgerMaxMarkDeleteRate == other.managedLedgerMaxMarkDeleteRate
-                    && managedLedgerStorageClassName == other.managedLedgerStorageClassName;
+                    && Objects.equals(managedLedgerStorageClassName, other.managedLedgerStorageClassName);
         }
 
         return false;
