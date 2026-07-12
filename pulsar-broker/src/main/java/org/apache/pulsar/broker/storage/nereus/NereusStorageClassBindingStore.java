@@ -30,6 +30,7 @@ import java.util.concurrent.CompletionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Supplier;
 import org.apache.bookkeeper.mledger.ManagedLedgerException.ManagedLedgerNotFoundException;
 import org.apache.bookkeeper.mledger.ManagedLedgerFactory;
 import org.apache.pulsar.common.naming.TopicName;
@@ -42,6 +43,7 @@ public final class NereusStorageClassBindingStore implements AutoCloseable {
     private final MetadataStoreExtended metadataStore;
     private final ManagedLedgerFactory bookkeeperFactory;
     private final Duration timeout;
+    private final Supplier<CompletableFuture<Void>> nereusCapabilityCheck;
     private final StorageClassBindingKeyspace keyspace = new StorageClassBindingKeyspace();
     private final StorageClassBindingCodec codec = new StorageClassBindingCodec();
     private final AtomicBoolean closed = new AtomicBoolean();
@@ -51,9 +53,19 @@ public final class NereusStorageClassBindingStore implements AutoCloseable {
             MetadataStoreExtended metadataStore,
             ManagedLedgerFactory bookkeeperFactory,
             Duration timeout) {
+        this(metadataStore, bookkeeperFactory, timeout, () -> CompletableFuture.completedFuture(null));
+    }
+
+    public NereusStorageClassBindingStore(
+            MetadataStoreExtended metadataStore,
+            ManagedLedgerFactory bookkeeperFactory,
+            Duration timeout,
+            Supplier<CompletableFuture<Void>> nereusCapabilityCheck) {
         this.metadataStore = java.util.Objects.requireNonNull(metadataStore, "metadataStore");
         this.bookkeeperFactory = java.util.Objects.requireNonNull(bookkeeperFactory, "bookkeeperFactory");
         this.timeout = java.util.Objects.requireNonNull(timeout, "timeout");
+        this.nereusCapabilityCheck = java.util.Objects.requireNonNull(
+                nereusCapabilityCheck, "nereusCapabilityCheck");
         if (timeout.isZero() || timeout.isNegative()) {
             throw new IllegalArgumentException("timeout must be positive");
         }
@@ -88,8 +100,10 @@ public final class NereusStorageClassBindingStore implements AutoCloseable {
         } catch (RuntimeException error) {
             return CompletableFuture.failedFuture(error);
         }
-        return prepareStorageClassOpen(
-                path, persistenceName, selectedStorageClass, createIfMissing, factory, 0)
+        CompletableFuture<Void> capabilityReady = StorageClassBindingRecord.NEREUS.equals(selectedStorageClass)
+                && createIfMissing ? requireNereusCapability() : CompletableFuture.completedFuture(null);
+        return capabilityReady.thenCompose(ignored -> prepareStorageClassOpen(
+                path, persistenceName, selectedStorageClass, createIfMissing, factory, 0))
                 .orTimeout(timeout.toNanos(), TimeUnit.NANOSECONDS);
     }
 
@@ -745,6 +759,15 @@ public final class NereusStorageClassBindingStore implements AutoCloseable {
             throw new IllegalStateException("Nereus managed-ledger factory is not attached");
         }
         return factory;
+    }
+
+    private CompletableFuture<Void> requireNereusCapability() {
+        try {
+            return java.util.Objects.requireNonNull(
+                    nereusCapabilityCheck.get(), "nereusCapabilityCheck result");
+        } catch (Throwable error) {
+            return CompletableFuture.failedFuture(error);
+        }
     }
 
     private void requireOpen() {

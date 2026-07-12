@@ -52,6 +52,7 @@ public final class NereusManagedLedgerStorage implements ManagedLedgerStorage {
     private ManagedLedgerClientFactory bookkeeperStorage;
     private NereusManagedLedgerFactory nereusFactory;
     private NereusStorageClassBindingStore bindingStore;
+    private NereusBrokerCapabilityCoordinator capabilityCoordinator;
     private ManagedLedgerStorageClass bookkeeperClass;
     private ManagedLedgerStorageClass nereusClass;
     private Collection<ManagedLedgerStorageClass> storageClasses = List.of();
@@ -72,6 +73,8 @@ public final class NereusManagedLedgerStorage implements ManagedLedgerStorage {
         NereusManagedLedgerRuntime runtime = null;
         try {
             NereusBrokerStorageConfiguration checked = new NereusBrokerStorageConfiguration(conf);
+            capabilityCoordinator = new NereusBrokerCapabilityCoordinator(
+                    Duration.ofSeconds(conf.getNereusMetadataTimeoutSeconds()));
             NereusProcessIdentity identity = NereusProcessIdentity.generate(new SecureRandom());
             NereusRuntimeConfiguration runtimeConfiguration = checked.runtimeConfiguration(identity);
             ClassLoader classLoader = Thread.currentThread().getContextClassLoader();
@@ -92,7 +95,8 @@ public final class NereusManagedLedgerStorage implements ManagedLedgerStorage {
             bindingStore = new NereusStorageClassBindingStore(
                     metadataStore,
                     bookkeeperClass.getManagedLedgerFactory(),
-                    Duration.ofSeconds(conf.getNereusMetadataTimeoutSeconds()));
+                    Duration.ofSeconds(conf.getNereusMetadataTimeoutSeconds()),
+                    capabilityCoordinator::requireClusterReady);
             NereusRuntimeContext context = new NereusRuntimeContext(
                     eventLoopGroup,
                     openTelemetry,
@@ -112,6 +116,7 @@ public final class NereusManagedLedgerStorage implements ManagedLedgerStorage {
             bindingStore.attachNereusFactory(nereusFactory);
             nereusClass = new NereusManagedLedgerStorageClass(nereusFactory);
             storageClasses = List.of(bookkeeperClass, nereusClass);
+            capabilityCoordinator.markStorageInitialized();
         } catch (Throwable failure) {
             if (runtime != null) {
                 suppressClose(failure, runtime);
@@ -156,6 +161,11 @@ public final class NereusManagedLedgerStorage implements ManagedLedgerStorage {
     public NereusStorageClassBindingStore bindingStore() {
         ensureReady();
         return bindingStore;
+    }
+
+    public NereusBrokerCapabilityCoordinator capabilityCoordinator() {
+        ensureReady();
+        return capabilityCoordinator;
     }
 
     @Override

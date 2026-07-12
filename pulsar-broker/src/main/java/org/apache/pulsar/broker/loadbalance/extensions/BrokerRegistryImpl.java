@@ -39,6 +39,7 @@ import org.apache.pulsar.broker.PulsarServerException;
 import org.apache.pulsar.broker.PulsarService;
 import org.apache.pulsar.broker.ServiceConfiguration;
 import org.apache.pulsar.broker.loadbalance.extensions.data.BrokerLookupData;
+import org.apache.pulsar.broker.storage.nereus.NereusManagedLedgerStorage;
 import org.apache.pulsar.broker.storage.nereus.NereusStorageBindingCapability;
 import org.apache.pulsar.common.util.FutureUtil;
 import org.apache.pulsar.metadata.api.MetadataCache;
@@ -89,6 +90,15 @@ public class BrokerRegistryImpl implements BrokerRegistry {
         this.scheduler = pulsar.getLoadManagerExecutor();
         this.listeners = new ArrayList<>();
         this.brokerIdKeyPath = keyPath(pulsar.getBrokerId());
+        Map<String, String> lookupProperties;
+        if (pulsar.getManagedLedgerStorage() instanceof NereusManagedLedgerStorage nereusStorage) {
+            nereusStorage.capabilityCoordinator().attachBrokerRegistry(this);
+            lookupProperties = nereusStorage.capabilityCoordinator()
+                    .decorateLookupProperties(pulsar.getConfig().lookupProperties());
+        } else {
+            lookupProperties = NereusStorageBindingCapability.requireUnreserved(
+                    pulsar.getConfig().lookupProperties());
+        }
         this.brokerLookupData = new BrokerLookupData(
                 pulsar.getBrokerId(),
                 pulsar.getWebServiceAddress(),
@@ -102,8 +112,7 @@ public class BrokerRegistryImpl implements BrokerRegistry {
                 conf.getLoadManagerClassName(),
                 System.currentTimeMillis(),
                 pulsar.getBrokerVersion(),
-                NereusStorageBindingCapability.lookupProperties(
-                        conf, pulsar.getConfig().lookupProperties()));
+                lookupProperties);
     }
 
     public BrokerRegistryImpl(PulsarService pulsar) {

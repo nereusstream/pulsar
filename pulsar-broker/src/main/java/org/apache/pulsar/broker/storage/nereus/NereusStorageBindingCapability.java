@@ -18,31 +18,21 @@
  */
 package org.apache.pulsar.broker.storage.nereus;
 
-import java.util.HashMap;
 import java.util.Map;
-import org.apache.pulsar.broker.ServiceConfiguration;
 
-/** Publishes the non-spoofable storage-binding protocol capability in broker lookup data. */
+/** Defines and protects the reserved storage-binding protocol lookup property. */
 public final class NereusStorageBindingCapability {
-    public static final String PROPERTY = "nereus.storage-binding-protocol";
-    public static final String VERSION = "1";
+    public static final String PROPERTY = NereusBrokerCapabilityCoordinator.PROPERTY;
+    public static final String VERSION = NereusBrokerCapabilityCoordinator.VERSION;
 
     private NereusStorageBindingCapability() {
     }
 
-    public static Map<String, String> lookupProperties(
-            ServiceConfiguration configuration, Map<String, String> configuredProperties) {
-        java.util.Objects.requireNonNull(configuration, "configuration");
+    public static Map<String, String> requireUnreserved(Map<String, String> configuredProperties) {
         java.util.Objects.requireNonNull(configuredProperties, "configuredProperties");
         if (configuredProperties.containsKey(PROPERTY)) {
             throw new IllegalArgumentException(PROPERTY + " is reserved by the broker");
         }
-        Map<String, String> properties = new HashMap<>(configuredProperties);
-        if (configuration.isNereusEnabled()
-                && NereusManagedLedgerStorage.class.getName().equals(
-                        configuration.getManagedLedgerStorageClassName())) {
-            properties.put(PROPERTY, VERSION);
-        }
-        return Map.copyOf(properties);
+        return Map.copyOf(configuredProperties);
     }
 }
