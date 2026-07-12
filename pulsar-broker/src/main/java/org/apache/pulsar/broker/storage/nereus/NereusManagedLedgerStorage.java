@@ -90,7 +90,9 @@ public final class NereusManagedLedgerStorage implements ManagedLedgerStorage {
             }
 
             bindingStore = new NereusStorageClassBindingStore(
-                    metadataStore, Duration.ofSeconds(conf.getNereusMetadataTimeoutSeconds()));
+                    metadataStore,
+                    bookkeeperClass.getManagedLedgerFactory(),
+                    Duration.ofSeconds(conf.getNereusMetadataTimeoutSeconds()));
             NereusRuntimeContext context = new NereusRuntimeContext(
                     eventLoopGroup,
                     openTelemetry,

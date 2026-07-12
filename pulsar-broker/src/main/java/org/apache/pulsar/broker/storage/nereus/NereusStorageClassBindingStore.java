@@ -22,6 +22,8 @@ import com.nereusstream.api.keys.DeterministicIds;
 import com.nereusstream.managedledger.integration.NereusCreationGuard;
 import com.nereusstream.managedledger.integration.NereusCreationPermit;
 import java.nio.ByteBuffer;
+import java.nio.charset.CharacterCodingException;
+import java.nio.charset.CodingErrorAction;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.Arrays;
@@ -30,6 +32,7 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import org.apache.bookkeeper.mledger.ManagedLedgerFactory;
 import org.apache.pulsar.metadata.api.GetResult;
 import org.apache.pulsar.metadata.api.MetadataStoreException;
 import org.apache.pulsar.metadata.api.extended.MetadataStoreExtended;
@@ -39,11 +42,16 @@ public final class NereusStorageClassBindingStore implements AutoCloseable {
     private static final byte[] MAGIC = new byte[] {'N', 'S', 'B', '1'};
     private static final String ROOT = "/managed-ledger-storage-bindings/v1/";
     private final MetadataStoreExtended metadataStore;
+    private final ManagedLedgerFactory bookkeeperFactory;
     private final Duration timeout;
     private final AtomicBoolean closed = new AtomicBoolean();
 
-    public NereusStorageClassBindingStore(MetadataStoreExtended metadataStore, Duration timeout) {
+    public NereusStorageClassBindingStore(
+            MetadataStoreExtended metadataStore,
+            ManagedLedgerFactory bookkeeperFactory,
+            Duration timeout) {
         this.metadataStore = java.util.Objects.requireNonNull(metadataStore, "metadataStore");
+        this.bookkeeperFactory = java.util.Objects.requireNonNull(bookkeeperFactory, "bookkeeperFactory");
         this.timeout = java.util.Objects.requireNonNull(timeout, "timeout");
         if (timeout.isZero() || timeout.isNegative()) {
             throw new IllegalArgumentException("timeout must be positive");
@@ -74,7 +82,12 @@ public final class NereusStorageClassBindingStore implements AutoCloseable {
                 Binding binding = decode(existing.orElseThrow().getValue(), persistenceName);
                 return CompletableFuture.completedFuture(permit(path, binding));
             }
-            return metadataStore.put(path, candidate, Optional.of(-1L))
+            return bookkeeperFactory.asyncExists(persistenceName).thenCompose(bookkeeperExists -> {
+                if (bookkeeperExists) {
+                    return CompletableFuture.failedFuture(new IllegalStateException(
+                            "existing BookKeeper storage cannot be opened as Nereus"));
+                }
+                return metadataStore.put(path, candidate, Optional.of(-1L))
                     .thenApply(ignored -> permit(path, new Binding(persistenceName, 1)))
                     .exceptionallyCompose(failure -> {
                         if (!isBadVersion(failure)) {
@@ -86,6 +99,7 @@ public final class NereusStorageClassBindingStore implements AutoCloseable {
                             return permit(path, decode(result.getValue(), persistenceName));
                         });
                     });
+            });
         });
         return operation.orTimeout(timeout.toNanos(), TimeUnit.NANOSECONDS);
     }
@@ -108,7 +122,13 @@ public final class NereusStorageClassBindingStore implements AutoCloseable {
                     return CompletableFuture.failedFuture(
                             new IllegalStateException("Nereus binding store is closed"));
                 }
-                return metadataStore.get(path).thenApply(current -> {
+                return metadataStore.get(path).thenCombine(
+                        bookkeeperFactory.asyncExists(binding.persistenceName()),
+                        (current, bookkeeperExists) -> {
+                    if (bookkeeperExists) {
+                        throw new IllegalStateException(
+                                "BookKeeper storage appeared before Nereus projection publish");
+                    }
                     GetResult result = current.orElseThrow(() ->
                             new IllegalStateException("Nereus binding disappeared before projection publish"));
                     Binding actual = decode(result.getValue(), binding.persistenceName());
@@ -148,13 +168,25 @@ public final class NereusStorageClassBindingStore implements AutoCloseable {
             }
             byte[] name = new byte[length];
             buffer.get(name);
-            String persistenceName = new String(name, StandardCharsets.UTF_8);
+            String persistenceName = strictUtf8(name);
             if (!persistenceName.equals(expectedName)) {
                 throw new IllegalStateException("Nereus binding hash collision");
             }
             return new Binding(persistenceName, generation);
         } catch (RuntimeException failure) {
             throw new IllegalStateException("corrupt Nereus storage-class binding", failure);
+        }
+    }
+
+    private static String strictUtf8(byte[] value) {
+        try {
+            return StandardCharsets.UTF_8.newDecoder()
+                    .onMalformedInput(CodingErrorAction.REPORT)
+                    .onUnmappableCharacter(CodingErrorAction.REPORT)
+                    .decode(ByteBuffer.wrap(value))
+                    .toString();
+        } catch (CharacterCodingException error) {
+            throw new IllegalArgumentException("binding name is not strict UTF-8", error);
         }
     }
 
