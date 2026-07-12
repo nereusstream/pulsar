@@ -148,6 +148,10 @@ import org.apache.pulsar.broker.stats.prometheus.metrics.Summary;
 import org.apache.pulsar.broker.storage.ManagedLedgerStorage;
 import org.apache.pulsar.broker.storage.ManagedLedgerStorageClass;
 import org.apache.pulsar.broker.storage.nereus.NereusManagedLedgerStorage;
+import org.apache.pulsar.broker.storage.nereus.NereusResolvedTopicFeatures;
+import org.apache.pulsar.broker.storage.nereus.NereusTopicFeatureResolver;
+import org.apache.pulsar.broker.storage.nereus.NereusTopicFeatureValidator;
+import org.apache.pulsar.broker.storage.nereus.NereusTopicOpenContext;
 import org.apache.pulsar.broker.storage.nereus.StorageClassBindingRecord;
 import org.apache.pulsar.broker.storage.nereus.StorageClassDeletePermit;
 import org.apache.pulsar.broker.storage.nereus.StorageClassOpenPermit;
@@ -2153,12 +2157,13 @@ public class BrokerService implements Closeable {
         CompletableFuture<Void> isTopicAlreadyMigrated = checkTopicAlreadyMigrated(topicName);
         maxTopicsCheck.thenCompose(partitionedTopicMetadata -> validateTopicConsistency(topicName))
                 .thenCompose(__ -> isTopicAlreadyMigrated)
-                .thenCompose(__ -> getManagedLedgerConfig(topicName))
+                .thenCompose(__ -> getNereusTopicOpenContext(topicName))
                 .thenCombine(pulsar().getNamespaceService().checkTopicExistsAsync(topicName).thenApply(n -> {
                             boolean found = n.isExists();
                             n.recycle();
                             return found;
-                        }), (managedLedgerConfig, exists) -> {
+                        }), (openContext, exists) -> {
+            ManagedLedgerConfig managedLedgerConfig = openContext.managedLedgerConfig();
             if (isBrokerEntryMetadataEnabled() || isBrokerPayloadProcessorEnabled()) {
                 // init managedLedger interceptor
                 Set<BrokerEntryMetadataInterceptor> interceptors = new HashSet<>();
@@ -2180,6 +2185,14 @@ public class BrokerService implements Closeable {
             String shadowSource = managedLedgerConfig.getShadowSource();
             if (shadowSource != null) {
                 managedLedgerConfig.setShadowSourceName(TopicName.get(shadowSource).getPersistenceNamingEncoding());
+            }
+            if (StorageClassBindingRecord.NEREUS.equals(managedLedgerConfig.getStorageClassName())) {
+                try {
+                    new NereusTopicFeatureValidator().validateTopicOpen(
+                            topicName, managedLedgerConfig, openContext.features());
+                } catch (NotAllowedException error) {
+                    throw new CompletionException(error);
+                }
             }
 
             topicEventsDispatcher.notify(topic, TopicEvent.LOAD, EventStage.BEFORE);
@@ -2350,6 +2363,10 @@ public class BrokerService implements Closeable {
     }
 
     public CompletableFuture<ManagedLedgerConfig> getManagedLedgerConfig(@NonNull TopicName topicName) {
+        return getNereusTopicOpenContext(topicName).thenApply(NereusTopicOpenContext::managedLedgerConfig);
+    }
+
+    public CompletableFuture<NereusTopicOpenContext> getNereusTopicOpenContext(@NonNull TopicName topicName) {
         if (topicName == null) {
             return FutureUtil.failedFuture(new NullPointerException("topicName"));
         }
@@ -2553,7 +2570,13 @@ public class BrokerService implements Closeable {
                     serviceConfig.isAcknowledgmentAtBatchIndexLevelEnabled());
             managedLedgerConfig.setNewEntriesCheckDelayInMillis(
                     serviceConfig.getManagedLedgerNewEntriesCheckDelayInMillis());
-            return managedLedgerConfig;
+            NereusResolvedTopicFeatures features = NereusTopicFeatureResolver.resolve(
+                    serviceConfig,
+                    policies.orElseGet(Policies::new),
+                    topicP,
+                    globalTopicP,
+                    topicName);
+            return new NereusTopicOpenContext(managedLedgerConfig, features);
         }).exceptionally(ex -> {
             final Throwable rc = FutureUtil.unwrapCompletionException(ex);
             log.error().attr("topic", topicName)
