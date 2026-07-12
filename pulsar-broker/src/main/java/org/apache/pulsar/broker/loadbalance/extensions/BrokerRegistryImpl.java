@@ -39,6 +39,7 @@ import org.apache.pulsar.broker.PulsarServerException;
 import org.apache.pulsar.broker.PulsarService;
 import org.apache.pulsar.broker.ServiceConfiguration;
 import org.apache.pulsar.broker.loadbalance.extensions.data.BrokerLookupData;
+import org.apache.pulsar.broker.storage.nereus.NereusStorageBindingCapability;
 import org.apache.pulsar.common.util.FutureUtil;
 import org.apache.pulsar.metadata.api.MetadataCache;
 import org.apache.pulsar.metadata.api.MetadataStoreException;
@@ -101,7 +102,8 @@ public class BrokerRegistryImpl implements BrokerRegistry {
                 conf.getLoadManagerClassName(),
                 System.currentTimeMillis(),
                 pulsar.getBrokerVersion(),
-                pulsar.getConfig().lookupProperties());
+                NereusStorageBindingCapability.lookupProperties(
+                        conf, pulsar.getConfig().lookupProperties()));
     }
 
     public BrokerRegistryImpl(PulsarService pulsar) {
