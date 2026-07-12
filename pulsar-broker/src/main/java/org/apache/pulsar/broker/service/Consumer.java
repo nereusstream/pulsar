@@ -56,6 +56,7 @@ import org.apache.pulsar.broker.authentication.AuthenticationDataSubscription;
 import org.apache.pulsar.broker.loadbalance.extensions.data.BrokerLookupData;
 import org.apache.pulsar.broker.service.persistent.PersistentSubscription;
 import org.apache.pulsar.broker.service.persistent.PersistentTopic;
+import org.apache.pulsar.broker.storage.nereus.NereusAcknowledgeValidator;
 import org.apache.pulsar.client.api.MessageId;
 import org.apache.pulsar.client.api.transaction.TxnID;
 import org.apache.pulsar.common.api.proto.CommandAck;
@@ -83,6 +84,8 @@ import org.apache.pulsar.transaction.common.exception.TransactionConflictExcepti
 public class Consumer {
 
     private static final Logger LOG = Logger.get(Consumer.class);
+    private static final NereusAcknowledgeValidator NEREUS_ACKNOWLEDGE_VALIDATOR =
+            new NereusAcknowledgeValidator();
     private final Logger log;
 
     private final Subscription subscription;
@@ -521,6 +524,12 @@ public class Consumer {
     }
 
     public CompletableFuture<Void> messageAcked(CommandAck ack, boolean requirePersistedAck) {
+        Optional<BrokerServiceException.NotAllowedException> nereusRejection =
+                NEREUS_ACKNOWLEDGE_VALIDATOR.rejection(subscription, subType, ack, requirePersistedAck);
+        if (nereusRejection.isPresent()) {
+            return FutureUtil.failedFuture(nereusRejection.get());
+        }
+        boolean nereusAcknowledgement = NEREUS_ACKNOWLEDGE_VALIDATOR.isNereusSubscription(subscription);
         CompletableFuture<Long> future;
 
         this.lastAckedTimestamp = System.currentTimeMillis();
@@ -558,7 +567,7 @@ public class Consumer {
                 future = transactionCumulativeAcknowledge(ack.getTxnidMostBits(),
                         ack.getTxnidLeastBits(), positionsAcked)
                         .thenApply(unused -> 1L);
-            } else if (requirePersistedAck) {
+            } else if (requirePersistedAck || nereusAcknowledgement) {
                 future = subscription.acknowledgeMessageAsync(positionsAcked, AckType.Cumulative, properties)
                         .thenApply(unused -> 1L);
             } else {
