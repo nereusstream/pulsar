@@ -33,6 +33,7 @@ import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
+import org.apache.bookkeeper.client.BookKeeperAdmin;
 import org.apache.bookkeeper.common.allocator.PoolingPolicy;
 import org.apache.bookkeeper.conf.ServerConfiguration;
 import org.apache.bookkeeper.mledger.Entry;
@@ -240,6 +241,7 @@ public class NereusMultiBrokerIntegrationTest {
         assertActiveBinding(brokers.get(stoppedOwner), BOOKKEEPER_TOPIC, StorageClassBindingRecord.BOOKKEEPER);
         assertLoadedLedgerType(brokers.get(stoppedOwner), NEREUS_TOPIC, NereusManagedLedger.class);
         assertLoadedLedgerType(brokers.get(stoppedOwner), BOOKKEEPER_TOPIC, ManagedLedgerImpl.class);
+        assertVirtualLedgerAbsentFromBookKeeper(brokers.get(stoppedOwner));
         assertThat(objectCount()).isPositive();
     }
 
@@ -556,6 +558,20 @@ public class NereusMultiBrokerIntegrationTest {
                 .getTopicReference(topic)
                 .orElseThrow();
         assertThat(loaded.getManagedLedger()).isInstanceOf(expectedType);
+    }
+
+    private static void assertVirtualLedgerAbsentFromBookKeeper(PulsarService broker) throws Exception {
+        PersistentTopic loaded = (PersistentTopic) broker.getBrokerService()
+                .getTopicReference(NEREUS_TOPIC)
+                .orElseThrow();
+        long virtualLedgerId = ((NereusManagedLedger) loaded.getManagedLedger())
+                .projection().virtualLedgerId();
+        try (BookKeeperAdmin admin = new BookKeeperAdmin(broker.getBookKeeperClient())) {
+            List<Long> bookKeeperLedgerIds = new ArrayList<>();
+            admin.listLedgers().forEach(bookKeeperLedgerIds::add);
+            assertThat(bookKeeperLedgerIds).isNotEmpty();
+            assertThat(bookKeeperLedgerIds).doesNotContain(virtualLedgerId);
+        }
     }
 
     private void awaitCapabilityConvergence() {
