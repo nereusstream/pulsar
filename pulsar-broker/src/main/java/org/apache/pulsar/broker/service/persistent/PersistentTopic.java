@@ -31,6 +31,7 @@ import com.carrotsearch.hppc.cursors.ObjectObjectCursor;
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.collect.Sets;
 import com.nereusstream.managedledger.NereusManagedLedger;
+import com.nereusstream.managedledger.NereusWriteFenceView;
 import io.github.merlimat.slog.Logger;
 import io.netty.buffer.ByteBuf;
 import io.netty.util.concurrent.FastThreadLocal;
@@ -150,6 +151,8 @@ import org.apache.pulsar.broker.storage.nereus.NereusTopicFeatureValidator;
 import org.apache.pulsar.broker.storage.nereus.NereusTopicOpenContext;
 import org.apache.pulsar.broker.storage.nereus.NereusTopicPolicySnapshot;
 import org.apache.pulsar.broker.storage.nereus.NereusTopicPolicyUpdateCoordinator;
+import org.apache.pulsar.broker.storage.nereus.NereusWriteFenceBridge;
+import org.apache.pulsar.broker.storage.nereus.NereusWriteFenceCompletion;
 import org.apache.pulsar.broker.storage.nereus.StorageClassBindingRecord;
 import org.apache.pulsar.broker.transaction.buffer.TransactionBuffer;
 import org.apache.pulsar.broker.transaction.buffer.impl.TopicTransactionBuffer;
@@ -227,6 +230,10 @@ public class PersistentTopic extends AbstractTopic implements Topic, AddEntryCal
     // Managed ledger associated with the topic
     protected final ManagedLedger ledger;
     private final boolean nereusManagedLedger;
+    private final NereusWriteFenceView nereusWriteFenceView;
+    private final NereusWriteFenceBridge nereusWriteFenceBridge;
+    private boolean nereusWriteFenceAwaitingCompletion;
+    private NereusWriteFenceCompletion retainedNereusWriteFenceCompletion;
     private final NereusTopicPolicyUpdateCoordinator nereusPolicyUpdateCoordinator =
             new NereusTopicPolicyUpdateCoordinator();
     private volatile NereusResolvedTopicFeatures nereusFeatures;
@@ -431,6 +438,8 @@ public class PersistentTopic extends AbstractTopic implements Topic, AddEntryCal
                 : null;
         this.ledger = ledger;
         this.nereusManagedLedger = ledger instanceof NereusManagedLedger;
+        this.nereusWriteFenceView = ledger instanceof NereusWriteFenceView view ? view : null;
+        this.nereusWriteFenceBridge = nereusWriteFenceView == null ? null : new NereusWriteFenceBridge();
         this.backloggedCursorThresholdEntries =
                 brokerService.pulsar().getConfiguration().getManagedLedgerCursorBackloggedThreshold();
         this.messageDeduplication = new MessageDeduplication(brokerService.pulsar(), this, ledger);
@@ -470,6 +479,8 @@ public class PersistentTopic extends AbstractTopic implements Topic, AddEntryCal
                 : null;
         this.ledger = ledger;
         this.nereusManagedLedger = ledger instanceof NereusManagedLedger;
+        this.nereusWriteFenceView = ledger instanceof NereusWriteFenceView view ? view : null;
+        this.nereusWriteFenceBridge = nereusWriteFenceView == null ? null : new NereusWriteFenceBridge();
         this.messageDeduplication = messageDeduplication;
         this.backloggedCursorThresholdEntries =
                 brokerService.pulsar().getConfiguration().getManagedLedgerCursorBackloggedThreshold();
@@ -772,20 +783,130 @@ public class PersistentTopic extends AbstractTopic implements Topic, AddEntryCal
         return ledger.getNumberOfEntries();
     }
 
+    @VisibleForTesting
+    void setPendingWriteOpsForTest(long pending) {
+        pendingWriteOps.set(pending);
+    }
+
     private void decrementPendingWriteOpsAndCheck() {
         long pending = pendingWriteOps.decrementAndGet();
+        boolean closeTopic = false;
         if (pending == 0 && isFenced && !isClosingOrDeleting) {
             synchronized (this) {
                 if (isFenced && !isClosingOrDeleting) {
-                    messageDeduplication.resetHighestSequenceIdPushed();
-                    log.info("Un-fencing topic...");
-                    // signal to managed ledger that we are ready to resume by creating a new ledger
-                    ledger.readyToCreateNewLedger();
-
-                    unfence();
+                    if (deferNereusAutoUnfenceIfNeeded()) {
+                        return;
+                    }
+                    if (nereusWriteFenceAwaitingCompletion) {
+                        return;
+                    }
+                    NereusWriteFenceCompletion completion = retainedNereusWriteFenceCompletion;
+                    retainedNereusWriteFenceCompletion = null;
+                    if (completion != null && completion.failure() != null) {
+                        logNereusWriteFenceFailure(completion);
+                        closeTopic = true;
+                    } else {
+                        resumeAfterWriteFence(completion);
+                    }
                 }
 
             }
+        }
+        if (closeTopic) {
+            closeAfterNereusWriteFenceFailure();
+        }
+    }
+
+    private boolean deferNereusAutoUnfenceIfNeeded() {
+        if (nereusWriteFenceBridge == null) {
+            return false;
+        }
+        nereusWriteFenceAwaitingCompletion = true;
+        try {
+            boolean deferred = nereusWriteFenceBridge.deferAutoUnfenceIfNeeded(
+                    nereusWriteFenceView,
+                    orderedExecutor == null ? Runnable::run : orderedExecutor,
+                    this::onNereusWriteFenceCompletion);
+            if (deferred) {
+                cancelFencedTopicMonitoringTask();
+            } else {
+                nereusWriteFenceAwaitingCompletion = false;
+            }
+            return deferred;
+        } catch (Throwable error) {
+            nereusWriteFenceAwaitingCompletion = false;
+            log.error().exception(error).log("Failed to inspect Nereus write fence; closing topic");
+            closeAfterNereusWriteFenceFailure();
+            return true;
+        }
+    }
+
+    private void onNereusWriteFenceCompletion(NereusWriteFenceCompletion completion) {
+        boolean closeTopic = false;
+        synchronized (this) {
+            nereusWriteFenceAwaitingCompletion = false;
+            if (!isFenced || isClosingOrDeleting) {
+                return;
+            }
+            if (deferNereusAutoUnfenceIfNeeded()) {
+                return;
+            }
+            if (pendingWriteOps.get() != 0) {
+                retainNereusWriteFenceCompletion(completion);
+                return;
+            }
+            retainedNereusWriteFenceCompletion = null;
+            if (completion.failure() != null) {
+                logNereusWriteFenceFailure(completion);
+                closeTopic = true;
+            } else {
+                resumeAfterWriteFence(completion);
+            }
+        }
+        if (closeTopic) {
+            closeAfterNereusWriteFenceFailure();
+        }
+    }
+
+    private void retainNereusWriteFenceCompletion(NereusWriteFenceCompletion completion) {
+        if (retainedNereusWriteFenceCompletion == null
+                || retainedNereusWriteFenceCompletion.generation() <= completion.generation()) {
+            retainedNereusWriteFenceCompletion = completion;
+        }
+    }
+
+    private void resumeAfterWriteFence(NereusWriteFenceCompletion completion) {
+        messageDeduplication.resetHighestSequenceIdPushed();
+        if (completion == null) {
+            log.info("Un-fencing topic...");
+        } else {
+            log.info()
+                    .attr("generation", completion.generation())
+                    .attr("resolution", completion.resolution())
+                    .log("Nereus write fence resolved; un-fencing topic");
+        }
+        // signal to managed ledger that we are ready to resume by creating a new ledger
+        ledger.readyToCreateNewLedger();
+        unfence();
+    }
+
+    private void logNereusWriteFenceFailure(NereusWriteFenceCompletion completion) {
+        log.error()
+                .attr("generation", completion.generation())
+                .exception(completion.failure())
+                .log("Nereus write-fence recovery failed permanently; closing topic");
+    }
+
+    private void closeAfterNereusWriteFenceFailure() {
+        close().exceptionally(error -> {
+            log.error().exception(error).log("Failed to close topic after Nereus write-fence failure");
+            return null;
+        });
+    }
+
+    private void closeNereusWriteFenceBridge() {
+        if (nereusWriteFenceBridge != null) {
+            nereusWriteFenceBridge.close();
         }
     }
 
@@ -834,6 +955,10 @@ public class PersistentTopic extends AbstractTopic implements Topic, AddEntryCal
         } else {
             // fence topic when failed to write a message to BK
             fence();
+            // The Nereus managed-ledger contract keeps an uncertain-write fence visible until this callback
+            // returns. Capture it before producer disconnects can delay pending-write drainage. A terminal
+            // result delivered during that delay is retained and consumed only when pendingWriteOps reaches zero.
+            deferNereusAutoUnfenceIfNeeded();
             // close all producers
             CompletableFuture<Void> disconnectProducersFuture;
             if (producers.size() > 0) {
@@ -1800,6 +1925,7 @@ public class PersistentTopic extends AbstractTopic implements Topic, AddEntryCal
 
                                                         unregisterTopicPolicyListener();
 
+                                                        closeNereusWriteFenceBridge();
                                                         log.info("Topic deleted");
                                                         deleteFuture.complete(null);
                                                     });
@@ -1996,6 +2122,7 @@ public class PersistentTopic extends AbstractTopic implements Topic, AddEntryCal
         Runnable closeLedgerAfterCloseClients = (() -> ledger.asyncClose(new CloseCallback() {
             @Override
             public void closeComplete(Object ctx) {
+                closeNereusWriteFenceBridge();
                 if (closeType != CloseTypes.transferring) {
                     // Everything is now closed, remove the topic from map
                     disposeTopic(closeFuture);
@@ -2009,6 +2136,7 @@ public class PersistentTopic extends AbstractTopic implements Topic, AddEntryCal
                 log.error()
                         .exception(exception)
                         .log("Failed to close managed ledger, proceeding anyway.");
+                closeNereusWriteFenceBridge();
                 if (closeType != CloseTypes.transferring) {
                     disposeTopic(closeFuture);
                 } else {
@@ -2087,6 +2215,7 @@ public class PersistentTopic extends AbstractTopic implements Topic, AddEntryCal
                     unregisterTopicPolicyListener();
                     log.info("Topic closed");
                     cancelFencedTopicMonitoringTask();
+                    closeNereusWriteFenceBridge();
                     closeFuture.complete(null);
                 })
                 .exceptionally(ex -> {

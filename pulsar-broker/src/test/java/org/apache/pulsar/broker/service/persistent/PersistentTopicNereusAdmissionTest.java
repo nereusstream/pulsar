@@ -21,19 +21,31 @@ package org.apache.pulsar.broker.service.persistent;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.doReturn;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.spy;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
+import com.nereusstream.api.AppendAttemptId;
 import com.nereusstream.managedledger.NereusManagedLedger;
+import com.nereusstream.managedledger.NereusWriteFenceResolution;
+import com.nereusstream.managedledger.NereusWriteFenceSnapshot;
+import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 import org.apache.bookkeeper.mledger.ManagedLedger;
 import org.apache.bookkeeper.mledger.ManagedLedgerConfig;
+import org.apache.bookkeeper.mledger.ManagedLedgerException;
 import org.apache.pulsar.broker.PulsarService;
 import org.apache.pulsar.broker.ServiceConfiguration;
 import org.apache.pulsar.broker.qos.AsyncTokenBucket;
 import org.apache.pulsar.broker.service.BacklogQuotaManager;
 import org.apache.pulsar.broker.service.BrokerService;
+import org.apache.pulsar.broker.service.Producer;
+import org.apache.pulsar.broker.service.Topic.PublishContext;
 import org.apache.pulsar.broker.storage.nereus.NereusAdminOperation;
 import org.apache.pulsar.broker.storage.nereus.NereusResolvedTopicFeatures;
 import org.apache.pulsar.broker.storage.nereus.NereusTopicOpenContext;
@@ -96,6 +108,132 @@ public class PersistentTopicNereusAdmissionTest {
         verify(ledger, never()).setConfig(any());
     }
 
+    @Test
+    public void waitsForNewestWriteFenceGenerationBeforeAutoUnfence() throws Exception {
+        BrokerService brokerService = brokerService();
+        NereusManagedLedger ledger = mock(NereusManagedLedger.class);
+        AtomicReference<Optional<NereusWriteFenceSnapshot>> current = new AtomicReference<>(fence(1));
+        CompletableFuture<NereusWriteFenceResolution> first = new CompletableFuture<>();
+        CompletableFuture<NereusWriteFenceResolution> second = new CompletableFuture<>();
+        when(ledger.currentWriteFence()).thenAnswer(ignored -> current.get());
+        when(ledger.awaitWriteFence(1)).thenReturn(first);
+        when(ledger.awaitWriteFence(2)).thenReturn(second);
+        MessageDeduplication deduplication = mock(MessageDeduplication.class);
+        PersistentTopic topic = new PersistentTopic(
+                "persistent://tenant/ns/nereus-write-fence",
+                brokerService,
+                ledger,
+                deduplication);
+        setPendingWrites(topic, 1);
+
+        topic.addFailed(new ManagedLedgerException("retryably uncertain"), mock(PublishContext.class));
+
+        assertThat(topic.isFenced()).isTrue();
+        verify(ledger, never()).readyToCreateNewLedger();
+
+        current.set(fence(2));
+        first.complete(NereusWriteFenceResolution.COMMITTED);
+        assertThat(topic.isFenced()).isTrue();
+        verify(ledger).awaitWriteFence(2);
+        verify(ledger, never()).readyToCreateNewLedger();
+
+        current.set(Optional.empty());
+        second.complete(NereusWriteFenceResolution.PROVEN_NOT_COMMITTED);
+
+        assertThat(topic.isFenced()).isFalse();
+        verify(ledger).readyToCreateNewLedger();
+        verify(ledger).unfenceForInterceptorException();
+        verify(deduplication).resetHighestSequenceIdPushed();
+    }
+
+    @Test
+    public void permanentWriteFenceFailureClosesWithoutAutoUnfence() throws Exception {
+        BrokerService brokerService = brokerService();
+        NereusManagedLedger ledger = mock(NereusManagedLedger.class);
+        AtomicReference<Optional<NereusWriteFenceSnapshot>> current = new AtomicReference<>(fence(1));
+        CompletableFuture<NereusWriteFenceResolution> terminal = new CompletableFuture<>();
+        when(ledger.currentWriteFence()).thenAnswer(ignored -> current.get());
+        when(ledger.awaitWriteFence(1)).thenReturn(terminal);
+        PersistentTopic topic = spy(new PersistentTopic(
+                "persistent://tenant/ns/nereus-write-fence-failure",
+                brokerService,
+                ledger,
+                mock(MessageDeduplication.class)));
+        doReturn(CompletableFuture.completedFuture(null)).when(topic).close();
+        setPendingWrites(topic, 1);
+
+        topic.addFailed(new ManagedLedgerException("retryably uncertain"), mock(PublishContext.class));
+        current.set(Optional.empty());
+        terminal.completeExceptionally(new IllegalStateException("permanent recovery failure"));
+
+        verify(topic).close();
+        verify(ledger, never()).readyToCreateNewLedger();
+        verify(ledger, never()).unfenceForInterceptorException();
+        assertThat(topic.isFenced()).isTrue();
+    }
+
+    @Test
+    public void retainsEarlyWriteFenceCompletionUntilProducerDisconnects() throws Exception {
+        BrokerService brokerService = brokerService();
+        NereusManagedLedger ledger = mock(NereusManagedLedger.class);
+        AtomicReference<Optional<NereusWriteFenceSnapshot>> current = new AtomicReference<>(fence(1));
+        CompletableFuture<NereusWriteFenceResolution> terminal = new CompletableFuture<>();
+        when(ledger.currentWriteFence()).thenAnswer(ignored -> current.get());
+        when(ledger.awaitWriteFence(1)).thenReturn(terminal);
+        MessageDeduplication deduplication = mock(MessageDeduplication.class);
+        PersistentTopic topic = new PersistentTopic(
+                "persistent://tenant/ns/nereus-early-write-fence-completion",
+                brokerService,
+                ledger,
+                deduplication);
+        Producer producer = mock(Producer.class);
+        CompletableFuture<Void> disconnect = new CompletableFuture<>();
+        when(producer.disconnect()).thenReturn(disconnect);
+        topic.getProducers().put("producer", producer);
+        setPendingWrites(topic, 1);
+
+        topic.addFailed(new ManagedLedgerException("retryably uncertain"), mock(PublishContext.class));
+        current.set(Optional.empty());
+        terminal.complete(NereusWriteFenceResolution.COMMITTED);
+
+        assertThat(topic.isFenced()).isTrue();
+        verify(ledger, never()).readyToCreateNewLedger();
+        verify(ledger).awaitWriteFence(1);
+
+        disconnect.complete(null);
+
+        assertThat(topic.isFenced()).isFalse();
+        verify(ledger).readyToCreateNewLedger();
+        verify(ledger).unfenceForInterceptorException();
+        verify(deduplication).resetHighestSequenceIdPushed();
+    }
+
+    @Test
+    public void handlesWriteFenceResolvingWhileBrokerAttaches() throws Exception {
+        BrokerService brokerService = brokerService();
+        NereusManagedLedger ledger = mock(NereusManagedLedger.class);
+        AtomicInteger fenceReads = new AtomicInteger();
+        when(ledger.currentWriteFence()).thenAnswer(
+                ignored -> fenceReads.getAndIncrement() == 0 ? fence(1) : Optional.empty());
+        when(ledger.awaitWriteFence(1)).thenReturn(
+                CompletableFuture.completedFuture(NereusWriteFenceResolution.COMMITTED));
+        MessageDeduplication deduplication = mock(MessageDeduplication.class);
+        PersistentTopic topic = new PersistentTopic(
+                "persistent://tenant/ns/nereus-write-fence-attach-race",
+                brokerService,
+                ledger,
+                deduplication);
+        setPendingWrites(topic, 1);
+
+        topic.addFailed(new ManagedLedgerException("retryably uncertain"), mock(PublishContext.class));
+
+        assertThat(topic.isFenced()).isFalse();
+        verify(ledger).awaitWriteFence(1);
+        verify(ledger).readyToCreateNewLedger();
+        verify(ledger).unfenceForInterceptorException();
+        verify(deduplication).resetHighestSequenceIdPushed();
+    }
+
     private static BrokerService brokerService() {
         BrokerService brokerService = mock(BrokerService.class);
         PulsarService pulsar = mock(PulsarService.class);
@@ -110,5 +248,14 @@ public class PersistentTopicNereusAdmissionTest {
     private static NereusResolvedTopicFeatures safeFeatures() {
         return new NereusResolvedTopicFeatures(
                 Set.of(), false, 0, 0, 0, false, false, false, false, false, false);
+    }
+
+    private static Optional<NereusWriteFenceSnapshot> fence(long generation) {
+        return Optional.of(new NereusWriteFenceSnapshot(
+                generation, new AppendAttemptId("attempt-" + generation)));
+    }
+
+    private static void setPendingWrites(PersistentTopic topic, long pending) {
+        topic.setPendingWriteOpsForTest(pending);
     }
 }
