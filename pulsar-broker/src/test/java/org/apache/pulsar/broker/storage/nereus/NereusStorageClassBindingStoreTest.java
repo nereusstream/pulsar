@@ -24,6 +24,7 @@ import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 import com.nereusstream.managedledger.NereusManagedLedgerFactory;
@@ -33,10 +34,12 @@ import java.util.List;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 import org.apache.bookkeeper.mledger.ManagedLedgerFactory;
 import org.apache.pulsar.metadata.api.GetResult;
+import org.apache.pulsar.metadata.api.MetadataStoreException;
 import org.apache.pulsar.metadata.api.Stat;
 import org.apache.pulsar.metadata.api.extended.MetadataStoreExtended;
 import org.testng.annotations.Test;
@@ -99,6 +102,63 @@ public class NereusStorageClassBindingStoreTest {
         assertThat(active.state()).isEqualTo(StorageClassBindingState.ACTIVE);
         assertThat(active.storageClass()).isEqualTo(StorageClassBindingRecord.NEREUS);
         assertThat(active.bindingGeneration()).isEqualTo(1);
+    }
+
+    @Test
+    public void acceptsSameGenerationActivationCompletedByPeerBroker() {
+        MutableBindingMetadata bindingMetadata = new MutableBindingMetadata();
+        ManagedLedgerFactory bookkeeper = mock(ManagedLedgerFactory.class);
+        NereusManagedLedgerFactory nereus = mock(NereusManagedLedgerFactory.class);
+        when(bookkeeper.asyncExists(PERSISTENCE_NAME)).thenReturn(CompletableFuture.completedFuture(false));
+        when(nereus.inspectStorageState(PERSISTENCE_NAME))
+                .thenReturn(CompletableFuture.completedFuture(NereusStorageStateSnapshot.missing()));
+        NereusStorageClassBindingStore firstBroker = new NereusStorageClassBindingStore(
+                bindingMetadata.store(), bookkeeper, Duration.ofSeconds(1));
+        NereusStorageClassBindingStore secondBroker = new NereusStorageClassBindingStore(
+                bindingMetadata.store(), bookkeeper, Duration.ofSeconds(1));
+        firstBroker.attachNereusFactory(nereus);
+        secondBroker.attachNereusFactory(nereus);
+
+        StorageClassOpenPermit firstPermit = firstBroker.prepareStorageClassOpen(
+                PERSISTENCE_NAME, StorageClassBindingRecord.NEREUS, true).join();
+        StorageClassOpenPermit peerPermit = secondBroker.prepareStorageClassOpen(
+                PERSISTENCE_NAME, StorageClassBindingRecord.NEREUS, true).join();
+        firstBroker.completeStorageClassOpen(firstPermit).join();
+
+        secondBroker.validateStorageClassOpenPermit(peerPermit).join();
+        secondBroker.completeStorageClassOpen(peerPermit).join();
+
+        StorageClassBindingRecord active = bindingMetadata.record();
+        assertThat(active.state()).isEqualTo(StorageClassBindingState.ACTIVE);
+        assertThat(active.bindingGeneration()).isEqualTo(1);
+    }
+
+    @Test
+    public void rereadsPeerActivationAfterOpenCompletionCasConflict() {
+        MetadataStoreExtended metadata = mock(MetadataStoreExtended.class);
+        StorageClassBindingCodec codec = new StorageClassBindingCodec();
+        StorageClassBindingRecord claimed = StorageClassBindingRecord.claimed(
+                PERSISTENCE_NAME, StorageClassBindingRecord.NEREUS, 1, 1).withMetadataVersion(0);
+        StorageClassBindingRecord active = claimed
+                .transitionTo(StorageClassBindingState.ACTIVE).withMetadataVersion(1);
+        AtomicInteger reads = new AtomicInteger();
+        when(metadata.sync(anyString())).thenReturn(CompletableFuture.completedFuture(null));
+        when(metadata.get(anyString())).thenAnswer(ignored -> {
+            StorageClassBindingRecord current = reads.getAndIncrement() == 0 ? claimed : active;
+            return CompletableFuture.completedFuture(Optional.of(new GetResult(
+                    codec.encode(current), MutableBindingMetadata.stat(current.metadataVersion()))));
+        });
+        when(metadata.put(anyString(), any(), any())).thenReturn(CompletableFuture.failedFuture(
+                new MetadataStoreException.BadVersionException("peer activated binding")));
+        NereusStorageClassBindingStore store = new NereusStorageClassBindingStore(
+                metadata, mock(ManagedLedgerFactory.class), Duration.ofSeconds(1));
+        store.attachNereusFactory(mock(NereusManagedLedgerFactory.class));
+
+        store.completeStorageClassOpen(new StorageClassOpenPermit(
+                PERSISTENCE_NAME, StorageClassBindingRecord.NEREUS, 1, 0, true)).join();
+
+        verify(metadata, times(2)).get(anyString());
+        verify(metadata).put(anyString(), any(), any());
     }
 
     @Test
