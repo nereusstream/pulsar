@@ -71,7 +71,7 @@ public final class NereusTopicFeatureValidator {
         rejectSubscription(type != SubType.Exclusive && type != SubType.Failover, "SUBSCRIPTION_TYPE");
         rejectSubscription(readCompacted, "READ_COMPACTED");
         rejectSubscription(replicated, "REPLICATED");
-        rejectSubscription(keySharedMeta != null, "KEY_SHARED_META");
+        rejectSubscription(keySharedMeta != null && !keySharedMeta.getHashRangesList().isEmpty(), "KEY_SHARED_META");
     }
 
     public void validateCreateSubscription() throws NotAllowedException {

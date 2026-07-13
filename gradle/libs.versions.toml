@@ -433,6 +433,7 @@ kubernetes-client-java-api-fluent = { module = "io.kubernetes:client-java-api-fl
 testcontainers-bom = { module = "org.testcontainers:testcontainers-bom", version.ref = "testcontainers" }
 testcontainers = { module = "org.testcontainers:testcontainers", version.ref = "testcontainers" }
 testcontainers-k3s = { module = "org.testcontainers:k3s", version.ref = "testcontainers" }
+testcontainers-localstack = { module = "org.testcontainers:localstack", version.ref = "testcontainers" }
 kerby-simplekdc = { module = "org.apache.kerby:kerb-simplekdc", version.ref = "kerby" }
 json = { module = "org.json:json", version.ref = "json" }
 # AWS SDKs

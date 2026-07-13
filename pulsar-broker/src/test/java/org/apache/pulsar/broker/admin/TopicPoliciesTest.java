@@ -1494,6 +1494,19 @@ public class TopicPoliciesTest extends MockedPulsarServiceBaseTest {
     }
 
     @Test
+    public void testPersistencePolicyRejectsMissingTopic() {
+        String missingTopic = testTopic + "-missing-" + UUID.randomUUID();
+        PersistencePolicies persistencePolicies = new PersistencePolicies(1, 1, 1, 0);
+
+        assertThrows(PulsarAdminException.NotFoundException.class,
+                () -> admin.topicPolicies().getPersistence(missingTopic));
+        assertThrows(PulsarAdminException.NotFoundException.class,
+                () -> admin.topicPolicies().setPersistence(missingTopic, persistencePolicies));
+        assertThrows(PulsarAdminException.NotFoundException.class,
+                () -> admin.topicPolicies().removePersistence(missingTopic));
+    }
+
+    @Test
     public void testRemovePersistence() throws Exception {
         PersistencePolicies persistencePoliciesForNamespace = new PersistencePolicies(2, 2, 2, 0.3);
         admin.namespaces().setPersistence(myNamespace, persistencePoliciesForNamespace);
