@@ -3933,6 +3933,14 @@ public class PersistentTopicsBase extends AdminResource {
     }
 
     protected CompletableFuture<Void> preValidation(boolean authoritative) {
+        return preValidation(authoritative, false);
+    }
+
+    protected CompletableFuture<Void> preValidationForPersistencePolicy(boolean authoritative) {
+        return preValidation(authoritative, pulsar().getBrokerService().usesStorageClassBindings());
+    }
+
+    private CompletableFuture<Void> preValidation(boolean authoritative, boolean allowMissingTopic) {
         if (!config().isTopicLevelPoliciesEnabled()) {
             return FutureUtil.failedFuture(new RestException(Status.METHOD_NOT_ALLOWED,
                     "Topic level policies is disabled, to enable the topic level policy and retry."));
@@ -3946,7 +3954,11 @@ public class PersistentTopicsBase extends AdminResource {
                 .thenCompose(topicExistsInfo -> {
                     if (!topicExistsInfo.isExists()) {
                         topicExistsInfo.recycle();
-                        throw new RestException(Status.NOT_FOUND, getTopicNotFoundErrorMessage(topicName.toString()));
+                        if (!allowMissingTopic) {
+                            throw new RestException(
+                                    Status.NOT_FOUND, getTopicNotFoundErrorMessage(topicName.toString()));
+                        }
+                        return validateTopicOwnershipAsync(topicName, authoritative);
                     } else {
                         return getPartitionedTopicMetadataAsync(topicName, false, false)
                             .thenCompose(metadata -> {

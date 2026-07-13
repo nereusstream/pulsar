@@ -36,6 +36,7 @@ import org.apache.bookkeeper.mledger.intercept.ManagedLedgerInterceptor;
 import org.apache.pulsar.broker.ServiceConfiguration;
 import org.apache.pulsar.broker.service.Producer;
 import org.apache.pulsar.common.api.proto.CommandSubscribe.SubType;
+import org.apache.pulsar.common.api.proto.KeySharedMeta;
 import org.apache.pulsar.common.api.proto.MarkerType;
 import org.apache.pulsar.common.api.proto.MessageMetadata;
 import org.apache.pulsar.common.naming.TopicName;
@@ -220,11 +221,18 @@ public class NereusTopicFeatureResolverTest {
         assertThatThrownBy(() -> validator.validateSubscribe(
                 SubType.Exclusive, true, false, false, null))
                 .hasMessage("NEREUS_UNSUPPORTED_SUBSCRIPTION:DURABLE");
+        KeySharedMeta exclusiveHashRange = new KeySharedMeta();
+        exclusiveHashRange.addHashRange().setStart(0).setEnd(99);
+        assertThatThrownBy(() -> validator.validateSubscribe(
+                SubType.Exclusive, false, false, false, exclusiveHashRange))
+                .hasMessage("NEREUS_UNSUPPORTED_SUBSCRIPTION:KEY_SHARED_META");
         assertThatThrownBy(() -> validator.validateExistingDurableCursors(true))
                 .hasMessage("NEREUS_UNSUPPORTED_SUBSCRIPTION:EXISTING_DURABLE_CURSOR");
         assertThatCode(() -> validator.validateExistingDurableCursors(false)).doesNotThrowAnyException();
         assertThatCode(() -> validator.validateSubscribe(
                 SubType.Failover, false, false, false, null)).doesNotThrowAnyException();
+        assertThatCode(() -> validator.validateSubscribe(
+                SubType.Exclusive, false, false, false, new KeySharedMeta())).doesNotThrowAnyException();
     }
 
     @Test

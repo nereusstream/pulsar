@@ -3244,7 +3244,7 @@ public class PersistentTopics extends PersistentTopicsBase {
             @QueryParam("authoritative") @DefaultValue("false") boolean authoritative) {
         validateTopicName(tenant, namespace, encodedTopic);
         validateTopicPolicyOperationAsync(topicName, PolicyName.PERSISTENCE, PolicyOperation.READ)
-            .thenCompose(__ -> preValidation(authoritative))
+            .thenCompose(__ -> preValidationForPersistencePolicy(authoritative))
             .thenCompose(__ -> internalGetPersistence(applied, isGlobal))
             .thenApply(asyncResponse::resume)
             .exceptionally(ex -> {
@@ -3275,7 +3275,7 @@ public class PersistentTopics extends PersistentTopicsBase {
                                            PersistencePolicies persistencePolicies) {
         validateTopicName(tenant, namespace, encodedTopic);
         validateTopicPolicyOperationAsync(topicName, PolicyName.PERSISTENCE, PolicyOperation.WRITE)
-            .thenCompose(__ -> preValidation(authoritative))
+            .thenCompose(__ -> preValidationForPersistencePolicy(authoritative))
             .thenCompose(__ -> internalSetPersistence(persistencePolicies, isGlobal))
             .thenRun(() -> {
                 try {
@@ -3313,7 +3313,7 @@ public class PersistentTopics extends PersistentTopicsBase {
             @QueryParam("authoritative") @DefaultValue("false") boolean authoritative) {
         validateTopicName(tenant, namespace, encodedTopic);
         validateTopicPolicyOperationAsync(topicName, PolicyName.PERSISTENCE, PolicyOperation.WRITE)
-            .thenCompose(__ -> preValidation(authoritative))
+            .thenCompose(__ -> preValidationForPersistencePolicy(authoritative))
             .thenCompose(__ -> internalRemovePersistence(isGlobal))
             .thenRun(() -> {
                 log.info()

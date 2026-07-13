@@ -23,6 +23,8 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import com.nereusstream.pulsar.NereusProcessIdentity;
 import java.security.SecureRandom;
 import org.apache.pulsar.broker.ServiceConfiguration;
+import org.apache.pulsar.broker.loadbalance.extensions.ExtensibleLoadManagerImpl;
+import org.apache.pulsar.broker.loadbalance.impl.ModularLoadManagerImpl;
 import org.testng.annotations.Test;
 
 public class NereusBrokerStorageConfigurationTest {
@@ -53,6 +55,20 @@ public class NereusBrokerStorageConfigurationTest {
                 .isInstanceOf(IllegalArgumentException.class)
                 .hasMessageContaining("nereusEnabled");
 
+        ServiceConfiguration persistentTopicsDisabled = validConfiguration();
+        persistentTopicsDisabled.setEnablePersistentTopics(false);
+        assertThatThrownBy(() -> new NereusBrokerStorageConfiguration(persistentTopicsDisabled)
+                .runtimeConfiguration(NereusProcessIdentity.generate(new SecureRandom())))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("enablePersistentTopics");
+
+        ServiceConfiguration legacyLoadManager = validConfiguration();
+        legacyLoadManager.setLoadManagerClassName(ModularLoadManagerImpl.class.getName());
+        assertThatThrownBy(() -> new NereusBrokerStorageConfiguration(legacyLoadManager)
+                .runtimeConfiguration(NereusProcessIdentity.generate(new SecureRandom())))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("ExtensibleLoadManagerImpl");
+
         ServiceConfiguration undersizedCache = validConfiguration();
         undersizedCache.setNereusMaxCachedStreams(9_999);
         assertThatThrownBy(() -> new NereusBrokerStorageConfiguration(undersizedCache)
@@ -64,6 +80,7 @@ public class NereusBrokerStorageConfigurationTest {
     private static ServiceConfiguration validConfiguration() {
         ServiceConfiguration broker = new ServiceConfiguration();
         broker.setNereusEnabled(true);
+        broker.setLoadManagerClassName(ExtensibleLoadManagerImpl.class.getName());
         broker.setClusterName("test-cluster");
         broker.setNereusOxiaServiceAddress("localhost:6648");
         broker.setNereusOxiaNamespace("nereus/test-cluster");
