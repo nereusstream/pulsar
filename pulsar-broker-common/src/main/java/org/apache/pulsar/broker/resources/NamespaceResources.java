@@ -18,6 +18,7 @@
  */
 package org.apache.pulsar.broker.resources;
 
+import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.core.type.TypeReference;
 import java.util.List;
 import java.util.Map;
@@ -40,6 +41,9 @@ import org.apache.pulsar.common.policies.data.NamespaceIsolationDataImpl;
 import org.apache.pulsar.common.policies.data.Policies;
 import org.apache.pulsar.common.policies.impl.NamespaceIsolationPolicies;
 import org.apache.pulsar.common.util.Codec;
+import org.apache.pulsar.common.util.FutureUtil;
+import org.apache.pulsar.common.util.ObjectMapperFactory;
+import org.apache.pulsar.metadata.api.CacheGetResult;
 import org.apache.pulsar.metadata.api.MetadataStore;
 import org.apache.pulsar.metadata.api.MetadataStoreException;
 
@@ -142,6 +146,32 @@ public class NamespaceResources extends BaseResources<Policies> {
 
     public CompletableFuture<Optional<Policies>> getPoliciesAsync(NamespaceName ns) {
         return getCache().get(joinPath(BASE_POLICIES_PATH, ns.toString()));
+    }
+
+    public CompletableFuture<Optional<CacheGetResult<Policies>>> getPoliciesWithVersion(NamespaceName ns) {
+        return getCache().getWithStats(joinPath(BASE_POLICIES_PATH, ns.toString()));
+    }
+
+    public CompletableFuture<Optional<CacheGetResult<Policies>>> refreshAndGetPoliciesWithVersion(
+            NamespaceName ns) {
+        String path = joinPath(BASE_POLICIES_PATH, ns.toString());
+        return getStore().sync(path).thenCompose(ignored -> {
+            getCache().invalidate(path);
+            return getCache().getWithStats(path);
+        });
+    }
+
+    public CompletableFuture<Void> setPoliciesWithVersion(
+            NamespaceName ns, Policies policies, long expectedVersion) {
+        try {
+            byte[] content = ObjectMapperFactory.getMapper().writer().writeValueAsBytes(policies);
+            return getStore().put(
+                    joinPath(BASE_POLICIES_PATH, ns.toString()),
+                    content,
+                    Optional.of(expectedVersion)).thenApply(ignored -> null);
+        } catch (JsonProcessingException error) {
+            return FutureUtil.failedFuture(error);
+        }
     }
 
     public void setPolicies(NamespaceName ns, Function<Policies, Policies> function) throws MetadataStoreException {

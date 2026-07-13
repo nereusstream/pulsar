@@ -3830,6 +3830,10 @@ public class PersistentTopicsBase extends AdminResource {
     protected CompletableFuture<Void> internalSetPersistence(PersistencePolicies persistencePoliciesToSet,
                                                              boolean isGlobal) {
         validatePersistencePolicies(persistencePoliciesToSet);
+        if (pulsar().getBrokerService().usesStorageClassBindings()) {
+            return pulsar().getBrokerService().updateTopicPersistence(
+                    topicName, persistencePoliciesToSet, isGlobal);
+        }
         return pulsar().getTopicPoliciesService()
                 .updateTopicPoliciesAsync(topicName, isGlobal, persistencePoliciesToSet == null, policies -> {
                     policies.setPersistence(persistencePoliciesToSet);
@@ -3837,6 +3841,9 @@ public class PersistentTopicsBase extends AdminResource {
     }
 
     protected CompletableFuture<Void> internalRemovePersistence(boolean isGlobal) {
+        if (pulsar().getBrokerService().usesStorageClassBindings()) {
+            return pulsar().getBrokerService().updateTopicPersistence(topicName, null, isGlobal);
+        }
         return pulsar().getTopicPoliciesService().updateTopicPoliciesAsync(topicName, isGlobal, true, policies -> {
             policies.setPersistence(null);
         });

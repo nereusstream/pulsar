@@ -2715,6 +2715,12 @@ public class ServiceConfiguration implements PulsarConfiguration {
     private int nereusMaxScanEntries = 10000;
     @FieldContext(category = CATEGORY_STORAGE_ML, doc = "Maximum pending Nereus projection metadata operations")
     private int nereusMaxProjectionMetadataPendingOperations = 1024;
+    @FieldContext(category = CATEGORY_STORAGE_ML,
+            doc = "Maximum binding records scanned during a Nereus namespace storage-policy update")
+    private int nereusMaxNamespaceBindingScanEntries = 10000;
+    @FieldContext(category = CATEGORY_STORAGE_ML,
+            doc = "Maximum concurrent binding reads during a Nereus namespace storage-policy update")
+    private int nereusMaxBindingPendingOperations = 64;
     @FieldContext(category = CATEGORY_STORAGE_ML, doc = "Maximum encoded Nereus projection value bytes")
     private int nereusProjectionMetadataMaxValueBytes = 65536;
     @FieldContext(category = CATEGORY_STORAGE_ML, doc = "Maximum ranges resolved by one Nereus read")

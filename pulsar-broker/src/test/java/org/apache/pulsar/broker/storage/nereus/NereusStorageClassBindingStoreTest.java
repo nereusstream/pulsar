@@ -29,6 +29,7 @@ import static org.mockito.Mockito.when;
 import com.nereusstream.managedledger.NereusManagedLedgerFactory;
 import com.nereusstream.managedledger.NereusStorageStateSnapshot;
 import java.time.Duration;
+import java.util.List;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -117,6 +118,93 @@ public class NereusStorageClassBindingStoreTest {
                 .hasRootCauseMessage("cluster not ready");
         verify(metadata, never()).sync(anyString());
         verify(metadata, never()).put(anyString(), any(), any());
+    }
+
+    @Test
+    public void abortsUnpublishedStorageClassClaim() {
+        MutableBindingMetadata bindingMetadata = new MutableBindingMetadata();
+        ManagedLedgerFactory bookkeeper = mock(ManagedLedgerFactory.class);
+        NereusManagedLedgerFactory nereus = mock(NereusManagedLedgerFactory.class);
+        when(bookkeeper.asyncExists(PERSISTENCE_NAME)).thenReturn(CompletableFuture.completedFuture(false));
+        when(nereus.inspectStorageState(PERSISTENCE_NAME))
+                .thenReturn(CompletableFuture.completedFuture(NereusStorageStateSnapshot.missing()));
+        NereusStorageClassBindingStore store = new NereusStorageClassBindingStore(
+                bindingMetadata.store(), bookkeeper, Duration.ofSeconds(1));
+        store.attachNereusFactory(nereus);
+        StorageClassOpenPermit permit = store.prepareStorageClassOpen(
+                PERSISTENCE_NAME, StorageClassBindingRecord.NEREUS, true).join();
+
+        store.abortStorageClassOpenClaim(permit).join();
+
+        assertThat(bindingMetadata.record().state()).isEqualTo(StorageClassBindingState.DELETED);
+    }
+
+    @Test
+    public void rejectsPolicyClassSwitchForActiveBinding() {
+        MutableBindingMetadata bindingMetadata = new MutableBindingMetadata();
+        ManagedLedgerFactory bookkeeper = mock(ManagedLedgerFactory.class);
+        NereusManagedLedgerFactory nereus = mock(NereusManagedLedgerFactory.class);
+        when(bookkeeper.asyncExists(PERSISTENCE_NAME)).thenReturn(CompletableFuture.completedFuture(false));
+        when(nereus.inspectStorageState(PERSISTENCE_NAME))
+                .thenReturn(CompletableFuture.completedFuture(NereusStorageStateSnapshot.missing()));
+        NereusStorageClassBindingStore store = new NereusStorageClassBindingStore(
+                bindingMetadata.store(), bookkeeper, Duration.ofSeconds(1));
+        store.attachNereusFactory(nereus);
+        StorageClassOpenPermit permit = store.prepareStorageClassOpen(
+                PERSISTENCE_NAME, StorageClassBindingRecord.NEREUS, true).join();
+        store.completeStorageClassOpen(permit).join();
+
+        assertThatThrownBy(() -> store.validateStorageClassPolicyUpdate(
+                PERSISTENCE_NAME, StorageClassBindingRecord.BOOKKEEPER).join())
+                .hasRootCauseMessage("storage-class migration is required");
+    }
+
+    @Test
+    public void rejectsNamespaceBindingScanAboveConfiguredCap() {
+        MetadataStoreExtended metadata = mock(MetadataStoreExtended.class);
+        when(metadata.sync(anyString())).thenReturn(CompletableFuture.completedFuture(null));
+        when(metadata.getChildren(anyString()))
+                .thenReturn(CompletableFuture.completedFuture(List.of("a", "b")));
+        NereusStorageClassBindingStore store = new NereusStorageClassBindingStore(
+                metadata, mock(ManagedLedgerFactory.class), Duration.ofSeconds(1));
+
+        assertThatThrownBy(() -> store.listNonDeletedBindings(
+                org.apache.pulsar.common.naming.NamespaceName.get("tenant/ns"), 1, 1).join())
+                .hasRootCauseMessage("Nereus namespace binding scan limit exceeded");
+        verify(metadata).sync(anyString());
+        verify(metadata, never()).get(anyString());
+    }
+
+    @Test
+    public void rejectsCorruptBindingDuringNamespaceScan() {
+        MetadataStoreExtended metadata = mock(MetadataStoreExtended.class);
+        when(metadata.sync(anyString())).thenReturn(CompletableFuture.completedFuture(null));
+        when(metadata.getChildren(anyString()))
+                .thenReturn(CompletableFuture.completedFuture(List.of("binding")));
+        when(metadata.get(anyString())).thenReturn(CompletableFuture.completedFuture(Optional.of(
+                new GetResult(new byte[] {1, 2, 3}, MutableBindingMetadata.stat(0)))));
+        NereusStorageClassBindingStore store = new NereusStorageClassBindingStore(
+                metadata, mock(ManagedLedgerFactory.class), Duration.ofSeconds(1));
+
+        assertThatThrownBy(() -> store.listNonDeletedBindings(
+                org.apache.pulsar.common.naming.NamespaceName.get("tenant/ns"), 10, 1).join())
+                .hasRootCauseMessage("invalid encoded storage binding size");
+    }
+
+    @Test
+    public void rejectsBindingReadFailureDuringNamespaceScan() {
+        MetadataStoreExtended metadata = mock(MetadataStoreExtended.class);
+        when(metadata.sync(anyString())).thenReturn(CompletableFuture.completedFuture(null));
+        when(metadata.getChildren(anyString()))
+                .thenReturn(CompletableFuture.completedFuture(List.of("binding")));
+        when(metadata.get(anyString())).thenReturn(CompletableFuture.failedFuture(
+                new IllegalStateException("binding backend failed")));
+        NereusStorageClassBindingStore store = new NereusStorageClassBindingStore(
+                metadata, mock(ManagedLedgerFactory.class), Duration.ofSeconds(1));
+
+        assertThatThrownBy(() -> store.listNonDeletedBindings(
+                org.apache.pulsar.common.naming.NamespaceName.get("tenant/ns"), 10, 1).join())
+                .hasRootCauseMessage("binding backend failed");
     }
 
     @Test
