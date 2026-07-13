@@ -119,11 +119,21 @@ public final class NereusStorageClassBindingStore implements AutoCloseable {
             return CompletableFuture.failedFuture(error);
         }
         String path = bindingPath(permit.persistenceName());
+        return completeStorageClassOpen(path, permit, 0)
+                .orTimeout(timeout.toNanos(), TimeUnit.NANOSECONDS);
+    }
+
+    private CompletableFuture<Void> completeStorageClassOpen(
+            String path, StorageClassOpenPermit permit, int conflictCount) {
+        if (conflictCount > 8) {
+            return CompletableFuture.failedFuture(
+                    new IllegalStateException("storage-class binding CAS retry limit exceeded"));
+        }
         return metadataStore.sync(path).thenCompose(ignored -> metadataStore.get(path)).thenCompose(current -> {
             GetResult result = current.orElseThrow(() ->
                     new IllegalStateException("storage-class binding disappeared before open completion"));
             StorageClassBindingRecord binding = decode(result, permit.persistenceName());
-            requirePermitIdentity(binding, permit);
+            requirePermitGeneration(binding, permit);
             if (binding.state() == StorageClassBindingState.ACTIVE) {
                 return CompletableFuture.completedFuture(null);
             }
@@ -131,10 +141,16 @@ public final class NereusStorageClassBindingStore implements AutoCloseable {
                 return CompletableFuture.failedFuture(
                         new IllegalStateException("storage-class binding cannot complete open"));
             }
+            requirePermitMetadataVersion(binding, permit);
             StorageClassBindingRecord active = binding.transitionTo(StorageClassBindingState.ACTIVE);
             return metadataStore.put(
                     path, codec.encode(active), Optional.of(binding.metadataVersion())).thenApply(stat -> (Void) null);
-        }).orTimeout(timeout.toNanos(), TimeUnit.NANOSECONDS);
+        }).exceptionallyCompose(error -> {
+            if (!isBadVersion(error)) {
+                return CompletableFuture.failedFuture(unwrap(error));
+            }
+            return completeStorageClassOpen(path, permit, conflictCount + 1);
+        });
     }
 
     public CompletableFuture<Void> validateStorageClassOpenPermit(StorageClassOpenPermit permit) {
@@ -150,10 +166,13 @@ public final class NereusStorageClassBindingStore implements AutoCloseable {
             StorageClassBindingRecord binding = decode(current.orElseThrow(() ->
                     new IllegalStateException("storage-class binding disappeared before factory open")),
                     permit.persistenceName());
-            requirePermitIdentity(binding, permit);
+            requirePermitGeneration(binding, permit);
             if (binding.state() != StorageClassBindingState.CLAIMED
                     && binding.state() != StorageClassBindingState.ACTIVE) {
                 throw new IllegalStateException("storage-class binding is not openable");
+            }
+            if (binding.state() == StorageClassBindingState.CLAIMED) {
+                requirePermitMetadataVersion(binding, permit);
             }
         }).orTimeout(timeout.toNanos(), TimeUnit.NANOSECONDS);
     }
@@ -175,7 +194,8 @@ public final class NereusStorageClassBindingStore implements AutoCloseable {
             StorageClassBindingRecord binding = decode(current.orElseThrow(() ->
                     new IllegalStateException("storage-class binding disappeared before claim abort")),
                     permit.persistenceName());
-            requirePermitIdentity(binding, permit);
+            requirePermitGeneration(binding, permit);
+            requirePermitMetadataVersion(binding, permit);
             if (binding.state() != StorageClassBindingState.CLAIMED) {
                 return CompletableFuture.failedFuture(
                         new IllegalStateException("storage-class binding claim is no longer abortable"));
@@ -847,12 +867,18 @@ public final class NereusStorageClassBindingStore implements AutoCloseable {
                 binding.metadataVersion());
     }
 
-    private static void requirePermitIdentity(
+    private static void requirePermitGeneration(
             StorageClassBindingRecord binding, StorageClassOpenPermit permit) {
         if (!binding.persistenceName().equals(permit.persistenceName())
                 || !binding.storageClass().equals(permit.storageClass())
-                || binding.bindingGeneration() != permit.bindingGeneration()
-                || binding.metadataVersion() != permit.expectedMetadataVersion()) {
+                || binding.bindingGeneration() != permit.bindingGeneration()) {
+            throw new IllegalStateException("storage-class open permit is stale");
+        }
+    }
+
+    private static void requirePermitMetadataVersion(
+            StorageClassBindingRecord binding, StorageClassOpenPermit permit) {
+        if (binding.metadataVersion() != permit.expectedMetadataVersion()) {
             throw new IllegalStateException("storage-class open permit is stale");
         }
     }
