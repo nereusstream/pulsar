@@ -1945,6 +1945,13 @@ public abstract class NamespacesBase extends AdminResource {
     }
 
     private CompletableFuture<Void> doUpdatePersistenceAsync(PersistencePolicies persistence) {
+        if (pulsar().getBrokerService().usesStorageClassBindings()) {
+            return pulsar().getBrokerService().updateNamespacePersistence(namespaceName, persistence)
+                    .thenRun(() -> log.info()
+                            .attr("namespace", namespaceName)
+                            .attr("persistence", persistence)
+                            .log("Successfully updated persistence configuration"));
+        }
         return updatePoliciesAsync(namespaceName, policies -> {
             policies.persistence = persistence;
             return policies;

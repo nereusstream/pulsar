@@ -24,6 +24,8 @@ import com.nereusstream.managedledger.NereusStorageStateSnapshot;
 import com.nereusstream.managedledger.integration.NereusCreationGuard;
 import com.nereusstream.managedledger.integration.NereusCreationPermit;
 import java.time.Duration;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
@@ -33,6 +35,7 @@ import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Supplier;
 import org.apache.bookkeeper.mledger.ManagedLedgerException.ManagedLedgerNotFoundException;
 import org.apache.bookkeeper.mledger.ManagedLedgerFactory;
+import org.apache.pulsar.common.naming.NamespaceName;
 import org.apache.pulsar.common.naming.TopicName;
 import org.apache.pulsar.metadata.api.GetResult;
 import org.apache.pulsar.metadata.api.MetadataStoreException;
@@ -132,6 +135,140 @@ public final class NereusStorageClassBindingStore implements AutoCloseable {
             return metadataStore.put(
                     path, codec.encode(active), Optional.of(binding.metadataVersion())).thenApply(stat -> (Void) null);
         }).orTimeout(timeout.toNanos(), TimeUnit.NANOSECONDS);
+    }
+
+    public CompletableFuture<Void> validateStorageClassOpenPermit(StorageClassOpenPermit permit) {
+        java.util.Objects.requireNonNull(permit, "permit");
+        try {
+            requireOpen();
+            requireStorageClass(permit.storageClass());
+        } catch (RuntimeException error) {
+            return CompletableFuture.failedFuture(error);
+        }
+        String path = bindingPath(permit.persistenceName());
+        return metadataStore.sync(path).thenCompose(ignored -> metadataStore.get(path)).thenAccept(current -> {
+            StorageClassBindingRecord binding = decode(current.orElseThrow(() ->
+                    new IllegalStateException("storage-class binding disappeared before factory open")),
+                    permit.persistenceName());
+            requirePermitIdentity(binding, permit);
+            if (binding.state() != StorageClassBindingState.CLAIMED
+                    && binding.state() != StorageClassBindingState.ACTIVE) {
+                throw new IllegalStateException("storage-class binding is not openable");
+            }
+        }).orTimeout(timeout.toNanos(), TimeUnit.NANOSECONDS);
+    }
+
+    public CompletableFuture<Void> abortStorageClassOpenClaim(StorageClassOpenPermit permit) {
+        java.util.Objects.requireNonNull(permit, "permit");
+        if (!permit.activationRequired()) {
+            return CompletableFuture.completedFuture(null);
+        }
+        final NereusManagedLedgerFactory factory;
+        try {
+            factory = requireAttachedFactory();
+            requireOpen();
+        } catch (RuntimeException error) {
+            return CompletableFuture.failedFuture(error);
+        }
+        String path = bindingPath(permit.persistenceName());
+        return metadataStore.sync(path).thenCompose(ignored -> metadataStore.get(path)).thenCompose(current -> {
+            StorageClassBindingRecord binding = decode(current.orElseThrow(() ->
+                    new IllegalStateException("storage-class binding disappeared before claim abort")),
+                    permit.persistenceName());
+            requirePermitIdentity(binding, permit);
+            if (binding.state() != StorageClassBindingState.CLAIMED) {
+                return CompletableFuture.failedFuture(
+                        new IllegalStateException("storage-class binding claim is no longer abortable"));
+            }
+            return bookkeeperFactory.asyncExists(permit.persistenceName()).thenCombine(
+                    factory.inspectStorageState(permit.persistenceName()), StorageObservations::new)
+                    .thenCompose(observations -> {
+                        if (observations.bookkeeperExists()
+                                || observations.nereus().state() != NereusDurableStorageState.MISSING) {
+                            return CompletableFuture.failedFuture(
+                                    new IllegalStateException("storage-class binding claim already published storage"));
+                        }
+                        StorageClassBindingRecord deleting =
+                                binding.transitionTo(StorageClassBindingState.DELETING);
+                        return transitionBinding(path, binding, deleting)
+                                .thenCompose(updated -> transitionBinding(
+                                        path,
+                                        updated,
+                                        updated.transitionTo(StorageClassBindingState.DELETED)))
+                                .thenApply(updated -> (Void) null);
+                    });
+        }).orTimeout(timeout.toNanos(), TimeUnit.NANOSECONDS);
+    }
+
+    public CompletableFuture<Void> validateStorageClassPolicyUpdate(
+            String persistenceName, String targetStorageClass) {
+        final NereusManagedLedgerFactory factory;
+        final String path;
+        try {
+            factory = requireAttachedFactory();
+            requireOpen();
+            requireStorageClass(targetStorageClass);
+            path = bindingPath(persistenceName);
+        } catch (RuntimeException error) {
+            return CompletableFuture.failedFuture(error);
+        }
+        return metadataStore.sync(path).thenCompose(ignored -> metadataStore.get(path)).thenCompose(current -> {
+            CompletableFuture<Boolean> bookkeeperState = bookkeeperFactory.asyncExists(persistenceName);
+            CompletableFuture<NereusStorageStateSnapshot> nereusState = factory.inspectStorageState(persistenceName);
+            return bookkeeperState.thenCombine(nereusState, StorageObservations::new).thenAccept(observations -> {
+                if (current.isEmpty()) {
+                    if (observations.bookkeeperExists()) {
+                        if (!StorageClassBindingRecord.BOOKKEEPER.equals(targetStorageClass)) {
+                            throw new IllegalStateException("storage-class migration is required");
+                        }
+                        return;
+                    }
+                    if (observations.nereus().state() != NereusDurableStorageState.MISSING) {
+                        throw new IllegalStateException(
+                                "durable storage exists without a storage-class binding");
+                    }
+                    return;
+                }
+                StorageClassBindingRecord binding = decode(current.orElseThrow(), persistenceName);
+                if (binding.state() != StorageClassBindingState.DELETED) {
+                    if (!binding.storageClass().equals(targetStorageClass)) {
+                        throw new IllegalStateException("storage-class migration is required");
+                    }
+                    return;
+                }
+                if (observations.bookkeeperExists()) {
+                    throw new IllegalStateException("deleted binding still has BookKeeper storage");
+                }
+                requireTerminalNereus(observations.nereus(), binding);
+            });
+        }).orTimeout(timeout.toNanos(), TimeUnit.NANOSECONDS);
+    }
+
+    public CompletableFuture<List<StorageClassBindingRecord>> listNonDeletedBindings(
+            NamespaceName namespace, int maxEntries, int maxPendingOperations) {
+        java.util.Objects.requireNonNull(namespace, "namespace");
+        if (maxEntries <= 0 || maxPendingOperations <= 0) {
+            return CompletableFuture.failedFuture(
+                    new IllegalArgumentException("binding scan limits must be positive"));
+        }
+        final String root;
+        try {
+            requireOpen();
+            String namespaceRoot = keyspace.namespaceRoot(namespace);
+            root = namespaceRoot.substring(0, namespaceRoot.length() - 1);
+        } catch (RuntimeException error) {
+            return CompletableFuture.failedFuture(error);
+        }
+        List<StorageClassBindingRecord> bindings = new ArrayList<>();
+        return metadataStore.sync(root)
+                .thenCompose(ignored -> metadataStore.getChildren(root)).thenCompose(children -> {
+            if (children.size() > maxEntries) {
+                return CompletableFuture.failedFuture(
+                        new IllegalStateException("Nereus namespace binding scan limit exceeded"));
+            }
+            return readBindingBatch(namespace, root, children, 0, maxPendingOperations, bindings);
+        }).thenApply(ignored -> List.copyOf(bindings))
+                .orTimeout(timeout.toNanos(), TimeUnit.NANOSECONDS);
     }
 
     public CompletableFuture<Optional<StorageClassDeletePermit>> prepareStorageClassDelete(
@@ -319,6 +456,39 @@ public final class NereusStorageClassBindingStore implements AutoCloseable {
                 StorageClassBindingRecord binding = decode(current.orElseThrow(), persistenceName);
                 return prepareExistingBindingDelete(path, binding, factory, conflictCount, observations);
             });
+        });
+    }
+
+    private CompletableFuture<Void> readBindingBatch(
+            NamespaceName namespace,
+            String root,
+            List<String> children,
+            int offset,
+            int maxPendingOperations,
+            List<StorageClassBindingRecord> bindings) {
+        if (offset >= children.size()) {
+            return CompletableFuture.completedFuture(null);
+        }
+        int end = Math.min(children.size(), offset + maxPendingOperations);
+        List<CompletableFuture<StorageClassBindingRecord>> reads = new ArrayList<>(end - offset);
+        for (int index = offset; index < end; index++) {
+            String path = root + "/" + children.get(index);
+            reads.add(metadataStore.get(path).thenApply(current -> {
+                GetResult result = current.orElseThrow(() ->
+                        new IllegalStateException("Nereus namespace binding disappeared during scan"));
+                StorageClassBindingRecord binding = codec.decode(
+                        result.getValue(), result.getStat().getVersion());
+                if (!keyspace.bindingKey(namespace, binding.persistenceName()).equals(path)) {
+                    throw new IllegalStateException("Nereus namespace binding key mismatch");
+                }
+                return binding;
+            }));
+        }
+        return CompletableFuture.allOf(reads.toArray(CompletableFuture[]::new)).thenCompose(ignored -> {
+            reads.stream().map(CompletableFuture::join)
+                    .filter(binding -> binding.state() != StorageClassBindingState.DELETED)
+                    .forEach(bindings::add);
+            return readBindingBatch(namespace, root, children, end, maxPendingOperations, bindings);
         });
     }
 

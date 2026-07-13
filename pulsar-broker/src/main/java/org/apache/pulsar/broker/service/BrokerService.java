@@ -148,8 +148,11 @@ import org.apache.pulsar.broker.stats.prometheus.metrics.ObserverGauge;
 import org.apache.pulsar.broker.stats.prometheus.metrics.Summary;
 import org.apache.pulsar.broker.storage.ManagedLedgerStorage;
 import org.apache.pulsar.broker.storage.ManagedLedgerStorageClass;
+import org.apache.pulsar.broker.storage.nereus.NamespaceStorageClassPermit;
+import org.apache.pulsar.broker.storage.nereus.NamespaceStorageClassPolicyGuard;
 import org.apache.pulsar.broker.storage.nereus.NereusManagedLedgerStorage;
 import org.apache.pulsar.broker.storage.nereus.NereusResolvedTopicFeatures;
+import org.apache.pulsar.broker.storage.nereus.NereusStorageClassMigrationGuard;
 import org.apache.pulsar.broker.storage.nereus.NereusTopicFeatureResolver;
 import org.apache.pulsar.broker.storage.nereus.NereusTopicFeatureValidator;
 import org.apache.pulsar.broker.storage.nereus.NereusTopicOpenContext;
@@ -240,6 +243,8 @@ public class BrokerService implements Closeable {
 
     private final PulsarService pulsar;
     private final ManagedLedgerStorage managedLedgerStorage;
+    private final NamespaceStorageClassPolicyGuard namespaceStorageClassPolicyGuard;
+    private final NereusStorageClassMigrationGuard storageClassMigrationGuard;
 
     private final Map<String, CompletableFuture<Optional<Topic>>> topics = new ConcurrentHashMap<>();
 
@@ -378,6 +383,26 @@ public class BrokerService implements Closeable {
         });
         this.dispatchRateLimiterFactory = createDispatchRateLimiterFactory(pulsar.getConfig());
         this.managedLedgerStorage = pulsar.getManagedLedgerStorage();
+        if (managedLedgerStorage instanceof NereusManagedLedgerStorage nereusStorage) {
+            this.namespaceStorageClassPolicyGuard = new NamespaceStorageClassPolicyGuard(
+                    pulsar.getCoordinationService(),
+                    pulsar.getPulsarResources().getNamespaceResources(),
+                    pulsar.getPulsarResources().getTopicResources(),
+                    nereusStorage.bindingStore(),
+                    nereusStorage.capabilityCoordinator(),
+                    topic -> getManagedLedgerConfig(topic)
+                            .thenApply(config -> config.getStorageClassName()),
+                    pulsar::getBrokerId,
+                    pulsar.getExecutor(),
+                    java.time.Duration.ofSeconds(pulsar.getConfig().getNereusMetadataTimeoutSeconds()),
+                    pulsar.getConfig().getNereusMaxNamespaceBindingScanEntries(),
+                    pulsar.getConfig().getNereusMaxBindingPendingOperations());
+            this.storageClassMigrationGuard = new NereusStorageClassMigrationGuard(
+                    namespaceStorageClassPolicyGuard);
+        } else {
+            this.namespaceStorageClassPolicyGuard = null;
+            this.storageClassMigrationGuard = null;
+        }
         this.keepAliveIntervalSeconds = pulsar.getConfiguration().getKeepAliveIntervalSeconds();
         this.pendingTopicLoadingQueue = Queues.newConcurrentLinkedQueue();
         this.pulsarStats = new PulsarStats(pulsar);
@@ -1019,6 +1044,10 @@ public class BrokerService implements Closeable {
                                     interceptor = null;
                                 }
 
+                                if (namespaceStorageClassPolicyGuard != null) {
+                                    asyncCloseFutures.add(namespaceStorageClassPolicyGuard.asyncClose());
+                                }
+
                                 try {
                                     authenticationService.close();
                                 } catch (IOException e) {
@@ -1613,6 +1642,52 @@ public class BrokerService implements Closeable {
         return managedLedgerStorage instanceof NereusManagedLedgerStorage;
     }
 
+    public CompletableFuture<Void> updateNamespacePersistence(
+            NamespaceName namespace, PersistencePolicies persistence) {
+        if (namespaceStorageClassPolicyGuard == null) {
+            return CompletableFuture.failedFuture(
+                    new IllegalStateException("namespace storage-class policy guard is not available"));
+        }
+        return namespaceStorageClassPolicyGuard.updateNamespacePersistence(namespace, persistence);
+    }
+
+    public CompletableFuture<Void> updateTopicPersistence(
+            TopicName topicName, PersistencePolicies persistence, boolean global) {
+        if (storageClassMigrationGuard == null) {
+            return CompletableFuture.failedFuture(
+                    new IllegalStateException("storage-class migration guard is not available"));
+        }
+        PersistencePolicies target = persistence == null ? null : new PersistencePolicies(
+                persistence.getBookkeeperEnsemble(),
+                persistence.getBookkeeperWriteQuorum(),
+                persistence.getBookkeeperAckQuorum(),
+                persistence.getManagedLedgerMaxMarkDeleteRate(),
+                persistence.getManagedLedgerStorageClassName());
+        return storageClassMigrationGuard.updateTopicPersistence(
+                topicName,
+                () -> getNereusTopicPolicySnapshot(topicName)
+                        .thenApply(snapshot -> proposedTopicStorageClass(snapshot, target, global)),
+                () -> pulsar.getTopicPoliciesService().updateTopicPoliciesAsync(
+                        topicName, global, target == null, policies -> policies.setPersistence(target)));
+    }
+
+    private static String proposedTopicStorageClass(
+            NereusTopicPolicySnapshot snapshot, PersistencePolicies target, boolean global) {
+        PersistencePolicies local = global
+                ? snapshot.localPolicies().map(TopicPolicies::getPersistence).orElse(null)
+                : target;
+        PersistencePolicies globalPersistence = global
+                ? target
+                : snapshot.globalPolicies().map(TopicPolicies::getPersistence).orElse(null);
+        PersistencePolicies effective = local != null ? local : globalPersistence;
+        if (effective == null) {
+            effective = snapshot.namespacePolicies().persistence;
+        }
+        String storageClass = effective == null ? null : effective.getManagedLedgerStorageClassName();
+        return storageClass == null || storageClass.isBlank()
+                ? StorageClassBindingRecord.BOOKKEEPER : storageClass;
+    }
+
     public CompletableFuture<Optional<StorageClassDeletePermit>> prepareStorageClassDelete(TopicName topicName) {
         if (!(managedLedgerStorage instanceof NereusManagedLedgerStorage hybridStorage)) {
             return CompletableFuture.completedFuture(Optional.empty());
@@ -1667,8 +1742,12 @@ public class BrokerService implements Closeable {
         String selectedStorageClass = managedLedgerConfig.getStorageClassName() == null
                 ? StorageClassBindingRecord.BOOKKEEPER
                 : managedLedgerConfig.getStorageClassName();
-        hybridStorage.bindingStore().prepareStorageClassOpen(
-                persistenceName, selectedStorageClass, managedLedgerConfig.isCreateIfMissing())
+        prepareStorageClassOpen(
+                hybridStorage,
+                topicName,
+                persistenceName,
+                selectedStorageClass,
+                managedLedgerConfig.isCreateIfMissing())
                 .whenComplete((permit, preparationError) -> {
                     if (preparationError != null) {
                         callback.openLedgerFailed(ManagedLedgerException.getManagedLedgerException(
@@ -1690,6 +1769,41 @@ public class BrokerService implements Closeable {
                             ownershipChecker,
                             context);
                 });
+    }
+
+    private CompletableFuture<StorageClassOpenPermit> prepareStorageClassOpen(
+            NereusManagedLedgerStorage hybridStorage,
+            TopicName topicName,
+            String persistenceName,
+            String selectedStorageClass,
+            boolean createIfMissing) {
+        if (!createIfMissing) {
+            return hybridStorage.bindingStore().prepareStorageClassOpen(
+                    persistenceName, selectedStorageClass, false);
+        }
+        if (namespaceStorageClassPolicyGuard == null) {
+            return CompletableFuture.failedFuture(
+                    new IllegalStateException("namespace storage-class policy guard is not available"));
+        }
+        return namespaceStorageClassPolicyGuard.acquireFirstCreate(
+                        topicName.getNamespaceObject(), topicName, selectedStorageClass)
+                .thenCompose(namespacePermit -> hybridStorage.bindingStore().prepareStorageClassOpen(
+                                persistenceName, selectedStorageClass, true)
+                        .thenCompose(bindingPermit -> namespacePermit.validateBeforeFactoryOpen(bindingPermit)
+                                .thenCompose(ignored -> namespacePermit.closeAsync())
+                                .thenApply(ignored -> bindingPermit))
+                        .exceptionallyCompose(error -> closeNamespacePermit(namespacePermit, error)));
+    }
+
+    private static CompletableFuture<StorageClassOpenPermit> closeNamespacePermit(
+            NamespaceStorageClassPermit permit, Throwable error) {
+        Throwable cause = FutureUtil.unwrapCompletionException(error);
+        return permit.closeAsync().handle((ignored, closeError) -> {
+            if (closeError != null) {
+                cause.addSuppressed(FutureUtil.unwrapCompletionException(closeError));
+            }
+            throw new CompletionException(cause);
+        });
     }
 
     private static OpenLedgerCallback bindingCompletionCallback(
