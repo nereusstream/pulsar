@@ -2758,6 +2758,50 @@ public class ServiceConfiguration implements PulsarConfiguration {
     private int nereusMaxBindingPendingOperations = 64;
     @FieldContext(category = CATEGORY_STORAGE_ML, doc = "Maximum encoded Nereus projection value bytes")
     private int nereusProjectionMetadataMaxValueBytes = 65536;
+    @FieldContext(category = CATEGORY_STORAGE_ML, doc = "Maximum pending Nereus cursor metadata operations")
+    private int nereusMaxCursorMetadataPendingOperations = 1024;
+    @FieldContext(category = CATEGORY_STORAGE_ML, doc = "Frozen maximum encoded Nereus cursor metadata value bytes")
+    private int nereusCursorMetadataMaxValueBytes = 65536;
+    @FieldContext(category = CATEGORY_STORAGE_ML, doc = "Maximum records in one Nereus cursor metadata scan page")
+    private int nereusCursorMetadataMaxScanPageSize = 256;
+    @FieldContext(category = CATEGORY_STORAGE_ML, doc = "Reserved safety margin in a Nereus cursor root")
+    private int nereusCursorMetadataSafetyMarginBytes = 4096;
+    @FieldContext(category = CATEGORY_STORAGE_ML, doc = "Maximum inline Nereus cursor acknowledgement bytes")
+    private int nereusCursorInlineAckMaxBytes = 8192;
+    @FieldContext(category = CATEGORY_STORAGE_ML, doc = "Maximum inline Nereus cursor acknowledgement deltas")
+    private int nereusCursorInlineDeltaMaxCount = 256;
+    @FieldContext(category = CATEGORY_STORAGE_ML, doc = "Maximum UTF-8 bytes in a Nereus cursor name")
+    private int nereusCursorNameMaxUtf8Bytes = 16384;
+    @FieldContext(category = CATEGORY_STORAGE_ML, doc = "Maximum Nereus cursor position-property bytes")
+    private int nereusCursorPositionPropertiesMaxBytes = 8192;
+    @FieldContext(category = CATEGORY_STORAGE_ML, doc = "Maximum Nereus cursor property bytes")
+    private int nereusCursorPropertiesMaxBytes = 16384;
+    @FieldContext(category = CATEGORY_STORAGE_ML, doc = "Maximum immutable Nereus cursor snapshot bytes")
+    private long nereusCursorSnapshotMaxBytes = 67108864;
+    @FieldContext(category = CATEGORY_STORAGE_ML, doc = "Maximum positions in one Nereus acknowledgement")
+    private int nereusCursorAckPositionsPerRequestMax = 1000;
+    @FieldContext(category = CATEGORY_STORAGE_ML, doc = "Maximum batch indexes in one Nereus entry")
+    private int nereusCursorBatchIndexesMax = 131072;
+    @FieldContext(category = CATEGORY_STORAGE_ML, doc = "Maximum encoded Nereus cursor protection intent bytes")
+    private int nereusCursorProtectionIntentMaxBytes = 49152;
+    @FieldContext(category = CATEGORY_STORAGE_ML, doc = "Maximum UTF-8 bytes in a Nereus trim reason")
+    private int nereusCursorTrimReasonMaxUtf8Bytes = 1024;
+    @FieldContext(category = CATEGORY_STORAGE_ML, doc = "Nereus cursor scan page size")
+    private int nereusCursorScanPageSize = 256;
+    @FieldContext(category = CATEGORY_STORAGE_ML, doc = "Maximum durable cursor records per Nereus stream")
+    private int nereusCursorRecordsPerStreamMax = 10000;
+    @FieldContext(category = CATEGORY_STORAGE_ML, doc = "Maximum concurrent Nereus cursor owner claims")
+    private int nereusCursorOwnerClaimConcurrency = 32;
+    @FieldContext(category = CATEGORY_STORAGE_ML, doc = "Maximum queued mutations per Nereus cursor")
+    private int nereusCursorMutationQueueMax = 1024;
+    @FieldContext(category = CATEGORY_STORAGE_ML, doc = "Maximum CAS attempts for a Nereus cursor mutation")
+    private int nereusCursorMaxCasAttempts = 32;
+    @FieldContext(category = CATEGORY_STORAGE_ML, doc = "Maximum Nereus cursor hydration stabilization attempts")
+    private int nereusCursorHydrationMaxAttempts = 8;
+    @FieldContext(category = CATEGORY_STORAGE_ML, doc = "Maximum Nereus cursor snapshot identity allocation attempts")
+    private int nereusCursorSnapshotIdMaxAttempts = 8;
+    @FieldContext(category = CATEGORY_STORAGE_ML, doc = "Nereus cursor snapshot operation timeout in seconds")
+    private long nereusCursorSnapshotOperationTimeoutSeconds = 60;
     @FieldContext(category = CATEGORY_STORAGE_ML, doc = "Maximum ranges resolved by one Nereus read")
     private int nereusMaxResolveRanges = 64;
     @FieldContext(category = CATEGORY_STORAGE_ML, doc = "Maximum Nereus commit-chain scan entries")

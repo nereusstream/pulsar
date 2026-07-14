@@ -20,6 +20,7 @@ package org.apache.pulsar.broker.service.persistent;
 
 import static org.apache.pulsar.broker.service.AbstractBaseDispatcher.checkAndApplyReachedEndOfTopicOrTopicMigration;
 import static org.apache.pulsar.common.naming.SystemTopicNames.isEventSystemTopic;
+import com.nereusstream.managedledger.NereusManagedLedger;
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.MoreObjects;
 import io.github.merlimat.slog.Logger;
@@ -453,13 +454,16 @@ public class PersistentSubscription extends AbstractSubscription {
 
     public CompletableFuture<Void> acknowledgeMessageAsync(List<Position> positions, AckType ackType,
                                                            Map<String, Long> properties) {
+        List<Position> immutablePositions = List.copyOf(positions);
         CompletableFuture<Void> future = new CompletableFuture<>();
         cursor.updateLastActive();
         Position previousMarkDeletePosition = cursor.getMarkDeletedPosition();
+        boolean nereusDurableAcknowledgement = cursor.isDurable()
+                && cursor.getManagedLedger() instanceof NereusManagedLedger;
 
         if (ackType == AckType.Cumulative) {
 
-            if (positions.size() != 1) {
+            if (immutablePositions.size() != 1) {
                 log.warn()
                         .log("Invalid cumulative ack received with multiple message ids.");
                 future.completeExceptionally(
@@ -467,7 +471,7 @@ public class PersistentSubscription extends AbstractSubscription {
                 return future;
             }
 
-            Position position = positions.get(0);
+            Position position = immutablePositions.get(0);
             log.debug()
                     .attr("position", position)
                     .log("Cumulative ack on");
@@ -494,31 +498,41 @@ public class PersistentSubscription extends AbstractSubscription {
 
         } else {
             log.debug()
-                    .attr("positions", positions)
+                    .attr("positions", immutablePositions)
                     .log("Individual acks on");
             AckCallback callback = new AckCallback(previousMarkDeletePosition, future);
-            cursor.asyncDelete(positions, callback, callback);
+            cursor.asyncDelete(immutablePositions, callback, callback);
+        }
+
+        Runnable postPersistence = () -> applyAcknowledgementSideEffects(immutablePositions, ackType);
+        if (nereusDurableAcknowledgement) {
+            return future.thenRun(postPersistence);
+        }
+        postPersistence.run();
+        return future;
+    }
+
+    private void applyAcknowledgementSideEffects(List<Position> positions, AckType ackType) {
+        if (ackType == AckType.Individual) {
             if (config.isTransactionCoordinatorEnabled()) {
                 positions.forEach(position -> {
-                    if ((cursor.isMessageDeleted(position))) {
+                    if (cursor.isMessageDeleted(position)) {
                         pendingAckHandle.clearIndividualPosition(position);
                     }
                 });
             }
-
-            if (dispatcher != null) {
-                dispatcher.getRedeliveryTracker().removeBatch(positions);
+            Dispatcher currentDispatcher = dispatcher;
+            if (currentDispatcher != null) {
+                currentDispatcher.getRedeliveryTracker().removeBatch(positions);
             }
         }
-
         if (topic.getManagedLedger().isTerminated() && !cursor.hasBacklog(false)) {
             // Notify all consumer that the end of topic was reached
-            if (dispatcher != null) {
-                checkAndApplyReachedEndOfTopicOrTopicMigration(topic, dispatcher.getConsumers());
+            Dispatcher currentDispatcher = dispatcher;
+            if (currentDispatcher != null) {
+                checkAndApplyReachedEndOfTopicOrTopicMigration(topic, currentDispatcher.getConsumers());
             }
         }
-
-        return future;
     }
 
     public CompletableFuture<Void> transactionIndividualAcknowledge(

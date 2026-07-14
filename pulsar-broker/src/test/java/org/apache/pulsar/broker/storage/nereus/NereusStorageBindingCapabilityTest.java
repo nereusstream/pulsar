@@ -47,6 +47,8 @@ public class NereusStorageBindingCapabilityTest {
         assertThat(properties).containsEntry("existing", "value");
         assertThat(properties).containsEntry(
                 NereusStorageBindingCapability.PROPERTY, NereusStorageBindingCapability.VERSION);
+        assertThat(properties).containsEntry(
+                NereusCursorProtocolCapability.PROPERTY, NereusCursorProtocolCapability.VERSION);
         assertThatThrownBy(() -> coordinator.attachBrokerRegistry(registry))
                 .hasMessage("Nereus broker registry is already attached");
     }
@@ -58,6 +60,10 @@ public class NereusStorageBindingCapabilityTest {
                 Map.of(NereusStorageBindingCapability.PROPERTY, "1")))
                 .isInstanceOf(IllegalArgumentException.class)
                 .hasMessage("nereus.storage-binding-protocol is reserved by the broker");
+        assertThatThrownBy(() -> NereusStorageBindingCapability.requireUnreserved(
+                Map.of(NereusCursorProtocolCapability.PROPERTY, "1")))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessage("nereus.cursor-protocol is reserved by the broker");
     }
 
     @Test
@@ -74,7 +80,8 @@ public class NereusStorageBindingCapabilityTest {
         when(registry.getAvailableBrokerLookupDataAsync()).thenReturn(
                 CompletableFuture.completedFuture(Map.of("a", capable, "b", incapable)));
         assertThatThrownBy(() -> coordinator.requireClusterReady().join())
-                .hasRootCauseMessage("NEREUS_CLUSTER_CAPABILITY_NOT_READY:b");
+                .hasRootCauseMessage(
+                        "NEREUS_CLUSTER_CAPABILITY_NOT_READY:b:nereus.storage-binding-protocol");
 
         Map<String, BrokerLookupData> first = new LinkedHashMap<>();
         first.put("a", capable);

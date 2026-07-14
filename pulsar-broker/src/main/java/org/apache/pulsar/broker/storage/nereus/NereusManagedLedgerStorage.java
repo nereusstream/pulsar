@@ -101,6 +101,7 @@ public final class NereusManagedLedgerStorage implements ManagedLedgerStorage {
                     eventLoopGroup,
                     openTelemetry,
                     bindingStore.creationGuard(),
+                    capabilityCoordinator,
                     secretResolver,
                     classLoader);
             runtime = runtimeProvider.create(runtimeConfiguration, context);

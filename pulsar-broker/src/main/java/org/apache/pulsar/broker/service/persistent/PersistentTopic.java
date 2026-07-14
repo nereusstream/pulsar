@@ -512,8 +512,7 @@ public class PersistentTopic extends AbstractTopic implements Topic, AddEntryCal
         if (nereusManagedLedger) {
             try {
                 requireNereusAdmissionContext();
-                NEREUS_FEATURE_VALIDATOR.validateExistingDurableCursors(
-                        ledger.getCursors().iterator().hasNext());
+                NEREUS_FEATURE_VALIDATOR.validateExistingDurableCursors(nereusManagedLedger);
             } catch (NotAllowedException error) {
                 return FutureUtil.failedFuture(error);
             }
@@ -586,7 +585,8 @@ public class PersistentTopic extends AbstractTopic implements Topic, AddEntryCal
         return pendingWriteOps;
     }
 
-    private void createPersistentSubscriptions() {
+    @VisibleForTesting
+    void createPersistentSubscriptions() {
         for (ManagedCursor cursor : ledger.getCursors()) {
                 if (cursor.getName().equals(DEDUPLICATION_CURSOR_NAME)
                         || cursor.getName().startsWith(replicatorPrefix)) {
@@ -1491,7 +1491,7 @@ public class PersistentTopic extends AbstractTopic implements Topic, AddEntryCal
         if (nereusManagedLedger) {
             try {
                 requireNereusAdmissionContext();
-                NEREUS_FEATURE_VALIDATOR.validateCreateSubscription();
+                NEREUS_FEATURE_VALIDATOR.validateCreateSubscription(nereusManagedLedger);
             } catch (NotAllowedException error) {
                 return FutureUtil.failedFuture(error);
             }

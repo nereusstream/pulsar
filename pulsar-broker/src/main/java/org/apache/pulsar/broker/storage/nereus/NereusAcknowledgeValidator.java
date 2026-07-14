@@ -28,47 +28,92 @@ import org.apache.pulsar.common.api.proto.CommandAck.AckType;
 import org.apache.pulsar.common.api.proto.CommandSubscribe.SubType;
 import org.apache.pulsar.common.api.proto.MessageIdData;
 
-/** Closed acknowledgement boundary for the limited F2 non-durable cursor surface. */
+/** Closed command-shape boundary for the F3 acknowledgement surface. */
 public final class NereusAcknowledgeValidator {
+    public static final int DEFAULT_MAX_POSITIONS = 1_000;
+
     public Optional<NotAllowedException> rejection(
             Subscription subscription,
             SubType subscriptionType,
             CommandAck ack,
             boolean requirePersistedAck) {
+        return rejection(
+                subscription, subscriptionType, ack, requirePersistedAck, true, DEFAULT_MAX_POSITIONS);
+    }
+
+    public Optional<NotAllowedException> rejection(
+            Subscription subscription,
+            SubType subscriptionType,
+            CommandAck ack,
+            boolean requirePersistedAck,
+            boolean batchIndexAcknowledgmentEnabled,
+            int maxPositions) {
         java.util.Objects.requireNonNull(subscription, "subscription");
         java.util.Objects.requireNonNull(subscriptionType, "subscriptionType");
         java.util.Objects.requireNonNull(ack, "ack");
+        if (maxPositions <= 0) {
+            throw new IllegalArgumentException("maxPositions must be positive");
+        }
         if (!isNereusSubscription(subscription)) {
             return Optional.empty();
         }
         PersistentSubscription persistentSubscription = (PersistentSubscription) subscription;
-        if (persistentSubscription.getCursor().isDurable()) {
-            return rejected("DURABLE_CURSOR");
-        }
-        if (subscriptionType != SubType.Exclusive && subscriptionType != SubType.Failover) {
-            return rejected("SUBSCRIPTION_TYPE");
-        }
-        if (requirePersistedAck) {
-            return rejected("PERSISTED_CONFIRMATION");
-        }
-        if (ack.getAckType() != AckType.Cumulative) {
-            return rejected("ACK_TYPE");
-        }
-        if (ack.getMessageIdsCount() != 1) {
-            return rejected("MESSAGE_ID_COUNT");
-        }
         if (ack.hasTxnidMostBits() || ack.hasTxnidLeastBits()) {
             return rejected("TRANSACTION");
         }
         if (ack.hasValidationError()) {
             return rejected("VALIDATION_ERROR");
         }
-        MessageIdData messageId = ack.getMessageIdAt(0);
-        if (messageId.getAckSetsCount() != 0) {
-            return rejected("ACK_SET");
+        if (subscriptionType == SubType.Key_Shared) {
+            return rejected("KEY_SHARED");
         }
-        if (messageId.hasBatchIndex() || messageId.hasBatchSize()) {
-            return rejected("BATCH_INDEX");
+        if (subscriptionType != SubType.Exclusive
+                && subscriptionType != SubType.Failover
+                && subscriptionType != SubType.Shared) {
+            return rejected("SUBSCRIPTION_TYPE");
+        }
+        if (requirePersistedAck && !persistentSubscription.getCursor().isDurable()) {
+            return rejected("PERSISTED_CONFIRMATION_NON_DURABLE");
+        }
+        if (ack.getAckType() == AckType.Cumulative) {
+            if (subscriptionType == SubType.Shared) {
+                return rejected("SHARED_CUMULATIVE");
+            }
+            if (ack.getMessageIdsCount() != 1) {
+                return rejected("MESSAGE_ID_COUNT");
+            }
+        } else if (ack.getAckType() == AckType.Individual) {
+            if (ack.getMessageIdsCount() == 0 || ack.getMessageIdsCount() > maxPositions) {
+                return rejected("MESSAGE_ID_COUNT");
+            }
+        } else {
+            return rejected("ACK_TYPE");
+        }
+        for (MessageIdData messageId : ack.getMessageIdsList()) {
+            Optional<NotAllowedException> batchRejection = validateBatchShape(
+                    messageId, batchIndexAcknowledgmentEnabled);
+            if (batchRejection.isPresent()) {
+                return batchRejection;
+            }
+        }
+        return Optional.empty();
+    }
+
+    private static Optional<NotAllowedException> validateBatchShape(
+            MessageIdData messageId, boolean batchIndexAcknowledgmentEnabled) {
+        boolean partialBatch = messageId.getAckSetsCount() != 0 || messageId.hasBatchIndex();
+        if (partialBatch && !batchIndexAcknowledgmentEnabled) {
+            return rejected("PARTIAL_BATCH_DISABLED");
+        }
+        if (messageId.hasBatchSize() && messageId.getBatchSize() <= 0) {
+            return rejected("BATCH_SHAPE");
+        }
+        if (messageId.hasBatchIndex()) {
+            if (!messageId.hasBatchSize()
+                    || messageId.getBatchIndex() < 0
+                    || messageId.getBatchIndex() >= messageId.getBatchSize()) {
+                return rejected("BATCH_SHAPE");
+            }
         }
         return Optional.empty();
     }
@@ -76,6 +121,11 @@ public final class NereusAcknowledgeValidator {
     public boolean isNereusSubscription(Subscription subscription) {
         return subscription instanceof PersistentSubscription persistentSubscription
                 && persistentSubscription.getCursor().getManagedLedger() instanceof NereusManagedLedger;
+    }
+
+    public boolean isNereusDurableSubscription(Subscription subscription) {
+        return isNereusSubscription(subscription)
+                && ((PersistentSubscription) subscription).getCursor().isDurable();
     }
 
     private static Optional<NotAllowedException> rejected(String reason) {

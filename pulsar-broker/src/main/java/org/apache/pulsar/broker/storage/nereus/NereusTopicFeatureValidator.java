@@ -28,7 +28,7 @@ import org.apache.pulsar.common.api.proto.MessageMetadata;
 import org.apache.pulsar.common.naming.TopicName;
 import org.apache.pulsar.common.protocol.Commands;
 
-/** Closed F2 topic-open admission gate for the Nereus storage class. */
+/** Closed F3 topic, subscription, and admin admission gate for the Nereus storage class. */
 public final class NereusTopicFeatureValidator {
     public void validateTopicOpen(
             TopicName topic,
@@ -40,8 +40,6 @@ public final class NereusTopicFeatureValidator {
         reject(features.systemOrInternalTopic(), "SYSTEM_OR_INTERNAL_TOPIC");
         reject(!features.remoteReplicationClusters().isEmpty(), "GEO_REPLICATION");
         reject(features.deduplicationEnabled(), "DEDUPLICATION");
-        reject(features.messageTtlSeconds() != 0, "MESSAGE_TTL");
-        reject(features.subscriptionExpirationMinutes() != 0, "SUBSCRIPTION_EXPIRATION");
         reject(features.compactionThresholdBytes() != 0, "COMPACTION");
         reject(features.retentionEnabled(), "RETENTION");
         reject(features.backlogEvictionEnabled(), "BACKLOG_EVICTION");
@@ -67,19 +65,21 @@ public final class NereusTopicFeatureValidator {
             boolean replicated,
             KeySharedMeta keySharedMeta) throws NotAllowedException {
         java.util.Objects.requireNonNull(type, "type");
-        rejectSubscription(durable, "DURABLE");
-        rejectSubscription(type != SubType.Exclusive && type != SubType.Failover, "SUBSCRIPTION_TYPE");
+        rejectSubscription(type == SubType.Key_Shared, "KEY_SHARED");
+        rejectSubscription(type != SubType.Exclusive
+                && type != SubType.Failover
+                && type != SubType.Shared, "SUBSCRIPTION_TYPE");
         rejectSubscription(readCompacted, "READ_COMPACTED");
         rejectSubscription(replicated, "REPLICATED");
         rejectSubscription(keySharedMeta != null && !keySharedMeta.getHashRangesList().isEmpty(), "KEY_SHARED_META");
     }
 
-    public void validateCreateSubscription() throws NotAllowedException {
-        throw new NotAllowedException("NEREUS_UNSUPPORTED_SUBSCRIPTION:DURABLE_CREATE");
+    public void validateCreateSubscription(boolean cursorProtocolRuntimeReady) throws NotAllowedException {
+        requireCursorProtocolRuntime(cursorProtocolRuntimeReady);
     }
 
-    public void validateExistingDurableCursors(boolean hasExistingDurableCursor) throws NotAllowedException {
-        rejectSubscription(hasExistingDurableCursor, "EXISTING_DURABLE_CURSOR");
+    public void validateExistingDurableCursors(boolean cursorProtocolRuntimeReady) throws NotAllowedException {
+        requireCursorProtocolRuntime(cursorProtocolRuntimeReady);
     }
 
     public void validatePublish(ByteBuf entry, boolean transactional) throws NotAllowedException {
@@ -117,14 +117,18 @@ public final class NereusTopicFeatureValidator {
     public void validateAdminOperation(NereusAdminOperation operation) throws NotAllowedException {
         java.util.Objects.requireNonNull(operation, "operation");
         switch (operation) {
-            case TERMINATE_TOPIC, DELETE_TOPIC, UNLOAD_TOPIC -> {
+            case TERMINATE_TOPIC, DELETE_TOPIC, UNLOAD_TOPIC, DELETE_DURABLE_SUBSCRIPTION,
+                    ANALYZE_BACKLOG, CLEAR_BACKLOG, SKIP_MESSAGES, EXPIRE_MESSAGES, RESET_CURSOR -> {
                 return;
             }
-            case DELETE_DURABLE_SUBSCRIPTION, CLEAR_BACKLOG, SKIP_MESSAGES, EXPIRE_MESSAGES, RESET_CURSOR,
-                    TRIGGER_COMPACTION, READ_COMPACTION_STATUS, TRIGGER_OFFLOAD, READ_OFFLOAD_STATUS, TRUNCATE_TOPIC,
-                    SET_SHADOW_TOPICS, MIGRATE_TOPIC -> throw new NotAllowedException(
+            case TRIGGER_COMPACTION, READ_COMPACTION_STATUS, TRIGGER_OFFLOAD, READ_OFFLOAD_STATUS,
+                    TRIM_TOPIC, TRUNCATE_TOPIC, SET_SHADOW_TOPICS, MIGRATE_TOPIC -> throw new NotAllowedException(
                             "NEREUS_UNSUPPORTED_ADMIN_OPERATION:" + operation.name());
         }
+    }
+
+    private static void requireCursorProtocolRuntime(boolean ready) throws NotAllowedException {
+        rejectSubscription(!ready, "CURSOR_PROTOCOL_NOT_READY");
     }
 
     private static void reject(boolean rejected, String feature) throws NotAllowedException {
