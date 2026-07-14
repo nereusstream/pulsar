@@ -20,9 +20,9 @@ package org.apache.pulsar.broker.service.persistent;
 
 import static org.apache.pulsar.broker.service.AbstractBaseDispatcher.checkAndApplyReachedEndOfTopicOrTopicMigration;
 import static org.apache.pulsar.common.naming.SystemTopicNames.isEventSystemTopic;
-import com.nereusstream.managedledger.NereusManagedLedger;
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.MoreObjects;
+import com.nereusstream.managedledger.NereusManagedLedger;
 import io.github.merlimat.slog.Logger;
 import io.netty.buffer.ByteBuf;
 import java.util.Collections;

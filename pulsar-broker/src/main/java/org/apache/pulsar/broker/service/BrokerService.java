@@ -1657,12 +1657,17 @@ public class BrokerService implements Closeable {
                 persistence.getBookkeeperAckQuorum(),
                 persistence.getManagedLedgerMaxMarkDeleteRate(),
                 persistence.getManagedLedgerStorageClassName());
-        return storageClassMigrationGuard.updateTopicPersistence(
-                topicName,
-                () -> getNereusTopicPolicySnapshot(topicName)
-                        .thenApply(snapshot -> proposedTopicStorageClass(snapshot, target, global)),
-                () -> pulsar.getTopicPoliciesService().updateTopicPoliciesAsync(
-                        topicName, global, target == null, policies -> policies.setPersistence(target)));
+        // The first topic-policy access can lazily create the namespace policy system topic. Complete that
+        // initialization before taking the namespace storage-class lock: the system topic's first durable open
+        // takes the same lock, so initializing it from policyMutation would otherwise deadlock recursively.
+        // The guarded supplier deliberately reads a fresh snapshot again after the lock is acquired.
+        return getNereusTopicPolicySnapshot(topicName).thenCompose(ignored ->
+                storageClassMigrationGuard.updateTopicPersistence(
+                        topicName,
+                        () -> getNereusTopicPolicySnapshot(topicName)
+                                .thenApply(snapshot -> proposedTopicStorageClass(snapshot, target, global)),
+                        () -> pulsar.getTopicPoliciesService().updateTopicPoliciesAsync(
+                                topicName, global, target == null, policies -> policies.setPersistence(target))));
     }
 
     private static String proposedTopicStorageClass(
