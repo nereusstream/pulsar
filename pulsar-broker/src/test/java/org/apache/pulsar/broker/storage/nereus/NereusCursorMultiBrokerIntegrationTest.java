@@ -28,6 +28,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
 import org.apache.bookkeeper.mledger.ManagedCursor;
@@ -67,12 +68,13 @@ public class NereusCursorMultiBrokerIntegrationTest {
 
     @Test(timeOut = 900_000)
     public void preservesDurableCursorTruthAcrossUnloadFailoverRestartExpiryAndBookKeeper() throws Exception {
-        assertExclusiveEarliestLatestAndUnload(topic("exclusive"));
-        assertFailoverRedeliversIdenticalMessageIds(topic("failover"));
-        assertSharedKeepsExactIndividualAckHoles(topic("shared"));
-        assertPartialBatchSurvivesFailoverAndRuntimeRestart(topic("batch"));
-        assertExpiryIsCursorOnly(topic("expiry"));
-        assertBookKeeperSubscriptionRemainsStock(topic("bookkeeper"));
+        String runId = UUID.randomUUID().toString();
+        assertExclusiveEarliestLatestAndUnload(topic(runId, "exclusive"));
+        assertFailoverRedeliversIdenticalMessageIds(topic(runId, "failover"));
+        assertSharedKeepsExactIndividualAckHoles(topic(runId, "shared"));
+        assertPartialBatchSurvivesFailoverAndRuntimeRestart(topic(runId, "batch"));
+        assertExpiryIsCursorOnly(topic(runId, "expiry"));
+        assertBookKeeperSubscriptionRemainsStock(topic(runId, "bookkeeper"));
     }
 
     private void assertExclusiveEarliestLatestAndUnload(String topic) throws Exception {
@@ -128,6 +130,7 @@ public class NereusCursorMultiBrokerIntegrationTest {
 
     private void assertFailoverRedeliversIdenticalMessageIds(String topic) throws Exception {
         configureNereus(topic);
+        List<ExpectedMessage> expected;
         int stoppedOwner = -1;
         try (PulsarClient client = cluster.multiBrokerClient();
                 Consumer<byte[]> first = consumer(
@@ -143,15 +146,32 @@ public class NereusCursorMultiBrokerIntegrationTest {
                         SubscriptionType.Failover,
                         SubscriptionInitialPosition.Latest);
                 Producer<byte[]> producer = producer(client, topic)) {
-            List<ExpectedMessage> expected = appendSingles(producer, "failover", 3);
+            expected = appendSingles(producer, "failover", 3);
             List<Delivery> initial = receiveEither(List.of(first, second), expected.size());
             assertDeliveries(expected, initial);
+        }
 
+        try {
             stoppedOwner = stopTopicOwner(topic);
-            List<Delivery> redelivered = receiveEither(List.of(first, second), expected.size());
-            assertDeliveries(expected, redelivered);
-            for (Delivery delivery : redelivered) {
-                delivery.consumer().acknowledge(delivery.message());
+            int survivor = otherBroker(stoppedOwner);
+            try (PulsarClient client = clientForBroker(survivor);
+                    Consumer<byte[]> first = consumer(
+                            client,
+                            topic,
+                            "failover-subscription",
+                            SubscriptionType.Failover,
+                            SubscriptionInitialPosition.Latest);
+                    Consumer<byte[]> second = consumer(
+                            client,
+                            topic,
+                            "failover-subscription",
+                            SubscriptionType.Failover,
+                            SubscriptionInitialPosition.Latest)) {
+                List<Delivery> redelivered = receiveEither(List.of(first, second), expected.size());
+                assertDeliveries(expected, redelivered);
+                for (Delivery delivery : redelivered) {
+                    delivery.consumer().acknowledge(delivery.message());
+                }
             }
         } finally {
             if (stoppedOwner >= 0) {
@@ -352,14 +372,9 @@ public class NereusCursorMultiBrokerIntegrationTest {
 
     private void configureNereus(String topic) throws Exception {
         PersistencePolicies policy = new PersistencePolicies(1, 1, 1, 0, StorageClassBindingRecord.NEREUS);
-        Awaitility.await()
-                .atMost(Duration.ofSeconds(60))
-                .pollInterval(Duration.ofMillis(200))
-                .ignoreExceptions()
-                .until(() -> {
-                    cluster.admin(0).topicPolicies().setPersistence(topic, policy);
-                    return policy.equals(cluster.admin(0).topicPolicies().getPersistence(topic));
-                });
+        cluster.admin(0).topicPolicies().setPersistence(topic, policy);
+        Awaitility.await().atMost(Duration.ofSeconds(30)).untilAsserted(() ->
+                assertThat(cluster.admin(0).topicPolicies().getPersistence(topic)).isEqualTo(policy));
     }
 
     private int stopTopicOwner(String topic) throws Exception {
@@ -387,8 +402,8 @@ public class NereusCursorMultiBrokerIntegrationTest {
                 .orElseThrow();
     }
 
-    private String topic(String suffix) {
-        return "persistent://" + cluster.namespace() + "/cursor-m5-" + suffix;
+    private String topic(String runId, String suffix) {
+        return "persistent://" + cluster.namespace() + "/cursor-m5-" + runId + "-" + suffix;
     }
 
     private static Producer<byte[]> producer(PulsarClient client, String topic) throws Exception {
