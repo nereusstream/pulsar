@@ -283,7 +283,7 @@ public class NereusMultiBrokerIntegrationTest {
                 .build();
     }
 
-    private void startBroker(int index) throws Exception {
+    void startBroker(int index) throws Exception {
         assertThat(brokers.get(index)).isNull();
         ServiceConfiguration configuration = brokerConfiguration();
         PulsarService broker = new PulsarService(configuration);
@@ -358,7 +358,7 @@ public class NereusMultiBrokerIntegrationTest {
         return configuration;
     }
 
-    private void stopBroker(int index) throws Exception {
+    void stopBroker(int index) throws Exception {
         PulsarAdmin admin = admins.set(index, null);
         PulsarService broker = brokers.set(index, null);
         Exception failure = null;
@@ -381,7 +381,7 @@ public class NereusMultiBrokerIntegrationTest {
         }
     }
 
-    private PulsarClient multiBrokerClient() throws Exception {
+    PulsarClient multiBrokerClient() throws Exception {
         return PulsarClient.builder()
                 .serviceUrl(brokers.stream()
                         .map(PulsarService::getBrokerServiceUrl)
@@ -553,7 +553,7 @@ public class NereusMultiBrokerIntegrationTest {
         return owner;
     }
 
-    private int awaitOwner(PulsarAdmin admin, String topic, Integer expectedIndex) {
+    int awaitOwner(PulsarAdmin admin, String topic, Integer expectedIndex) {
         AtomicReference<Integer> owner = new AtomicReference<>();
         Awaitility.await().atMost(Duration.ofSeconds(60)).pollInterval(Duration.ofMillis(100))
                 .untilAsserted(() -> {
@@ -613,7 +613,7 @@ public class NereusMultiBrokerIntegrationTest {
         }
     }
 
-    private void awaitCapabilityConvergence() {
+    void awaitCapabilityConvergence() {
         Awaitility.await().atMost(Duration.ofSeconds(60)).pollInterval(Duration.ofMillis(100))
                 .untilAsserted(() -> {
                     for (PulsarService broker : brokers) {
@@ -623,11 +623,12 @@ public class NereusMultiBrokerIntegrationTest {
                         NereusManagedLedgerStorage storage =
                                 (NereusManagedLedgerStorage) broker.getManagedLedgerStorage();
                         storage.capabilityCoordinator().requireClusterReady().join();
+                        storage.capabilityCoordinator().requireCursorClusterReady().join();
                     }
                 });
     }
 
-    private long objectCount() throws Exception {
+    long objectCount() throws Exception {
         Container.ExecResult listing = localstack.execInContainer(
                 "awslocal", "s3", "ls", "s3://" + BUCKET, "--recursive");
         assertThat(listing.getExitCode()).withFailMessage(listing.getStderr()).isZero();
@@ -636,6 +637,18 @@ public class NereusMultiBrokerIntegrationTest {
 
     private static int otherBroker(int index) {
         return index == 0 ? 1 : 0;
+    }
+
+    PulsarService broker(int index) {
+        return brokers.get(index);
+    }
+
+    PulsarAdmin admin(int index) {
+        return admins.get(index);
+    }
+
+    String namespace() {
+        return NAMESPACE;
     }
 
     private static byte[] bytes(String value) {
