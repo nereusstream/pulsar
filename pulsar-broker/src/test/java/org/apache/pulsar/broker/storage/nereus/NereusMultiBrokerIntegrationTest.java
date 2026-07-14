@@ -53,6 +53,7 @@ import org.apache.pulsar.client.api.MessageIdAdv;
 import org.apache.pulsar.client.api.Producer;
 import org.apache.pulsar.client.api.PulsarClient;
 import org.apache.pulsar.client.api.Reader;
+import org.apache.pulsar.client.api.ReaderBuilder;
 import org.apache.pulsar.common.naming.NamespaceName;
 import org.apache.pulsar.common.naming.TopicName;
 import org.apache.pulsar.common.policies.data.ClusterData;
@@ -197,11 +198,13 @@ public class NereusMultiBrokerIntegrationTest {
             appendBookKeeperControl(client, bookkeeperExpected, "bookkeeper-before");
             assertFacadeEntriesReadable(admins.get(0), 5);
             assertReadAll(client, NEREUS_TOPIC, expected);
+            assertSavedMessageIdStarts(client, expected);
             assertReadAll(client, BOOKKEEPER_TOPIC, bookkeeperExpected);
             assertNereusOwnerAndPosition(admins.get(0), expected);
 
             admins.get(0).topics().unload(NEREUS_TOPIC);
             assertReadAll(client, NEREUS_TOPIC, expected);
+            assertSavedMessageIdStarts(client, expected);
             appendSingles(producer, expected, "after-unload", 2);
             assertReadAll(client, NEREUS_TOPIC, expected);
 
@@ -216,6 +219,7 @@ public class NereusMultiBrokerIntegrationTest {
                     Producer<byte[]> survivorProducer = singleEntryProducer(survivorClient, NEREUS_TOPIC)) {
                 appendSingles(survivorProducer, expected, "after-owner-failover", 3);
                 assertReadAll(survivorClient, NEREUS_TOPIC, expected);
+                assertSavedMessageIdStarts(survivorClient, expected);
                 assertNereusOwnerAndPosition(admins.get(survivor), expected);
                 assertActiveBinding(brokers.get(survivor), NEREUS_TOPIC, StorageClassBindingRecord.NEREUS);
             }
@@ -233,6 +237,7 @@ public class NereusMultiBrokerIntegrationTest {
             appendSingles(restartedProducer, expected, "after-runtime-restart", 2);
             appendBookKeeperControl(restartedClient, bookkeeperExpected, "bookkeeper-after");
             assertReadAll(restartedClient, NEREUS_TOPIC, expected);
+            assertSavedMessageIdStarts(restartedClient, expected);
             assertReadAll(restartedClient, BOOKKEEPER_TOPIC, bookkeeperExpected);
         }
 
@@ -452,6 +457,40 @@ public class NereusMultiBrokerIntegrationTest {
                 expectedMessage.assertSamePosition(actual.getMessageId());
             }
             assertThat(reader.readNext(250, TimeUnit.MILLISECONDS)).isNull();
+        }
+    }
+
+    private void assertSavedMessageIdStarts(
+            PulsarClient client, List<ExpectedMessage> expected) throws Exception {
+        assertThat(expected).hasSizeGreaterThanOrEqualTo(7);
+        assertReaderStartsAt(client, expected.get(0), false, expected.get(1));
+        assertReaderStartsAt(client, expected.get(0), true, expected.get(0));
+        assertReaderStartsAt(client, expected.get(1), false, expected.get(2));
+        assertReaderStartsAt(client, expected.get(1), true, expected.get(1));
+        assertReaderStartsAt(client, expected.get(5), false, expected.get(6));
+        assertReaderStartsAt(client, expected.get(5), true, expected.get(5));
+    }
+
+    private void assertReaderStartsAt(
+            PulsarClient client,
+            ExpectedMessage start,
+            boolean inclusive,
+            ExpectedMessage expectedFirst) throws Exception {
+        ReaderBuilder<byte[]> builder = client.newReader()
+                .topic(NEREUS_TOPIC)
+                .startMessageId(start.messageId());
+        if (inclusive) {
+            builder.startMessageIdInclusive();
+        }
+        try (Reader<byte[]> reader = builder.create()) {
+            Message<byte[]> actual = reader.readNext(30, TimeUnit.SECONDS);
+            assertThat(actual)
+                    .withFailMessage(() -> "start=" + start.messageId()
+                            + ", inclusive=" + inclusive + ", " + cursorDiagnostics(NEREUS_TOPIC))
+                    .isNotNull();
+            assertThat(new String(actual.getData(), StandardCharsets.UTF_8))
+                    .isEqualTo(expectedFirst.value());
+            expectedFirst.assertSamePosition(actual.getMessageId());
         }
     }
 
