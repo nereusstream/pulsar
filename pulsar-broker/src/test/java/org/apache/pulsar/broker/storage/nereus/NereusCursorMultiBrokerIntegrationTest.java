@@ -18,8 +18,11 @@
  */
 package org.apache.pulsar.broker.storage.nereus;
 
+import static org.apache.bookkeeper.mledger.ManagedCursor.CURSOR_INTERNAL_PROPERTY_PREFIX;
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import com.nereusstream.managedledger.NereusManagedLedger;
+import com.nereusstream.managedledger.projection.VirtualLedgerProjection;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.ArrayList;
@@ -33,15 +36,19 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
 import org.apache.bookkeeper.mledger.ManagedCursor;
 import org.apache.bookkeeper.mledger.impl.ManagedLedgerImpl;
+import org.apache.pulsar.broker.service.TopicPoliciesService;
 import org.apache.pulsar.broker.service.persistent.PersistentTopic;
+import org.apache.pulsar.client.admin.PulsarAdminException;
 import org.apache.pulsar.client.api.Consumer;
 import org.apache.pulsar.client.api.Message;
 import org.apache.pulsar.client.api.MessageId;
 import org.apache.pulsar.client.api.MessageIdAdv;
 import org.apache.pulsar.client.api.Producer;
 import org.apache.pulsar.client.api.PulsarClient;
+import org.apache.pulsar.client.api.Reader;
 import org.apache.pulsar.client.api.SubscriptionInitialPosition;
 import org.apache.pulsar.client.api.SubscriptionType;
+import org.apache.pulsar.common.naming.TopicName;
 import org.apache.pulsar.common.policies.data.PersistencePolicies;
 import org.awaitility.Awaitility;
 import org.testng.annotations.AfterClass;
@@ -75,6 +82,242 @@ public class NereusCursorMultiBrokerIntegrationTest {
         assertPartialBatchSurvivesFailoverAndRuntimeRestart(topic(runId, "batch"));
         assertExpiryIsCursorOnly(topic(runId, "expiry"));
         assertBookKeeperSubscriptionRemainsStock(topic(runId, "bookkeeper"));
+    }
+
+    @Test(timeOut = 900_000)
+    public void preservesMessageIdsPropertiesAndIncarnationAcrossCompatibilityCuts() throws Exception {
+        String runId = UUID.randomUUID().toString();
+        assertMessageIdsSurviveSeekHistoryUnloadFailoverAndRestart(topic(runId, "message-id"));
+        assertCursorPropertiesSurvivePeerOwnershipAndRestart(topic(runId, "properties"));
+        assertLoadedUnloadedAndNamespaceAdminRoutes(topic(runId, "admin"), topic(runId, "shadow"));
+        assertTopicRecreationUsesFreshProjectionAndCursorTruth(topic(runId, "recreate"));
+    }
+
+    private void assertMessageIdsSurviveSeekHistoryUnloadFailoverAndRestart(String topic) throws Exception {
+        configureNereus(topic);
+        ExpectedMessage ordinary;
+        ExpectedMessage middleBatch;
+        try (PulsarClient client = cluster.multiBrokerClient();
+                Producer<byte[]> producer = producer(client, topic)) {
+            ordinary = appendSingles(producer, "message-id-single", 4).get(1);
+            middleBatch = appendBatch(client, topic, "message-id-batch", 3).get(1);
+            assertHistoryAndSeek(client, topic, "initial", ordinary, middleBatch);
+        }
+
+        cluster.admin(0).topics().unload(topic);
+        try (PulsarClient client = cluster.multiBrokerClient()) {
+            assertHistoryAndSeek(client, topic, "unload", ordinary, middleBatch);
+        }
+
+        try {
+            int stoppedOwner = stopTopicOwner(topic);
+            int survivor = otherBroker(stoppedOwner);
+            try (PulsarClient client = clientForBroker(survivor)) {
+                assertHistoryAndSeek(client, topic, "failover", ordinary, middleBatch);
+            }
+
+            ensureBrokerRunning(stoppedOwner);
+            cluster.awaitCapabilityConvergence();
+            cluster.stopBroker(survivor);
+            cluster.awaitOwner(cluster.admin(stoppedOwner), topic, stoppedOwner);
+            try (PulsarClient client = clientForBroker(stoppedOwner)) {
+                assertHistoryAndSeek(client, topic, "restart", ordinary, middleBatch);
+            }
+        } finally {
+            ensureBrokerRunning(0);
+            ensureBrokerRunning(1);
+        }
+        cluster.awaitCapabilityConvergence();
+    }
+
+    private void assertHistoryAndSeek(
+            PulsarClient client,
+            String topic,
+            String checkpoint,
+            ExpectedMessage ordinary,
+            ExpectedMessage middleBatch) throws Exception {
+        assertReaderStartsAt(client, topic, ordinary);
+        assertReaderStartsAt(client, topic, middleBatch);
+        try (Consumer<byte[]> consumer = client.newConsumer()
+                .topic(topic)
+                .subscriptionName("m6-seek-" + checkpoint)
+                .subscriptionType(SubscriptionType.Exclusive)
+                .subscriptionInitialPosition(SubscriptionInitialPosition.Latest)
+                .startMessageIdInclusive()
+                .enableBatchIndexAcknowledgment(true)
+                .isAckReceiptEnabled(true)
+                .subscribe()) {
+            consumer.seek(ordinary.messageId());
+            ordinary.assertSame(receive(consumer));
+            consumer.seek(middleBatch.messageId());
+            middleBatch.assertSame(receive(consumer));
+        }
+    }
+
+    private static void assertReaderStartsAt(
+            PulsarClient client, String topic, ExpectedMessage expected) throws Exception {
+        try (Reader<byte[]> reader = client.newReader()
+                .topic(topic)
+                .startMessageId(expected.messageId())
+                .startMessageIdInclusive()
+                .create()) {
+            expected.assertSame(receive(reader));
+        }
+    }
+
+    private void assertCursorPropertiesSurvivePeerOwnershipAndRestart(String topic) throws Exception {
+        configureNereus(topic);
+        String subscription = "m6-properties";
+        String internalKey = CURSOR_INTERNAL_PROPERTY_PREFIX + "m6-owner";
+        try (PulsarClient client = cluster.multiBrokerClient();
+                Consumer<byte[]> ignored = consumer(
+                        client,
+                        topic,
+                        subscription,
+                        SubscriptionType.Exclusive,
+                        SubscriptionInitialPosition.Earliest)) {
+            ManagedCursor cursor = loadedCursor(topic, subscription);
+            cursor.putCursorProperty(internalKey, "internal-one").join();
+            cursor.putCursorProperty("obsolete", "remove-me").join();
+            cursor.setCursorProperties(Map.of("external", "one")).join();
+            assertThat(cursor.getCursorProperties()).containsExactlyInAnyOrderEntriesOf(Map.of(
+                    internalKey, "internal-one", "external", "one"));
+            assertThatThrownBy(() -> cursor.setCursorProperties(
+                            Map.of(internalKey, "forbidden", "external", "corrupt"))
+                    .join())
+                    .hasRootCauseInstanceOf(IllegalArgumentException.class)
+                    .hasRootCauseMessage("external replacement cannot contain internal cursor keys");
+            assertThat(cursor.getCursorProperties()).containsExactlyInAnyOrderEntriesOf(Map.of(
+                    internalKey, "internal-one", "external", "one"));
+        }
+
+        try {
+            int stoppedOwner = stopTopicOwner(topic);
+            int survivor = otherBroker(stoppedOwner);
+            try (PulsarClient client = clientForBroker(survivor);
+                    Consumer<byte[]> ignored = consumer(
+                            client,
+                            topic,
+                            subscription,
+                            SubscriptionType.Exclusive,
+                            SubscriptionInitialPosition.Latest)) {
+                ManagedCursor cursor = loadedCursor(survivor, topic, subscription);
+                assertThat(cursor.getCursorProperties()).containsExactlyInAnyOrderEntriesOf(Map.of(
+                        internalKey, "internal-one", "external", "one"));
+                cursor.setCursorProperties(Map.of("external", "two")).join();
+                assertThat(cursor.getCursorProperties()).containsExactlyInAnyOrderEntriesOf(Map.of(
+                        internalKey, "internal-one", "external", "two"));
+            }
+
+            ensureBrokerRunning(stoppedOwner);
+            cluster.awaitCapabilityConvergence();
+            cluster.stopBroker(survivor);
+            cluster.awaitOwner(cluster.admin(stoppedOwner), topic, stoppedOwner);
+            try (PulsarClient client = clientForBroker(stoppedOwner);
+                    Consumer<byte[]> ignored = consumer(
+                            client,
+                            topic,
+                            subscription,
+                            SubscriptionType.Exclusive,
+                            SubscriptionInitialPosition.Latest)) {
+                assertThat(loadedCursor(stoppedOwner, topic, subscription).getCursorProperties())
+                        .containsExactlyInAnyOrderEntriesOf(Map.of(
+                                internalKey, "internal-one", "external", "two"));
+            }
+        } finally {
+            ensureBrokerRunning(0);
+            ensureBrokerRunning(1);
+        }
+        cluster.awaitCapabilityConvergence();
+    }
+
+    private void assertLoadedUnloadedAndNamespaceAdminRoutes(String sourceTopic, String shadowTopic)
+            throws Exception {
+        configureNereus(sourceTopic);
+        try (PulsarClient client = cluster.multiBrokerClient();
+                Producer<byte[]> source = producer(client, sourceTopic);
+                Producer<byte[]> shadow = producer(client, shadowTopic)) {
+            source.send(bytes("admin-source"));
+            shadow.send(bytes("admin-shadow"));
+        }
+
+        assertAdminRejected(
+                () -> cluster.admin(0).topics().triggerCompaction(sourceTopic),
+                NereusAdminOperation.TRIGGER_COMPACTION);
+
+        cluster.admin(0).topics().unload(sourceTopic);
+        Awaitility.await().atMost(Duration.ofSeconds(30)).untilAsserted(() -> {
+            for (int index = 0; index < 2; index++) {
+                assertThat(cluster.broker(index).getBrokerService().getTopicReference(sourceTopic)).isEmpty();
+            }
+        });
+        assertAdminRejected(
+                () -> cluster.admin(0).topics().setShadowTopics(sourceTopic, List.of(shadowTopic)),
+                NereusAdminOperation.SET_SHADOW_TOPICS);
+        try (PulsarClient client = cluster.multiBrokerClient();
+                Producer<byte[]> reopened = producer(client, sourceTopic)) {
+            reopened.send(bytes("admin-reopened"));
+        }
+        assertThat(cluster.broker(0).getTopicPoliciesService()
+                        .getTopicPoliciesAsync(
+                                TopicName.get(sourceTopic), TopicPoliciesService.GetType.LOCAL_ONLY)
+                        .join()
+                        .orElseThrow()
+                        .getShadowTopics())
+                .isNullOrEmpty();
+
+        cluster.admin(0).namespaces().clearNamespaceBacklog(cluster.namespace());
+    }
+
+    private static void assertAdminRejected(
+            AdminOperation operation, NereusAdminOperation expected) {
+        assertThatThrownBy(operation::run)
+                .isInstanceOf(PulsarAdminException.class)
+                .hasMessageContaining("NEREUS_UNSUPPORTED_ADMIN_OPERATION:" + expected.name());
+    }
+
+    private void assertTopicRecreationUsesFreshProjectionAndCursorTruth(String topic) throws Exception {
+        configureNereus(topic);
+        String subscription = "m6-recreated-subscription";
+        ExpectedMessage oldMessage;
+        VirtualLedgerProjection oldProjection;
+        try (PulsarClient client = cluster.multiBrokerClient();
+                Producer<byte[]> producer = producer(client, topic);
+                Consumer<byte[]> consumer = consumer(
+                        client,
+                        topic,
+                        subscription,
+                        SubscriptionType.Exclusive,
+                        SubscriptionInitialPosition.Earliest)) {
+            oldMessage = appendSingles(producer, "old-incarnation", 1).get(0);
+            oldMessage.assertSame(receive(consumer));
+            oldProjection = ((NereusManagedLedger) loadedTopic(topic).getManagedLedger()).projection();
+        }
+
+        cluster.admin(0).topics().delete(topic, true);
+        configureNereus(topic);
+
+        VirtualLedgerProjection newProjection;
+        try (PulsarClient client = cluster.multiBrokerClient();
+                Consumer<byte[]> consumer = consumer(
+                        client,
+                        topic,
+                        subscription,
+                        SubscriptionType.Exclusive,
+                        SubscriptionInitialPosition.Earliest);
+                Producer<byte[]> producer = producer(client, topic)) {
+            assertThat(consumer.receive(NO_MESSAGE_TIMEOUT_MILLIS, TimeUnit.MILLISECONDS)).isNull();
+            ExpectedMessage newMessage = appendSingles(producer, "new-incarnation", 1).get(0);
+            newMessage.assertSame(receive(consumer));
+            assertThat(newMessage.messageId()).isNotEqualTo(oldMessage.messageId());
+            newProjection = ((NereusManagedLedger) loadedTopic(topic).getManagedLedger()).projection();
+        }
+
+        assertThat(newProjection.incarnation()).isEqualTo(oldProjection.incarnation() + 1);
+        assertThat(newProjection.storageClassBindingGeneration())
+                .isEqualTo(oldProjection.storageClassBindingGeneration() + 1);
+        assertThat(newProjection.streamId()).isNotEqualTo(oldProjection.streamId());
+        assertThat(newProjection.virtualLedgerId()).isNotEqualTo(oldProjection.virtualLedgerId());
     }
 
     private void assertExclusiveEarliestLatestAndUnload(String topic) throws Exception {
@@ -397,9 +640,24 @@ public class NereusCursorMultiBrokerIntegrationTest {
 
     private PersistentTopic loadedTopic(String topic) {
         int owner = cluster.awaitOwner(cluster.admin(0), topic, null);
+        return loadedTopic(owner, topic);
+    }
+
+    private PersistentTopic loadedTopic(int owner, String topic) {
         return (PersistentTopic) cluster.broker(owner).getBrokerService()
                 .getTopicReference(topic)
                 .orElseThrow();
+    }
+
+    private ManagedCursor loadedCursor(String topic, String subscription) {
+        int owner = cluster.awaitOwner(cluster.admin(0), topic, null);
+        return loadedCursor(owner, topic, subscription);
+    }
+
+    private ManagedCursor loadedCursor(int owner, String topic, String subscription) {
+        Awaitility.await().atMost(Duration.ofSeconds(30)).untilAsserted(() ->
+                assertThat(loadedTopic(owner, topic).getSubscription(subscription)).isNotNull());
+        return loadedTopic(owner, topic).getSubscription(subscription).getCursor();
     }
 
     private String topic(String runId, String suffix) {
@@ -464,6 +722,12 @@ public class NereusCursorMultiBrokerIntegrationTest {
 
     private static Message<byte[]> receive(Consumer<byte[]> consumer) throws Exception {
         Message<byte[]> message = consumer.receive(RECEIVE_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+        assertThat(message).isNotNull();
+        return message;
+    }
+
+    private static Message<byte[]> receive(Reader<byte[]> reader) throws Exception {
+        Message<byte[]> message = reader.readNext(RECEIVE_TIMEOUT_SECONDS, TimeUnit.SECONDS);
         assertThat(message).isNotNull();
         return message;
     }
@@ -541,6 +805,11 @@ public class NereusCursorMultiBrokerIntegrationTest {
     }
 
     private record Delivery(Consumer<byte[]> consumer, Message<byte[]> message) {
+    }
+
+    @FunctionalInterface
+    private interface AdminOperation {
+        void run() throws Exception;
     }
 
     private record ExpectedMessage(String value, MessageIdAdv messageId) {

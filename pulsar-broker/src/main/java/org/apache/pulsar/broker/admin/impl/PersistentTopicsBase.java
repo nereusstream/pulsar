@@ -88,6 +88,7 @@ import org.apache.pulsar.broker.service.persistent.PersistentReplicator;
 import org.apache.pulsar.broker.service.persistent.PersistentSubscription;
 import org.apache.pulsar.broker.service.persistent.PersistentTopic;
 import org.apache.pulsar.broker.storage.nereus.NereusAdminOperation;
+import org.apache.pulsar.broker.storage.nereus.NereusManagedLedgerStorage;
 import org.apache.pulsar.broker.web.RestException;
 import org.apache.pulsar.client.admin.LongRunningProcessStatus;
 import org.apache.pulsar.client.admin.OffloadProcessStatus;
@@ -173,11 +174,20 @@ public class PersistentTopicsBase extends AdminResource {
         return CompletableFuture.completedFuture(topic);
     }
 
-    private CompletableFuture<Void> validateLoadedNereusAdminOperation(NereusAdminOperation operation) {
+    protected CompletableFuture<Void> validateNereusAdminOperationForLoadedOrBoundTopic(
+            NereusAdminOperation operation) {
         return pulsar().getBrokerService().getTopicIfExists(topicName.toString())
-                .thenCompose(optionalTopic -> optionalTopic
-                        .map(topic -> validateNereusAdminOperation(topic, operation).thenApply(__ -> (Void) null))
-                        .orElseGet(() -> CompletableFuture.completedFuture(null)));
+                .thenCompose(optionalTopic -> {
+                    if (optionalTopic.isPresent()) {
+                        return validateNereusAdminOperation(
+                                optionalTopic.orElseThrow(), operation).thenApply(__ -> (Void) null);
+                    }
+                    if (pulsar().getManagedLedgerStorage()
+                            instanceof NereusManagedLedgerStorage nereusStorage) {
+                        return nereusStorage.validateUnloadedAdminOperation(topicName, operation);
+                    }
+                    return CompletableFuture.completedFuture(null);
+                });
     }
 
     protected CompletableFuture<List<String>> internalGetListAsync(Optional<String> bundle,
@@ -1245,7 +1255,8 @@ public class PersistentTopicsBase extends AdminResource {
     protected CompletableFuture<Void> internalDeleteTopicAsync(boolean authoritative, boolean force) {
         return validateNamespaceOperationAsync(topicName.getNamespaceObject(), NamespaceOperation.DELETE_TOPIC)
                 .thenCompose(__ -> validateTopicOwnershipAsync(topicName, authoritative))
-                .thenCompose(__ -> validateLoadedNereusAdminOperation(NereusAdminOperation.DELETE_TOPIC))
+                .thenCompose(__ -> validateNereusAdminOperationForLoadedOrBoundTopic(
+                        NereusAdminOperation.DELETE_TOPIC))
                 .thenCompose(__ -> pulsar().getBrokerService().deleteTopic(topicName.toString(), force));
     }
 
@@ -5702,7 +5713,8 @@ public class PersistentTopicsBase extends AdminResource {
         }
         return validatePoliciesReadOnlyAccessAsync()
                 .thenCompose(__ -> validateShadowTopics(shadowTopics))
-                .thenCompose(__ -> validateLoadedNereusAdminOperation(NereusAdminOperation.SET_SHADOW_TOPICS))
+                .thenCompose(__ -> validateNereusAdminOperationForLoadedOrBoundTopic(
+                        NereusAdminOperation.SET_SHADOW_TOPICS))
                 .thenCompose(__ -> pulsar().getTopicPoliciesService().updateTopicPoliciesAsync(topicName, false,
                         false, policies -> {
                     policies.setShadowTopics(shadowTopics);

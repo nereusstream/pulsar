@@ -59,6 +59,7 @@ import org.apache.pulsar.broker.admin.AdminResource;
 import org.apache.pulsar.broker.admin.impl.PersistentTopicsBase;
 import org.apache.pulsar.broker.service.BrokerServiceException;
 import org.apache.pulsar.broker.service.GetStatsOptions;
+import org.apache.pulsar.broker.storage.nereus.NereusAdminOperation;
 import org.apache.pulsar.broker.web.RestException;
 import org.apache.pulsar.client.admin.LongRunningProcessStatus;
 import org.apache.pulsar.client.admin.OffloadProcessStatus;
@@ -5469,6 +5470,8 @@ public class PersistentTopics extends PersistentTopicsBase {
             @RequestBody(description = "List of shadow topics", required = true) List<String> shadowTopics) {
         validateTopicName(tenant, namespace, encodedTopic);
         validateTopicPolicyOperationAsync(topicName, PolicyName.SHADOW_TOPIC, PolicyOperation.WRITE)
+                .thenCompose(__ -> validateNereusAdminOperationForLoadedOrBoundTopic(
+                        NereusAdminOperation.SET_SHADOW_TOPICS))
                 .thenCompose(__ -> preValidation(authoritative))
                 .thenCompose(__ -> internalSetShadowTopic(shadowTopics))
                 .thenRun(() -> asyncResponse.resume(Response.noContent().build()))

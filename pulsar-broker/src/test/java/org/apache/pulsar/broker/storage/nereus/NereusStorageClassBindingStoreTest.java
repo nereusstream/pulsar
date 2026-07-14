@@ -105,6 +105,25 @@ public class NereusStorageClassBindingStoreTest {
     }
 
     @Test
+    public void readsTheExactBindingForAnUnloadedTopic() {
+        MutableBindingMetadata bindingMetadata = new MutableBindingMetadata();
+        ManagedLedgerFactory bookkeeper = mock(ManagedLedgerFactory.class);
+        NereusManagedLedgerFactory nereus = mock(NereusManagedLedgerFactory.class);
+        when(bookkeeper.asyncExists(PERSISTENCE_NAME)).thenReturn(CompletableFuture.completedFuture(false));
+        when(nereus.inspectStorageState(PERSISTENCE_NAME))
+                .thenReturn(CompletableFuture.completedFuture(NereusStorageStateSnapshot.missing()));
+        NereusStorageClassBindingStore store = new NereusStorageClassBindingStore(
+                bindingMetadata.store(), bookkeeper, Duration.ofSeconds(1));
+        store.attachNereusFactory(nereus);
+        StorageClassOpenPermit permit = store.prepareStorageClassOpen(
+                PERSISTENCE_NAME, StorageClassBindingRecord.NEREUS, true).join();
+        store.completeStorageClassOpen(permit).join();
+
+        assertThat(store.getBinding(PERSISTENCE_NAME).join())
+                .contains(bindingMetadata.record());
+    }
+
+    @Test
     public void acceptsSameGenerationActivationCompletedByPeerBroker() {
         MutableBindingMetadata bindingMetadata = new MutableBindingMetadata();
         ManagedLedgerFactory bookkeeper = mock(ManagedLedgerFactory.class);

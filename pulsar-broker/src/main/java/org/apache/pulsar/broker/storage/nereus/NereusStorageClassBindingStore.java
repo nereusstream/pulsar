@@ -85,6 +85,20 @@ public final class NereusStorageClassBindingStore implements AutoCloseable {
         }
     }
 
+    public CompletableFuture<Optional<StorageClassBindingRecord>> getBinding(String persistenceName) {
+        final String path;
+        try {
+            requireOpen();
+            path = bindingPath(persistenceName);
+        } catch (RuntimeException error) {
+            return CompletableFuture.failedFuture(error);
+        }
+        return metadataStore.sync(path)
+                .thenCompose(ignored -> metadataStore.get(path))
+                .thenApply(current -> current.map(result -> decode(result, persistenceName)))
+                .orTimeout(timeout.toNanos(), TimeUnit.NANOSECONDS);
+    }
+
     public CompletableFuture<StorageClassOpenPermit> prepareStorageClassOpen(
             String persistenceName,
             String selectedStorageClass,

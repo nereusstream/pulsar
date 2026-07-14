@@ -32,7 +32,9 @@ import java.security.SecureRandom;
 import java.time.Duration;
 import java.util.Collection;
 import java.util.List;
+import java.util.Objects;
 import java.util.Optional;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.atomic.AtomicBoolean;
 import org.apache.bookkeeper.mledger.ManagedLedgerConfig;
 import org.apache.bookkeeper.mledger.ManagedLedgerException;
@@ -40,13 +42,16 @@ import org.apache.bookkeeper.mledger.ManagedLedgerFactoryConfig;
 import org.apache.pulsar.broker.BookKeeperClientFactory;
 import org.apache.pulsar.broker.ManagedLedgerClientFactory;
 import org.apache.pulsar.broker.ServiceConfiguration;
+import org.apache.pulsar.broker.service.BrokerServiceException.NotAllowedException;
 import org.apache.pulsar.broker.storage.ManagedLedgerStorage;
 import org.apache.pulsar.broker.storage.ManagedLedgerStorageClass;
+import org.apache.pulsar.common.naming.TopicName;
 import org.apache.pulsar.common.util.Reflections;
 import org.apache.pulsar.metadata.api.extended.MetadataStoreExtended;
 
 /** Hybrid BookKeeper-default plus opt-in Nereus managed-ledger storage provider. */
 public final class NereusManagedLedgerStorage implements ManagedLedgerStorage {
+    private static final NereusTopicFeatureValidator FEATURE_VALIDATOR = new NereusTopicFeatureValidator();
     private final AtomicBoolean initialized = new AtomicBoolean();
     private final AtomicBoolean closed = new AtomicBoolean();
     private ManagedLedgerClientFactory bookkeeperStorage;
@@ -167,6 +172,35 @@ public final class NereusManagedLedgerStorage implements ManagedLedgerStorage {
     public NereusBrokerCapabilityCoordinator capabilityCoordinator() {
         ensureReady();
         return capabilityCoordinator;
+    }
+
+    public CompletableFuture<Void> validateUnloadedAdminOperation(
+            TopicName topicName, NereusAdminOperation operation) {
+        final String persistenceName;
+        try {
+            ensureReady();
+            persistenceName = Objects.requireNonNull(topicName, "topicName")
+                    .getPersistenceNamingEncoding();
+            Objects.requireNonNull(operation, "operation");
+        } catch (RuntimeException error) {
+            return CompletableFuture.failedFuture(error);
+        }
+        return bindingStore.getBinding(persistenceName).thenCompose(binding -> {
+            if (binding.isEmpty()) {
+                return CompletableFuture.completedFuture(null);
+            }
+            StorageClassBindingRecord current = binding.orElseThrow();
+            if (current.state() == StorageClassBindingState.DELETED
+                    || !StorageClassBindingRecord.NEREUS.equals(current.storageClass())) {
+                return CompletableFuture.completedFuture(null);
+            }
+            try {
+                FEATURE_VALIDATOR.validateAdminOperation(operation);
+                return CompletableFuture.completedFuture(null);
+            } catch (NotAllowedException error) {
+                return CompletableFuture.failedFuture(error);
+            }
+        });
     }
 
     @Override
