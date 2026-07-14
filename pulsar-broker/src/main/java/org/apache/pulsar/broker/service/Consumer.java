@@ -158,6 +158,7 @@ public class Consumer {
     private final String clientAddress; // IP address only, no port number included
     private final MessageId startMessageId;
     private final boolean isAcknowledgmentAtBatchIndexLevelEnabled;
+    private final int nereusCursorAckPositionsPerRequestMax;
 
     @Getter
     @Setter
@@ -260,6 +261,10 @@ public class Consumer {
         this.consumerEpoch = consumerEpoch;
         this.isAcknowledgmentAtBatchIndexLevelEnabled = subscription.getTopic().getBrokerService()
                 .getPulsar().getConfiguration().isAcknowledgmentAtBatchIndexLevelEnabled();
+        int configuredNereusAckLimit = subscription.getTopic().getBrokerService()
+                .getPulsar().getConfiguration().getNereusCursorAckPositionsPerRequestMax();
+        this.nereusCursorAckPositionsPerRequestMax = configuredNereusAckLimit > 0
+                ? configuredNereusAckLimit : NereusAcknowledgeValidator.DEFAULT_MAX_POSITIONS;
 
         this.schemaType = schemaType;
 
@@ -294,6 +299,7 @@ public class Consumer {
         this.clientAddress = null;
         this.startMessageId = null;
         this.isAcknowledgmentAtBatchIndexLevelEnabled = false;
+        this.nereusCursorAckPositionsPerRequestMax = NereusAcknowledgeValidator.DEFAULT_MAX_POSITIONS;
         this.schemaType = null;
         this.log = LOG.with().attr("consumerName", consumerName).build();
         MESSAGE_PERMITS_UPDATER.set(this, availablePermits);
@@ -525,14 +531,23 @@ public class Consumer {
 
     public CompletableFuture<Void> messageAcked(CommandAck ack, boolean requirePersistedAck) {
         Optional<BrokerServiceException.NotAllowedException> nereusRejection =
-                NEREUS_ACKNOWLEDGE_VALIDATOR.rejection(subscription, subType, ack, requirePersistedAck);
+                NEREUS_ACKNOWLEDGE_VALIDATOR.rejection(
+                        subscription,
+                        subType,
+                        ack,
+                        requirePersistedAck,
+                        isAcknowledgmentAtBatchIndexLevelEnabled,
+                        nereusCursorAckPositionsPerRequestMax);
         if (nereusRejection.isPresent()) {
             return FutureUtil.failedFuture(nereusRejection.get());
         }
-        boolean nereusAcknowledgement = NEREUS_ACKNOWLEDGE_VALIDATOR.isNereusSubscription(subscription);
+        boolean nereusDurableAcknowledgement =
+                NEREUS_ACKNOWLEDGE_VALIDATOR.isNereusDurableSubscription(subscription);
         CompletableFuture<Long> future;
 
-        this.lastAckedTimestamp = System.currentTimeMillis();
+        if (!nereusDurableAcknowledgement) {
+            this.lastAckedTimestamp = System.currentTimeMillis();
+        }
         Map<String, Long> properties = Collections.emptyMap();
         if (ack.getPropertiesCount() > 0) {
             properties = ack.getPropertiesList().stream()
@@ -567,7 +582,7 @@ public class Consumer {
                 future = transactionCumulativeAcknowledge(ack.getTxnidMostBits(),
                         ack.getTxnidLeastBits(), positionsAcked)
                         .thenApply(unused -> 1L);
-            } else if (requirePersistedAck || nereusAcknowledgement) {
+            } else if (requirePersistedAck || nereusDurableAcknowledgement) {
                 future = subscription.acknowledgeMessageAsync(positionsAcked, AckType.Cumulative, properties)
                         .thenApply(unused -> 1L);
             } else {
@@ -575,11 +590,15 @@ public class Consumer {
                 future = CompletableFuture.completedFuture(1L);
             }
         } else {
-            future = individualAck(ack, properties, requirePersistedAck);
+            future = individualAck(
+                    ack, properties, requirePersistedAck || nereusDurableAcknowledgement);
         }
 
         return future
                 .thenApply(v -> {
+                    if (nereusDurableAcknowledgement) {
+                        this.lastAckedTimestamp = System.currentTimeMillis();
+                    }
                     this.messageAckRate.recordEvent(v);
                     this.messageAckCounter.add(v);
                     return null;
@@ -594,7 +613,7 @@ public class Consumer {
      * timing behavior), and additionally schedule per-position cleanup on txn storage completion.
      */
     private CompletableFuture<Long> individualAck(CommandAck ack, Map<String, Long> properties,
-                                                  boolean requirePersistedAck) {
+                                                  boolean awaitPersistence) {
         boolean hasTxn = ack.hasTxnidLeastBits() && ack.hasTxnidMostBits();
 
         if (hasTxn && !isTransactionEnabled()) {
@@ -707,7 +726,7 @@ public class Consumer {
         // Non-transactional
         CompletableFuture<Void> ackFuture = subscription.acknowledgeMessageAsync(
                 nonTxnPositions, AckType.Individual, properties);
-        if (requirePersistedAck) {
+        if (awaitPersistence) {
             return ackFuture.thenApply(unused -> {
                 applyPendingAckCompletions(pendingAckCompletions);
                 return finalTotalAckCount;

@@ -122,8 +122,6 @@ public class NereusTopicFeatureResolverTest {
             {"SYSTEM_OR_INTERNAL_TOPIC"},
             {"GEO_REPLICATION"},
             {"DEDUPLICATION"},
-            {"MESSAGE_TTL"},
-            {"SUBSCRIPTION_EXPIRATION"},
             {"COMPACTION"},
             {"RETENTION"},
             {"BACKLOG_EVICTION"},
@@ -131,6 +129,14 @@ public class NereusTopicFeatureResolverTest {
             {"ENTRY_FILTERS"},
             {"SHADOW_OR_MIGRATION"}
         };
+    }
+
+    @Test
+    public void admitsTtlAndSubscriptionExpirationWithoutAdmittingPhysicalGcPolicies() {
+        NereusResolvedTopicFeatures lifecyclePolicies = new NereusResolvedTopicFeatures(
+                Set.of(), false, 30, 60, 0, false, false, false, false, false, false);
+        assertThatCode(() -> new NereusTopicFeatureValidator().validateTopicOpen(
+                USER_TOPIC, new ManagedLedgerConfig(), lifecyclePolicies)).doesNotThrowAnyException();
     }
 
     @Test(dataProvider = "unsupportedFeatures")
@@ -215,20 +221,24 @@ public class NereusTopicFeatureResolverTest {
         when(remote.isRemote()).thenReturn(true);
         assertThatThrownBy(() -> validator.validateProducer(remote))
                 .hasMessage("NEREUS_UNSUPPORTED_PRODUCER:REMOTE_REPLICATION");
+        assertThatCode(() -> validator.validateSubscribe(
+                SubType.Shared, false, false, false, null)).doesNotThrowAnyException();
+        assertThatCode(() -> validator.validateSubscribe(
+                SubType.Exclusive, true, false, false, null)).doesNotThrowAnyException();
         assertThatThrownBy(() -> validator.validateSubscribe(
-                SubType.Shared, false, false, false, null))
-                .hasMessage("NEREUS_UNSUPPORTED_SUBSCRIPTION:SUBSCRIPTION_TYPE");
-        assertThatThrownBy(() -> validator.validateSubscribe(
-                SubType.Exclusive, true, false, false, null))
-                .hasMessage("NEREUS_UNSUPPORTED_SUBSCRIPTION:DURABLE");
+                SubType.Key_Shared, true, false, false, null))
+                .hasMessage("NEREUS_UNSUPPORTED_SUBSCRIPTION:KEY_SHARED");
         KeySharedMeta exclusiveHashRange = new KeySharedMeta();
         exclusiveHashRange.addHashRange().setStart(0).setEnd(99);
         assertThatThrownBy(() -> validator.validateSubscribe(
                 SubType.Exclusive, false, false, false, exclusiveHashRange))
                 .hasMessage("NEREUS_UNSUPPORTED_SUBSCRIPTION:KEY_SHARED_META");
-        assertThatThrownBy(() -> validator.validateExistingDurableCursors(true))
-                .hasMessage("NEREUS_UNSUPPORTED_SUBSCRIPTION:EXISTING_DURABLE_CURSOR");
-        assertThatCode(() -> validator.validateExistingDurableCursors(false)).doesNotThrowAnyException();
+        assertThatThrownBy(() -> validator.validateExistingDurableCursors(false))
+                .hasMessage("NEREUS_UNSUPPORTED_SUBSCRIPTION:CURSOR_PROTOCOL_NOT_READY");
+        assertThatCode(() -> validator.validateExistingDurableCursors(true)).doesNotThrowAnyException();
+        assertThatThrownBy(() -> validator.validateCreateSubscription(false))
+                .hasMessage("NEREUS_UNSUPPORTED_SUBSCRIPTION:CURSOR_PROTOCOL_NOT_READY");
+        assertThatCode(() -> validator.validateCreateSubscription(true)).doesNotThrowAnyException();
         assertThatCode(() -> validator.validateSubscribe(
                 SubType.Failover, false, false, false, null)).doesNotThrowAnyException();
         assertThatCode(() -> validator.validateSubscribe(
@@ -242,12 +252,20 @@ public class NereusTopicFeatureResolverTest {
                 .doesNotThrowAnyException();
         assertThatCode(() -> validator.validateAdminOperation(NereusAdminOperation.DELETE_TOPIC))
                 .doesNotThrowAnyException();
-        assertThatCode(() -> validator.validateAdminOperation(NereusAdminOperation.UNLOAD_TOPIC))
-                .doesNotThrowAnyException();
+        java.util.Set<NereusAdminOperation> allowed = java.util.Set.of(
+                NereusAdminOperation.TERMINATE_TOPIC,
+                NereusAdminOperation.DELETE_TOPIC,
+                NereusAdminOperation.UNLOAD_TOPIC,
+                NereusAdminOperation.DELETE_DURABLE_SUBSCRIPTION,
+                NereusAdminOperation.ANALYZE_BACKLOG,
+                NereusAdminOperation.CLEAR_BACKLOG,
+                NereusAdminOperation.SKIP_MESSAGES,
+                NereusAdminOperation.EXPIRE_MESSAGES,
+                NereusAdminOperation.RESET_CURSOR);
+        allowed.forEach(operation -> assertThatCode(() -> validator.validateAdminOperation(operation))
+                .doesNotThrowAnyException());
         for (NereusAdminOperation operation : NereusAdminOperation.values()) {
-            if (operation == NereusAdminOperation.TERMINATE_TOPIC
-                    || operation == NereusAdminOperation.DELETE_TOPIC
-                    || operation == NereusAdminOperation.UNLOAD_TOPIC) {
+            if (allowed.contains(operation)) {
                 continue;
             }
             assertThatThrownBy(() -> validator.validateAdminOperation(operation))
@@ -341,10 +359,6 @@ public class NereusTopicFeatureResolverTest {
                     Set.of("remote"), false, 0, 0, 0, false, false, false, false, false, false);
             case "DEDUPLICATION" -> new NereusResolvedTopicFeatures(
                     Set.of(), true, 0, 0, 0, false, false, false, false, false, false);
-            case "MESSAGE_TTL" -> new NereusResolvedTopicFeatures(
-                    Set.of(), false, 1, 0, 0, false, false, false, false, false, false);
-            case "SUBSCRIPTION_EXPIRATION" -> new NereusResolvedTopicFeatures(
-                    Set.of(), false, 0, 1, 0, false, false, false, false, false, false);
             case "COMPACTION" -> new NereusResolvedTopicFeatures(
                     Set.of(), false, 0, 0, 1, false, false, false, false, false, false);
             case "RETENTION" -> new NereusResolvedTopicFeatures(

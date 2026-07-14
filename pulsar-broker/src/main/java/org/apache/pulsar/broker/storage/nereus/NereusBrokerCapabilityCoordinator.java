@@ -18,6 +18,8 @@
  */
 package org.apache.pulsar.broker.storage.nereus;
 
+import com.nereusstream.managedledger.cursor.CursorLedgerIdentity;
+import com.nereusstream.managedledger.cursor.CursorProtocolActivationGuard;
 import java.time.Duration;
 import java.util.HashMap;
 import java.util.Map;
@@ -28,8 +30,8 @@ import java.util.concurrent.atomic.AtomicReference;
 import org.apache.pulsar.broker.loadbalance.extensions.BrokerRegistry;
 import org.apache.pulsar.broker.loadbalance.extensions.data.BrokerLookupData;
 
-/** Publishes and verifies the cluster-wide storage-binding protocol capability. */
-public final class NereusBrokerCapabilityCoordinator {
+/** Publishes and independently verifies the cluster-wide binding and cursor protocols. */
+public final class NereusBrokerCapabilityCoordinator implements CursorProtocolActivationGuard {
     public static final String PROPERTY = "nereus.storage-binding-protocol";
     public static final String VERSION = "1";
 
@@ -70,10 +72,29 @@ public final class NereusBrokerCapabilityCoordinator {
         }
         Map<String, String> properties = new HashMap<>(configured);
         properties.put(PROPERTY, VERSION);
+        properties.put(NereusCursorProtocolCapability.PROPERTY, NereusCursorProtocolCapability.VERSION);
         return Map.copyOf(properties);
     }
 
+    /** F2 creation barrier. Cursor capability is deliberately not inferred from this property. */
     public CompletableFuture<Void> requireClusterReady() {
+        return requireClusterReady(Map.of(PROPERTY, VERSION));
+    }
+
+    /** F3 first-activation barrier requiring both independently versioned protocols. */
+    public CompletableFuture<Void> requireCursorClusterReady() {
+        return requireClusterReady(Map.of(
+                PROPERTY, VERSION,
+                NereusCursorProtocolCapability.PROPERTY, NereusCursorProtocolCapability.VERSION));
+    }
+
+    @Override
+    public CompletableFuture<Void> acquireFirstActivationPermit(CursorLedgerIdentity ledger) {
+        java.util.Objects.requireNonNull(ledger, "ledger");
+        return requireCursorClusterReady();
+    }
+
+    private CompletableFuture<Void> requireClusterReady(Map<String, String> requiredProperties) {
         BrokerRegistry registry = brokerRegistry.get();
         if (!storageInitialized.get() || registry == null) {
             return CompletableFuture.failedFuture(
@@ -84,9 +105,9 @@ public final class NereusBrokerCapabilityCoordinator {
                     new IllegalStateException("NEREUS_CLUSTER_CAPABILITY_NOT_READY:LOCAL_REGISTRY"));
         }
         CompletableFuture<Void> check = registry.getAvailableBrokerLookupDataAsync()
-                .thenApply(NereusBrokerCapabilityCoordinator::requireCapableBrokers)
+                .thenApply(available -> requireCapableBrokers(available, requiredProperties))
                 .thenCompose(first -> registry.getAvailableBrokerLookupDataAsync().thenAccept(second -> {
-                    Map<String, BrokerLookupData> capableSecond = requireCapableBrokers(second);
+                    Map<String, BrokerLookupData> capableSecond = requireCapableBrokers(second, requiredProperties);
                     if (!first.keySet().equals(capableSecond.keySet())) {
                         throw new IllegalStateException("NEREUS_CLUSTER_CAPABILITY_BROKER_SET_CHANGED");
                     }
@@ -99,8 +120,10 @@ public final class NereusBrokerCapabilityCoordinator {
     }
 
     private static Map<String, BrokerLookupData> requireCapableBrokers(
-            Map<String, BrokerLookupData> available) {
+            Map<String, BrokerLookupData> available,
+            Map<String, String> requiredProperties) {
         java.util.Objects.requireNonNull(available, "available");
+        java.util.Objects.requireNonNull(requiredProperties, "requiredProperties");
         Map<String, BrokerLookupData> persistent = new HashMap<>();
         available.forEach((brokerId, data) -> {
             if (data != null && data.persistentTopicsEnabled()) {
@@ -111,8 +134,12 @@ public final class NereusBrokerCapabilityCoordinator {
             throw new IllegalStateException("NEREUS_CLUSTER_CAPABILITY_NOT_READY:EMPTY");
         }
         persistent.forEach((brokerId, data) -> {
-            if (data.properties() == null || !VERSION.equals(data.properties().get(PROPERTY))) {
-                throw new IllegalStateException("NEREUS_CLUSTER_CAPABILITY_NOT_READY:" + brokerId);
+            for (Map.Entry<String, String> required : requiredProperties.entrySet()) {
+                if (data.properties() == null
+                        || !required.getValue().equals(data.properties().get(required.getKey()))) {
+                    throw new IllegalStateException(
+                            "NEREUS_CLUSTER_CAPABILITY_NOT_READY:" + brokerId + ":" + required.getKey());
+                }
             }
         });
         return Map.copyOf(persistent);

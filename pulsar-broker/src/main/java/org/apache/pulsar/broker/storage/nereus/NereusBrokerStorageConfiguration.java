@@ -20,6 +20,8 @@ package org.apache.pulsar.broker.storage.nereus;
 
 import com.nereusstream.core.StreamStorageConfig;
 import com.nereusstream.managedledger.NereusManagedLedgerFactoryConfig;
+import com.nereusstream.managedledger.cursor.CursorStorageConfig;
+import com.nereusstream.metadata.oxia.CursorMetadataStoreConfig;
 import com.nereusstream.metadata.oxia.OxiaClientConfiguration;
 import com.nereusstream.metadata.oxia.ProjectionMetadataStoreConfig;
 import com.nereusstream.objectstore.ObjectStoreConfiguration;
@@ -136,7 +138,47 @@ public final class NereusBrokerStorageConfiguration {
                         "nereusMaxProjectionMetadataPendingOperations"),
                 positive(broker.getNereusProjectionMetadataMaxValueBytes(),
                         "nereusProjectionMetadataMaxValueBytes"));
-        return new NereusRuntimeConfiguration(oxia, objectStore, stream, managedLedger, projection);
+        CursorMetadataStoreConfig cursorMetadata = new CursorMetadataStoreConfig(
+                metadataTimeout,
+                positive(broker.getNereusMaxCursorMetadataPendingOperations(),
+                        "nereusMaxCursorMetadataPendingOperations"),
+                positive(broker.getNereusCursorMetadataMaxValueBytes(),
+                        "nereusCursorMetadataMaxValueBytes"),
+                positive(broker.getNereusCursorMetadataMaxScanPageSize(),
+                        "nereusCursorMetadataMaxScanPageSize"));
+        CursorStorageConfig cursorStorage = new CursorStorageConfig(
+                positive(broker.getNereusCursorMetadataMaxValueBytes(),
+                        "nereusCursorMetadataMaxValueBytes"),
+                positive(broker.getNereusCursorMetadataSafetyMarginBytes(),
+                        "nereusCursorMetadataSafetyMarginBytes"),
+                positive(broker.getNereusCursorInlineAckMaxBytes(), "nereusCursorInlineAckMaxBytes"),
+                positive(broker.getNereusCursorInlineDeltaMaxCount(), "nereusCursorInlineDeltaMaxCount"),
+                positive(broker.getNereusCursorNameMaxUtf8Bytes(), "nereusCursorNameMaxUtf8Bytes"),
+                positive(broker.getNereusCursorPositionPropertiesMaxBytes(),
+                        "nereusCursorPositionPropertiesMaxBytes"),
+                positive(broker.getNereusCursorPropertiesMaxBytes(), "nereusCursorPropertiesMaxBytes"),
+                positive(broker.getNereusCursorSnapshotMaxBytes(), "nereusCursorSnapshotMaxBytes"),
+                positive(broker.getNereusCursorAckPositionsPerRequestMax(),
+                        "nereusCursorAckPositionsPerRequestMax"),
+                positive(broker.getNereusCursorBatchIndexesMax(), "nereusCursorBatchIndexesMax"),
+                positive(broker.getNereusCursorProtectionIntentMaxBytes(),
+                        "nereusCursorProtectionIntentMaxBytes"),
+                positive(broker.getNereusCursorTrimReasonMaxUtf8Bytes(),
+                        "nereusCursorTrimReasonMaxUtf8Bytes"),
+                positive(broker.getNereusCursorScanPageSize(), "nereusCursorScanPageSize"),
+                positive(broker.getNereusCursorRecordsPerStreamMax(), "nereusCursorRecordsPerStreamMax"),
+                positive(broker.getNereusCursorOwnerClaimConcurrency(),
+                        "nereusCursorOwnerClaimConcurrency"),
+                positive(broker.getNereusCursorMutationQueueMax(), "nereusCursorMutationQueueMax"),
+                positive(broker.getNereusCursorMaxCasAttempts(), "nereusCursorMaxCasAttempts"),
+                positive(broker.getNereusCursorHydrationMaxAttempts(), "nereusCursorHydrationMaxAttempts"),
+                positive(broker.getNereusCursorSnapshotIdMaxAttempts(),
+                        "nereusCursorSnapshotIdMaxAttempts"),
+                metadataTimeout,
+                seconds(broker.getNereusCursorSnapshotOperationTimeoutSeconds(),
+                        "nereusCursorSnapshotOperationTimeoutSeconds"));
+        return new NereusRuntimeConfiguration(
+                oxia, objectStore, stream, managedLedger, projection, cursorMetadata, cursorStorage);
     }
 
     public String runtimeProviderClassName() {

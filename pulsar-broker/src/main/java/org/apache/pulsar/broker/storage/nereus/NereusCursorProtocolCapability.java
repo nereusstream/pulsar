@@ -20,12 +20,12 @@ package org.apache.pulsar.broker.storage.nereus;
 
 import java.util.Map;
 
-/** Defines and protects the reserved storage-binding protocol lookup property. */
-public final class NereusStorageBindingCapability {
-    public static final String PROPERTY = NereusBrokerCapabilityCoordinator.PROPERTY;
-    public static final String VERSION = NereusBrokerCapabilityCoordinator.VERSION;
+/** Defines and protects the independently negotiated F3 cursor protocol capability. */
+public final class NereusCursorProtocolCapability {
+    public static final String PROPERTY = "nereus.cursor-protocol";
+    public static final String VERSION = "1";
 
-    private NereusStorageBindingCapability() {
+    private NereusCursorProtocolCapability() {
     }
 
     public static Map<String, String> requireUnreserved(Map<String, String> configuredProperties) {
@@ -33,6 +33,6 @@ public final class NereusStorageBindingCapability {
         if (configuredProperties.containsKey(PROPERTY)) {
             throw new IllegalArgumentException(PROPERTY + " is reserved by the broker");
         }
-        return NereusCursorProtocolCapability.requireUnreserved(configuredProperties);
+        return Map.copyOf(configuredProperties);
     }
 }

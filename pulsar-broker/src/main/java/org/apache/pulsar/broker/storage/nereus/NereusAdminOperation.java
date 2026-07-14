@@ -18,12 +18,13 @@
  */
 package org.apache.pulsar.broker.storage.nereus;
 
-/** Closed set of F2 topic admin operations whose admission is storage-class dependent. */
+/** Closed set of F3 topic admin operations whose admission is storage-class dependent. */
 public enum NereusAdminOperation {
     TERMINATE_TOPIC,
     DELETE_TOPIC,
     UNLOAD_TOPIC,
     DELETE_DURABLE_SUBSCRIPTION,
+    ANALYZE_BACKLOG,
     CLEAR_BACKLOG,
     SKIP_MESSAGES,
     EXPIRE_MESSAGES,
@@ -32,6 +33,7 @@ public enum NereusAdminOperation {
     READ_COMPACTION_STATUS,
     TRIGGER_OFFLOAD,
     READ_OFFLOAD_STATUS,
+    TRIM_TOPIC,
     TRUNCATE_TOPIC,
     SET_SHADOW_TOPICS,
     MIGRATE_TOPIC

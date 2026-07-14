@@ -1195,6 +1195,8 @@ public class PersistentTopicsBase extends AdminResource {
     private void internalUnloadNonPartitionedTopicAsync(AsyncResponse asyncResponse, boolean authoritative) {
         validateTopicOwnershipAsync(topicName, authoritative)
                         .thenCompose(__ -> getTopicReferenceAsync(topicName))
+                        .thenCompose(topic -> validateNereusAdminOperation(
+                                topic, NereusAdminOperation.UNLOAD_TOPIC))
                         .thenCompose(topic -> topic.close(false))
                         .thenRun(() -> {
                             log.info()
@@ -1243,6 +1245,7 @@ public class PersistentTopicsBase extends AdminResource {
     protected CompletableFuture<Void> internalDeleteTopicAsync(boolean authoritative, boolean force) {
         return validateNamespaceOperationAsync(topicName.getNamespaceObject(), NamespaceOperation.DELETE_TOPIC)
                 .thenCompose(__ -> validateTopicOwnershipAsync(topicName, authoritative))
+                .thenCompose(__ -> validateLoadedNereusAdminOperation(NereusAdminOperation.DELETE_TOPIC))
                 .thenCompose(__ -> pulsar().getBrokerService().deleteTopic(topicName.toString(), force));
     }
 
@@ -1760,6 +1763,8 @@ public class PersistentTopicsBase extends AdminResource {
         validateTopicOwnershipAsync(topicName, authoritative)
                 .thenCompose(__ -> validateTopicOperationAsync(topicName, TopicOperation.CONSUME, subName))
                 .thenCompose(__ -> getTopicReferenceAsync(topicName))
+                .thenCompose(topic -> validateNereusAdminOperation(
+                        topic, NereusAdminOperation.ANALYZE_BACKLOG))
                 .thenCompose(topic -> {
                             Subscription sub = topic.getSubscription(subName);
                             if (sub == null) {
@@ -4952,6 +4957,8 @@ public class PersistentTopicsBase extends AdminResource {
                                                             TopicName topicName, boolean authoritative) {
         return  validateTopicOwnershipAsync(topicName, authoritative)
                 .thenCompose(__ -> getTopicReferenceAsync(topicName))
+                .thenCompose(topic -> validateNereusAdminOperation(
+                        topic, NereusAdminOperation.TRIM_TOPIC))
                 .thenCompose(topic -> {
                     if (!(topic instanceof PersistentTopic persistentTopic)) {
                         log.info()

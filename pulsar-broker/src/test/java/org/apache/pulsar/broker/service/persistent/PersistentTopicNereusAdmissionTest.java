@@ -97,14 +97,14 @@ public class PersistentTopicNereusAdmissionTest {
         ManagedLedgerConfig unsafeConfig = new ManagedLedgerConfig();
         unsafeConfig.setStorageClassName("nereus");
         NereusResolvedTopicFeatures unsafeFeatures = new NereusResolvedTopicFeatures(
-                Set.of(), false, 1, 0, 0, false, false, false, false, false, false);
+                Set.of(), false, 1, 1, 0, true, false, false, false, false, false);
 
         assertThatThrownBy(() -> topic.applyNereusPolicySnapshot(new NereusTopicPolicySnapshot(
                 new NereusTopicOpenContext(unsafeConfig, unsafeFeatures),
                 new Policies(),
                 java.util.Optional.empty(),
                 java.util.Optional.empty())))
-                .hasRootCauseMessage("NEREUS_UNSUPPORTED_TOPIC_FEATURE:MESSAGE_TTL");
+                .hasRootCauseMessage("NEREUS_UNSUPPORTED_TOPIC_FEATURE:RETENTION");
         verify(ledger, never()).setConfig(any());
     }
 

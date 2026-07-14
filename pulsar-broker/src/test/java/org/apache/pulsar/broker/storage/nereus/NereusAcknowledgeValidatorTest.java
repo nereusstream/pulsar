@@ -21,7 +21,10 @@ package org.apache.pulsar.broker.storage.nereus;
 import static java.util.Collections.emptyMap;
 import static org.apache.pulsar.client.api.MessageId.latest;
 import static org.apache.pulsar.common.api.proto.CommandAck.AckType.Cumulative;
+import static org.apache.pulsar.common.api.proto.CommandAck.AckType.Individual;
 import static org.apache.pulsar.common.api.proto.CommandSubscribe.SubType.Exclusive;
+import static org.apache.pulsar.common.api.proto.CommandSubscribe.SubType.Failover;
+import static org.apache.pulsar.common.api.proto.CommandSubscribe.SubType.Key_Shared;
 import static org.apache.pulsar.common.api.proto.CommandSubscribe.SubType.Shared;
 import static org.apache.pulsar.common.protocol.Commands.DEFAULT_CONSUMER_EPOCH;
 import static org.assertj.core.api.Assertions.assertThat;
@@ -69,36 +72,33 @@ public class NereusAcknowledgeValidatorTest {
     }
 
     @Test
-    public void admitsOnlyTheLimitedNonDurableCumulativeShape() {
-        when(cursor.isDurable()).thenReturn(false);
-        CommandAck admitted = cumulativeAck();
-        assertThat(validator.rejection(subscription, Exclusive, admitted, false)).isEmpty();
-
+    public void implementsTheF3DurabilityTypeAndBatchDecisionTable() {
         when(cursor.isDurable()).thenReturn(true);
-        assertReason(validator.rejection(subscription, Exclusive, admitted, false), "DURABLE_CURSOR");
+        assertThat(validator.rejection(subscription, Exclusive, cumulativeAck(), true)).isEmpty();
+        assertThat(validator.rejection(subscription, Failover, cumulativeAck(), false)).isEmpty();
+        assertThat(validator.rejection(subscription, Exclusive, individualAck(2), true)).isEmpty();
+        assertThat(validator.rejection(subscription, Shared, individualAck(2), false)).isEmpty();
+        assertReason(validator.rejection(subscription, Shared, cumulativeAck(), false), "SHARED_CUMULATIVE");
+        assertReason(validator.rejection(subscription, Key_Shared, individualAck(1), false), "KEY_SHARED");
+
         when(cursor.isDurable()).thenReturn(false);
+        assertThat(validator.rejection(subscription, Exclusive, cumulativeAck(), false)).isEmpty();
+        assertReason(
+                validator.rejection(subscription, Exclusive, cumulativeAck(), true),
+                "PERSISTED_CONFIRMATION_NON_DURABLE");
 
-        CommandAck individual = cumulativeAck().setAckType(CommandAck.AckType.Individual);
-        assertReason(validator.rejection(subscription, Exclusive, individual, false), "ACK_TYPE");
-
-        assertReason(validator.rejection(subscription, Shared, cumulativeAck(), false), "SUBSCRIPTION_TYPE");
-        assertReason(validator.rejection(subscription, Exclusive, cumulativeAck(), true), "PERSISTED_CONFIRMATION");
-
-        CommandAck multiple = cumulativeAck();
-        multiple.addMessageId().setLedgerId(1).setEntryId(3);
-        assertReason(validator.rejection(subscription, Exclusive, multiple, false), "MESSAGE_ID_COUNT");
-
-        CommandAck batched = cumulativeAck();
-        batched.getMessageIdAt(0).setBatchIndex(0);
-        assertReason(validator.rejection(subscription, Exclusive, batched, false), "BATCH_INDEX");
-
-        CommandAck batchSize = cumulativeAck();
-        batchSize.getMessageIdAt(0).setBatchSize(2);
-        assertReason(validator.rejection(subscription, Exclusive, batchSize, false), "BATCH_INDEX");
-
-        CommandAck ackSet = cumulativeAck();
-        ackSet.getMessageIdAt(0).addAckSet(1);
-        assertReason(validator.rejection(subscription, Exclusive, ackSet, false), "ACK_SET");
+        CommandAck validBatch = individualAck(1);
+        validBatch.getMessageIdAt(0).setBatchSize(2).setBatchIndex(0).addAckSet(2);
+        assertThat(validator.rejection(
+                subscription, Shared, validBatch, false, true, 10)).isEmpty();
+        assertReason(validator.rejection(
+                subscription, Shared, validBatch, false, false, 10), "PARTIAL_BATCH_DISABLED");
+        CommandAck invalidBatch = individualAck(1);
+        invalidBatch.getMessageIdAt(0).setBatchIndex(2).setBatchSize(2);
+        assertReason(validator.rejection(
+                subscription, Shared, invalidBatch, false, true, 10), "BATCH_SHAPE");
+        assertReason(validator.rejection(
+                subscription, Shared, individualAck(2), false, true, 1), "MESSAGE_ID_COUNT");
 
         CommandAck transactional = cumulativeAck().setTxnidMostBits(1);
         assertReason(validator.rejection(subscription, Exclusive, transactional, false), "TRANSACTION");
@@ -114,26 +114,36 @@ public class NereusAcknowledgeValidatorTest {
     }
 
     @Test
-    public void consumerRejectsBeforeMutationAndWaitsForAdmittedLocalAck() throws Exception {
+    public void consumerRejectsBeforeMutationAndPublishesDurableAckEffectsOnlyAfterCallback() throws Exception {
         when(cursor.isDurable()).thenReturn(true);
         Consumer consumer = consumer();
         long initialTimestamp = consumer.getStats().lastAckedTimestamp;
 
-        assertThatThrownBy(() -> consumer.messageAcked(cumulativeAck()).get())
-                .hasRootCauseMessage("NEREUS_UNSUPPORTED_ACK:DURABLE_CURSOR");
+        assertThatThrownBy(() -> consumer.messageAcked(
+                cumulativeAck().setValidationError(CommandAck.ValidationError.ChecksumMismatch)).get())
+                .hasRootCauseMessage("NEREUS_UNSUPPORTED_ACK:VALIDATION_ERROR");
         assertThat(consumer.getStats().lastAckedTimestamp).isEqualTo(initialTimestamp);
         assertThat(consumer.getMessageAckCounter()).isZero();
         verify(subscription, never()).acknowledgeMessageAsync(any(), any(), any());
 
-        when(cursor.isDurable()).thenReturn(false);
-        CompletableFuture<Void> localAck = new CompletableFuture<>();
-        when(subscription.acknowledgeMessageAsync(any(), any(), any())).thenReturn(localAck);
+        CompletableFuture<Void> failedAck = new CompletableFuture<>();
+        when(subscription.acknowledgeMessageAsync(any(), any(), any())).thenReturn(failedAck);
         CompletableFuture<Void> result = consumer.messageAcked(cumulativeAck());
         assertThat(result).isNotDone();
         assertThat(consumer.getMessageAckCounter()).isZero();
-        localAck.complete(null);
-        result.get();
+        failedAck.completeExceptionally(new IllegalStateException("cursor CAS failed"));
+        assertThatThrownBy(result::get).hasRootCauseMessage("cursor CAS failed");
+        assertThat(consumer.getStats().lastAckedTimestamp).isEqualTo(initialTimestamp);
+        assertThat(consumer.getMessageAckCounter()).isZero();
+
+        CompletableFuture<Void> durableAck = new CompletableFuture<>();
+        when(subscription.acknowledgeMessageAsync(any(), any(), any())).thenReturn(durableAck);
+        CompletableFuture<Void> successful = consumer.messageAcked(cumulativeAck());
+        assertThat(successful).isNotDone();
+        durableAck.complete(null);
+        successful.get();
         assertThat(consumer.getMessageAckCounter()).isEqualTo(1);
+        assertThat(consumer.getStats().lastAckedTimestamp).isGreaterThanOrEqualTo(initialTimestamp);
     }
 
     private Consumer consumer() {
@@ -158,6 +168,14 @@ public class NereusAcknowledgeValidatorTest {
     private static CommandAck cumulativeAck() {
         CommandAck ack = new CommandAck().setAckType(Cumulative).setConsumerId(1);
         ack.addMessageId().setLedgerId(1).setEntryId(2);
+        return ack;
+    }
+
+    private static CommandAck individualAck(int count) {
+        CommandAck ack = new CommandAck().setAckType(Individual).setConsumerId(1);
+        for (int i = 0; i < count; i++) {
+            ack.addMessageId().setLedgerId(1).setEntryId(2 + i);
+        }
         return ack;
     }
 
