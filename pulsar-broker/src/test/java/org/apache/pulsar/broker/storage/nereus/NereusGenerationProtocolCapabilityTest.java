@@ -98,6 +98,8 @@ public class NereusGenerationProtocolCapabilityTest {
         assertThat(readiness.brokerSetSha256())
                 .isEqualTo("bc63f01d0aa01a65c7205625a2714f0246d8ba7e7b88b8a653137abbc719cc0d");
         assertThat(coordinator.currentGenerationReadiness()).contains(readiness);
+        assertThat(coordinator.currentGenerationCapabilityReadiness())
+                .contains(readiness.toCore());
     }
 
     @Test

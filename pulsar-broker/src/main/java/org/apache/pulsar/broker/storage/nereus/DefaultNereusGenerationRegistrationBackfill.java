@@ -21,6 +21,7 @@ package org.apache.pulsar.broker.storage.nereus;
 import com.nereusstream.api.Checksum;
 import com.nereusstream.api.ChecksumType;
 import com.nereusstream.api.NereusException;
+import com.nereusstream.core.capability.GenerationRegistrationBackfillCompletion;
 import com.nereusstream.managedledger.generation.ManagedLedgerMaterializationRegistrationCandidate;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
@@ -64,6 +65,7 @@ public final class DefaultNereusGenerationRegistrationBackfill
     private final TopicResources topicResources;
     private final NereusStorageClassBindingStore bindingStore;
     private final RegistrationAccess registrations;
+    private final ProofAccess proofs;
     private final NereusBrokerCapabilityCoordinator capabilityCoordinator;
     private final int maxTopicsPerNamespace;
 
@@ -100,6 +102,7 @@ public final class DefaultNereusGenerationRegistrationBackfill
                                 candidate);
                     }
                 },
+                storage::completeGenerationRegistrationBackfill,
                 capabilityCoordinator,
                 maxTopicsPerNamespace);
     }
@@ -110,6 +113,7 @@ public final class DefaultNereusGenerationRegistrationBackfill
             TopicResources topicResources,
             NereusStorageClassBindingStore bindingStore,
             RegistrationAccess registrations,
+            ProofAccess proofs,
             NereusBrokerCapabilityCoordinator capabilityCoordinator,
             int maxTopicsPerNamespace) {
         this.tenantResources =
@@ -122,6 +126,7 @@ public final class DefaultNereusGenerationRegistrationBackfill
                 Objects.requireNonNull(bindingStore, "bindingStore");
         this.registrations =
                 Objects.requireNonNull(registrations, "registrations");
+        this.proofs = Objects.requireNonNull(proofs, "proofs");
         this.capabilityCoordinator = Objects.requireNonNull(
                 capabilityCoordinator, "capabilityCoordinator");
         if (maxTopicsPerNamespace < 1) {
@@ -158,12 +163,29 @@ public final class DefaultNereusGenerationRegistrationBackfill
                                     capabilityCoordinator
                                             ::requireGenerationReadiness,
                                     deadlineNanos))
-                            .thenApply(last -> {
+                            .thenCompose(last -> {
                                 if (!first.equals(last)) {
                                     throw new IllegalStateException(
                                             "NEREUS_GENERATION_BACKFILL_READINESS_CHANGED");
                                 }
-                                return accumulator.report();
+                                GenerationRegistrationBackfillReport report =
+                                        accumulator.report();
+                                if (report.failureCount() != 0) {
+                                    return CompletableFuture.completedFuture(
+                                            report);
+                                }
+                                GenerationRegistrationBackfillCompletion
+                                        completion =
+                                                new GenerationRegistrationBackfillCompletion(
+                                                        report.runId(),
+                                                        first.toCore(),
+                                                        report.coverageSha256(),
+                                                        report.failureCount());
+                                return bound(
+                                                () -> proofs.complete(
+                                                        completion),
+                                                deadlineNanos)
+                                        .thenApply(ignored -> report);
                             });
                 });
     }
@@ -648,6 +670,11 @@ public final class DefaultNereusGenerationRegistrationBackfill
 
         CompletableFuture<Void> ensureRegistered(
                 ManagedLedgerMaterializationRegistrationCandidate candidate);
+    }
+
+    interface ProofAccess {
+        CompletableFuture<Void> complete(
+                GenerationRegistrationBackfillCompletion completion);
     }
 
     private record TopicOutcome(
