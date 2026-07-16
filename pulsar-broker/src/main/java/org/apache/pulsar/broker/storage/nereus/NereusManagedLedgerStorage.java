@@ -39,6 +39,7 @@ import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Supplier;
 import org.apache.bookkeeper.mledger.ManagedLedgerConfig;
 import org.apache.bookkeeper.mledger.ManagedLedgerException;
 import org.apache.bookkeeper.mledger.ManagedLedgerFactoryConfig;
@@ -71,6 +72,7 @@ public final class NereusManagedLedgerStorage implements ManagedLedgerStorage {
     private int generationRegistrationBackfillConcurrency;
     private Duration generationRegistrationBackfillTimeout;
     private int generationRegistrationBackfillMaxTopicsPerNamespace;
+    private boolean generationProtocolEnabled;
     private Collection<ManagedLedgerStorageClass> storageClasses = List.of();
 
     public NereusManagedLedgerStorage() {
@@ -95,6 +97,8 @@ public final class NereusManagedLedgerStorage implements ManagedLedgerStorage {
                     checked.generationRegistrationBackfillTimeout();
             generationRegistrationBackfillMaxTopicsPerNamespace =
                     checked.generationRegistrationBackfillMaxTopicsPerNamespace();
+            generationProtocolEnabled =
+                    checked.generationProtocolEnabled();
             capabilityCoordinator = new NereusBrokerCapabilityCoordinator(
                     Duration.ofSeconds(conf.getNereusMetadataTimeoutSeconds()));
             NereusProcessIdentity identity = NereusProcessIdentity.generate(new SecureRandom());
@@ -223,7 +227,11 @@ public final class NereusManagedLedgerStorage implements ManagedLedgerStorage {
         } catch (Throwable error) {
             return CompletableFuture.failedFuture(error);
         }
-        return backfill.run(request);
+        return backfill.run(request)
+                .thenCompose(report -> activateAfterSuccessfulBackfill(
+                        report,
+                        generationProtocolEnabled,
+                        this::activateGenerationPublication));
     }
 
     public CompletableFuture<GenerationRegistrationBackfillReport>
@@ -273,6 +281,36 @@ public final class NereusManagedLedgerStorage implements ManagedLedgerStorage {
             ensureReady();
             return nereusFactory.completeGenerationRegistrationBackfill(
                     completion);
+        } catch (Throwable error) {
+            return CompletableFuture.failedFuture(error);
+        }
+    }
+
+    public CompletableFuture<Void> activateGenerationPublication() {
+        try {
+            ensureReady();
+            return nereusFactory.activateGenerationPublication();
+        } catch (Throwable error) {
+            return CompletableFuture.failedFuture(error);
+        }
+    }
+
+    static CompletableFuture<GenerationRegistrationBackfillReport>
+            activateAfterSuccessfulBackfill(
+                    GenerationRegistrationBackfillReport report,
+                    boolean activationEnabled,
+                    Supplier<CompletableFuture<Void>> activation) {
+        final GenerationRegistrationBackfillReport exact;
+        try {
+            exact = Objects.requireNonNull(report, "report");
+            if (!activationEnabled || exact.failureCount() != 0) {
+                return CompletableFuture.completedFuture(exact);
+            }
+            Objects.requireNonNull(activation, "activation");
+            return Objects.requireNonNull(
+                            activation.get(),
+                            "activation future")
+                    .thenApply(ignored -> exact);
         } catch (Throwable error) {
             return CompletableFuture.failedFuture(error);
         }
