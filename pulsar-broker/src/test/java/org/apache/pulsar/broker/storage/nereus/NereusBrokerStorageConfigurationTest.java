@@ -49,8 +49,12 @@ public class NereusBrokerStorageConfigurationTest {
                 .isEqualTo(16);
         assertThat(checked.generationRegistrationBackfillTimeout())
                 .isEqualTo(java.time.Duration.ofHours(1));
+        assertThat(checked.generationProtocolEnabled()).isFalse();
         assertThat(checked.generationRegistrationBackfillMaxTopicsPerNamespace())
                 .isEqualTo(broker.getNereusMaxNamespaceBindingScanEntries());
+
+        broker.setNereusGenerationProtocolEnabled(true);
+        assertThat(checked.generationProtocolEnabled()).isTrue();
     }
 
     @Test
