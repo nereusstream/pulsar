@@ -20,6 +20,7 @@ package org.apache.pulsar.broker.storage.nereus;
 
 import com.nereusstream.managedledger.NereusManagedLedgerFactory;
 import com.nereusstream.managedledger.NereusManagedLedgerRuntime;
+import com.nereusstream.managedledger.generation.ManagedLedgerMaterializationRegistrationCandidate;
 import com.nereusstream.objectstore.ObjectStoreSecretResolver;
 import com.nereusstream.pulsar.NereusProcessIdentity;
 import com.nereusstream.pulsar.NereusRuntimeConfiguration;
@@ -36,12 +37,16 @@ import java.util.Objects;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
 import org.apache.bookkeeper.mledger.ManagedLedgerConfig;
 import org.apache.bookkeeper.mledger.ManagedLedgerException;
 import org.apache.bookkeeper.mledger.ManagedLedgerFactoryConfig;
 import org.apache.pulsar.broker.BookKeeperClientFactory;
 import org.apache.pulsar.broker.ManagedLedgerClientFactory;
 import org.apache.pulsar.broker.ServiceConfiguration;
+import org.apache.pulsar.broker.resources.NamespaceResources;
+import org.apache.pulsar.broker.resources.TenantResources;
+import org.apache.pulsar.broker.resources.TopicResources;
 import org.apache.pulsar.broker.service.BrokerServiceException.NotAllowedException;
 import org.apache.pulsar.broker.storage.ManagedLedgerStorage;
 import org.apache.pulsar.broker.storage.ManagedLedgerStorageClass;
@@ -54,12 +59,17 @@ public final class NereusManagedLedgerStorage implements ManagedLedgerStorage {
     private static final NereusTopicFeatureValidator FEATURE_VALIDATOR = new NereusTopicFeatureValidator();
     private final AtomicBoolean initialized = new AtomicBoolean();
     private final AtomicBoolean closed = new AtomicBoolean();
+    private final AtomicReference<NereusGenerationRegistrationBackfill>
+            generationRegistrationBackfill = new AtomicReference<>();
     private ManagedLedgerClientFactory bookkeeperStorage;
     private NereusManagedLedgerFactory nereusFactory;
     private NereusStorageClassBindingStore bindingStore;
     private NereusBrokerCapabilityCoordinator capabilityCoordinator;
     private ManagedLedgerStorageClass bookkeeperClass;
     private ManagedLedgerStorageClass nereusClass;
+    private int generationRegistrationBackfillConcurrency;
+    private Duration generationRegistrationBackfillTimeout;
+    private int generationRegistrationBackfillMaxTopicsPerNamespace;
     private Collection<ManagedLedgerStorageClass> storageClasses = List.of();
 
     public NereusManagedLedgerStorage() {
@@ -78,6 +88,12 @@ public final class NereusManagedLedgerStorage implements ManagedLedgerStorage {
         NereusManagedLedgerRuntime runtime = null;
         try {
             NereusBrokerStorageConfiguration checked = new NereusBrokerStorageConfiguration(conf);
+            generationRegistrationBackfillConcurrency =
+                    checked.generationRegistrationBackfillConcurrency();
+            generationRegistrationBackfillTimeout =
+                    checked.generationRegistrationBackfillTimeout();
+            generationRegistrationBackfillMaxTopicsPerNamespace =
+                    checked.generationRegistrationBackfillMaxTopicsPerNamespace();
             capabilityCoordinator = new NereusBrokerCapabilityCoordinator(
                     Duration.ofSeconds(conf.getNereusMetadataTimeoutSeconds()));
             NereusProcessIdentity identity = NereusProcessIdentity.generate(new SecureRandom());
@@ -174,6 +190,80 @@ public final class NereusManagedLedgerStorage implements ManagedLedgerStorage {
         return capabilityCoordinator;
     }
 
+    public void attachGenerationRegistrationBackfill(
+            TenantResources tenantResources,
+            NamespaceResources namespaceResources,
+            TopicResources topicResources) {
+        ensureReady();
+        NereusGenerationRegistrationBackfill backfill =
+                new DefaultNereusGenerationRegistrationBackfill(
+                        tenantResources,
+                        namespaceResources,
+                        topicResources,
+                        bindingStore,
+                        this,
+                        capabilityCoordinator,
+                        generationRegistrationBackfillMaxTopicsPerNamespace);
+        if (!generationRegistrationBackfill.compareAndSet(null, backfill)) {
+            throw new IllegalStateException(
+                    "Nereus generation registration backfill is already attached");
+        }
+    }
+
+    public CompletableFuture<GenerationRegistrationBackfillReport>
+            runGenerationRegistrationBackfill(
+                    GenerationRegistrationBackfillRequest request) {
+        final NereusGenerationRegistrationBackfill backfill;
+        try {
+            ensureReady();
+            backfill = requireGenerationRegistrationBackfill();
+        } catch (Throwable error) {
+            return CompletableFuture.failedFuture(error);
+        }
+        return backfill.run(request);
+    }
+
+    public CompletableFuture<GenerationRegistrationBackfillReport>
+            runGenerationRegistrationBackfill(String runId) {
+        try {
+            ensureReady();
+            requireGenerationRegistrationBackfill();
+        } catch (Throwable error) {
+            return CompletableFuture.failedFuture(error);
+        }
+        return capabilityCoordinator.requireGenerationReadiness()
+                .thenCompose(readiness -> runGenerationRegistrationBackfill(
+                        new GenerationRegistrationBackfillRequest(
+                                runId,
+                                readiness.brokerReadinessEpoch(),
+                                generationRegistrationBackfillConcurrency,
+                                generationRegistrationBackfillTimeout)));
+    }
+
+    public CompletableFuture<ManagedLedgerMaterializationRegistrationCandidate>
+            inspectMaterializationRegistrationCandidate(
+                    String persistenceName,
+                    long expectedBindingGeneration) {
+        try {
+            ensureReady();
+            return nereusFactory
+                    .inspectMaterializationRegistrationCandidate(
+                            persistenceName, expectedBindingGeneration);
+        } catch (Throwable error) {
+            return CompletableFuture.failedFuture(error);
+        }
+    }
+
+    public CompletableFuture<Void> ensureMaterializationRegistration(
+            ManagedLedgerMaterializationRegistrationCandidate candidate) {
+        try {
+            ensureReady();
+            return nereusFactory.ensureMaterializationRegistration(candidate);
+        } catch (Throwable error) {
+            return CompletableFuture.failedFuture(error);
+        }
+    }
+
     public CompletableFuture<Void> validateUnloadedAdminOperation(
             TopicName topicName, NereusAdminOperation operation) {
         final String persistenceName;
@@ -212,6 +302,7 @@ public final class NereusManagedLedgerStorage implements ManagedLedgerStorage {
         failure = closeFactory(nereusFactory, failure);
         failure = closeResource(bookkeeperStorage, failure);
         failure = closeResource(bindingStore, failure);
+        generationRegistrationBackfill.set(null);
         storageClasses = List.of();
         if (failure != null) {
             throw failure;
@@ -222,6 +313,17 @@ public final class NereusManagedLedgerStorage implements ManagedLedgerStorage {
         if (!initialized.get() || storageClasses.isEmpty() || closed.get()) {
             throw new IllegalStateException("Nereus managed-ledger storage is not available");
         }
+    }
+
+    private NereusGenerationRegistrationBackfill
+            requireGenerationRegistrationBackfill() {
+        NereusGenerationRegistrationBackfill backfill =
+                generationRegistrationBackfill.get();
+        if (backfill == null) {
+            throw new IllegalStateException(
+                    "Nereus generation registration backfill is not attached");
+        }
+        return backfill;
     }
 
     private static IOException closeFactory(NereusManagedLedgerFactory factory, IOException failure) {

@@ -2756,6 +2756,12 @@ public class ServiceConfiguration implements PulsarConfiguration {
     @FieldContext(category = CATEGORY_STORAGE_ML,
             doc = "Maximum concurrent binding reads during a Nereus namespace storage-policy update")
     private int nereusMaxBindingPendingOperations = 64;
+    @FieldContext(category = CATEGORY_STORAGE_ML,
+            doc = "Maximum concurrent topic registrations during one Nereus generation cold-topic backfill")
+    private int nereusGenerationRegistrationBackfillConcurrency = 16;
+    @FieldContext(category = CATEGORY_STORAGE_ML,
+            doc = "Deadline in seconds for one complete Nereus generation cold-topic backfill")
+    private long nereusGenerationRegistrationBackfillTimeoutSeconds = 3600;
     @FieldContext(category = CATEGORY_STORAGE_ML, doc = "Maximum encoded Nereus projection value bytes")
     private int nereusProjectionMetadataMaxValueBytes = 65536;
     @FieldContext(category = CATEGORY_STORAGE_ML, doc = "Maximum pending Nereus cursor metadata operations")

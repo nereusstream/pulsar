@@ -190,6 +190,24 @@ public final class NereusBrokerStorageConfiguration {
                 "nereusObjectStoreSecretResolverClassName");
     }
 
+    public int generationRegistrationBackfillConcurrency() {
+        return positive(
+                broker.getNereusGenerationRegistrationBackfillConcurrency(),
+                "nereusGenerationRegistrationBackfillConcurrency");
+    }
+
+    public Duration generationRegistrationBackfillTimeout() {
+        return seconds(
+                broker.getNereusGenerationRegistrationBackfillTimeoutSeconds(),
+                "nereusGenerationRegistrationBackfillTimeoutSeconds");
+    }
+
+    public int generationRegistrationBackfillMaxTopicsPerNamespace() {
+        return positive(
+                broker.getNereusMaxNamespaceBindingScanEntries(),
+                "nereusMaxNamespaceBindingScanEntries");
+    }
+
     private void requireBrokerIntegration() {
         if (!broker.isEnablePersistentTopics()) {
             throw new IllegalArgumentException("enablePersistentTopics must be true for Nereus hybrid storage");

@@ -93,6 +93,10 @@ public class BrokerRegistryImpl implements BrokerRegistry {
         Map<String, String> lookupProperties;
         if (pulsar.getManagedLedgerStorage() instanceof NereusManagedLedgerStorage nereusStorage) {
             nereusStorage.capabilityCoordinator().attachBrokerRegistry(this);
+            nereusStorage.attachGenerationRegistrationBackfill(
+                    pulsar.getPulsarResources().getTenantResources(),
+                    pulsar.getPulsarResources().getNamespaceResources(),
+                    pulsar.getPulsarResources().getTopicResources());
             lookupProperties = nereusStorage.capabilityCoordinator()
                     .decorateLookupProperties(pulsar.getConfig().lookupProperties());
         } else {
