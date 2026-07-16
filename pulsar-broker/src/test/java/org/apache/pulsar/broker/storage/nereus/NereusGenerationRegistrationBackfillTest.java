@@ -23,6 +23,7 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
+import com.nereusstream.core.capability.GenerationRegistrationBackfillCompletion;
 import com.nereusstream.managedledger.generation.ManagedLedgerMaterializationRegistrationCandidate;
 import com.nereusstream.metadata.oxia.ManagedLedgerProjectionNames;
 import com.nereusstream.metadata.oxia.records.ManagedLedgerProjectionIdentity;
@@ -73,6 +74,8 @@ public class NereusGenerationRegistrationBackfillTest {
         when(bindings.getBinding(any())).thenAnswer(invocation ->
                 completed(Optional.ofNullable(records.get(invocation.getArgument(0)))));
         AtomicInteger registrations = new AtomicInteger();
+        List<GenerationRegistrationBackfillCompletion> proofs =
+                new ArrayList<>();
         DefaultNereusGenerationRegistrationBackfill.RegistrationAccess access =
                 registrationAccess(registrations);
         var backfill = new DefaultNereusGenerationRegistrationBackfill(
@@ -81,6 +84,10 @@ public class NereusGenerationRegistrationBackfillTest {
                 topics,
                 bindings,
                 access,
+                completion -> {
+                    proofs.add(completion);
+                    return completed(null);
+                },
                 capabilities,
                 100);
         var request = request(4);
@@ -99,6 +106,14 @@ public class NereusGenerationRegistrationBackfillTest {
         assertThat(first.coverageSha256().value())
                 .isEqualTo("2f234d6b9baa3a760460090850d22734f94cd72d51fd0f27706fda272fc01d7c");
         assertThat(registrations).hasValue(4);
+        assertThat(proofs).hasSize(2).allSatisfy(proof -> {
+            assertThat(proof.runId()).isEqualTo(RUN_ID);
+            assertThat(proof.readiness())
+                    .isEqualTo(readiness("11").toCore());
+            assertThat(proof.coverageSha256())
+                    .isEqualTo(first.coverageSha256());
+            assertThat(proof.failureCount()).isZero();
+        });
     }
 
     @Test
@@ -130,6 +145,7 @@ public class NereusGenerationRegistrationBackfillTest {
         AtomicInteger inFlight = new AtomicInteger();
         AtomicInteger maxObserved = new AtomicInteger();
         AtomicInteger registrations = new AtomicInteger();
+        AtomicInteger proofs = new AtomicInteger();
         DefaultNereusGenerationRegistrationBackfill.RegistrationAccess access =
                 new DefaultNereusGenerationRegistrationBackfill.RegistrationAccess() {
                     @Override
@@ -156,6 +172,7 @@ public class NereusGenerationRegistrationBackfillTest {
                 topics,
                 bindings,
                 access,
+                proofAccess(proofs),
                 capabilities,
                 10);
 
@@ -167,6 +184,7 @@ public class NereusGenerationRegistrationBackfillTest {
         releaseFirstBatch.complete(null);
         assertThat(result.join().nereusProjectionsRegistered()).isEqualTo(8);
         assertThat(registrations).hasValue(8);
+        assertThat(proofs).hasValue(1);
         assertThat(maxObserved.get()).isLessThanOrEqualTo(3);
     }
 
@@ -187,12 +205,14 @@ public class NereusGenerationRegistrationBackfillTest {
         when(topics.listPersistentTopicsAsync(namespace)).thenReturn(completed(topicNames));
         when(bindings.getBinding(any())).thenReturn(
                 CompletableFuture.failedFuture(new IllegalStateException("read failed")));
+        AtomicInteger proofs = new AtomicInteger();
         var backfill = new DefaultNereusGenerationRegistrationBackfill(
                 tenants,
                 namespaces,
                 topics,
                 bindings,
                 registrationAccess(new AtomicInteger()),
+                proofAccess(proofs),
                 capabilities,
                 200);
 
@@ -207,6 +227,7 @@ public class NereusGenerationRegistrationBackfillTest {
                             .isEqualTo(GenerationRegistrationBackfillStage.BINDING_READ);
                     assertThat(failure.errorCode()).isEqualTo("OPERATION_FAILED");
                 });
+        assertThat(proofs).hasValue(0);
     }
 
     @Test
@@ -227,12 +248,14 @@ public class NereusGenerationRegistrationBackfillTest {
                 completed(Optional.of(activeBinding(
                         topic, StorageClassBindingRecord.BOOKKEEPER, 4))));
         AtomicInteger registrations = new AtomicInteger();
+        AtomicInteger proofs = new AtomicInteger();
         var backfill = new DefaultNereusGenerationRegistrationBackfill(
                 tenants,
                 namespaces,
                 topics,
                 bindings,
                 registrationAccess(registrations),
+                proofAccess(proofs),
                 capabilities,
                 10);
 
@@ -245,6 +268,7 @@ public class NereusGenerationRegistrationBackfillTest {
                 .isEqualTo(GenerationRegistrationBackfillStage.BINDING_READ);
         assertThat(report.boundedFailures().get(0).errorCode())
                 .isEqualTo("BINDING_CHANGED");
+        assertThat(proofs).hasValue(0);
     }
 
     @Test
@@ -259,17 +283,20 @@ public class NereusGenerationRegistrationBackfillTest {
                 completed(new NereusGenerationCapabilityReadiness(
                         READINESS_EPOCH + 1, "55".repeat(32), 2)));
         when(tenants.listTenantsAsync()).thenReturn(completed(List.of()));
+        AtomicInteger proofs = new AtomicInteger();
         var backfill = new DefaultNereusGenerationRegistrationBackfill(
                 tenants,
                 namespaces,
                 topics,
                 bindings,
                 registrationAccess(new AtomicInteger()),
+                proofAccess(proofs),
                 capabilities,
                 10);
 
         assertThatThrownBy(() -> backfill.run(request(1)).join())
                 .hasRootCauseMessage("NEREUS_GENERATION_BACKFILL_READINESS_CHANGED");
+        assertThat(proofs).hasValue(0);
     }
 
     @Test
@@ -317,6 +344,14 @@ public class NereusGenerationRegistrationBackfillTest {
                 registrations.incrementAndGet();
                 return CompletableFuture.completedFuture(null);
             }
+        };
+    }
+
+    private static DefaultNereusGenerationRegistrationBackfill.ProofAccess
+            proofAccess(AtomicInteger completions) {
+        return completion -> {
+            completions.incrementAndGet();
+            return completed(null);
         };
     }
 

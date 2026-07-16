@@ -18,6 +18,7 @@
  */
 package org.apache.pulsar.broker.storage.nereus;
 
+import com.nereusstream.core.capability.GenerationRegistrationBackfillCompletion;
 import com.nereusstream.managedledger.NereusManagedLedgerFactory;
 import com.nereusstream.managedledger.NereusManagedLedgerRuntime;
 import com.nereusstream.managedledger.generation.ManagedLedgerMaterializationRegistrationCandidate;
@@ -122,6 +123,7 @@ public final class NereusManagedLedgerStorage implements ManagedLedgerStorage {
                     eventLoopGroup,
                     openTelemetry,
                     bindingStore.creationGuard(),
+                    capabilityCoordinator,
                     capabilityCoordinator,
                     secretResolver,
                     classLoader);
@@ -259,6 +261,17 @@ public final class NereusManagedLedgerStorage implements ManagedLedgerStorage {
         try {
             ensureReady();
             return nereusFactory.ensureMaterializationRegistration(candidate);
+        } catch (Throwable error) {
+            return CompletableFuture.failedFuture(error);
+        }
+    }
+
+    public CompletableFuture<Void> completeGenerationRegistrationBackfill(
+            GenerationRegistrationBackfillCompletion completion) {
+        try {
+            ensureReady();
+            return nereusFactory.completeGenerationRegistrationBackfill(
+                    completion);
         } catch (Throwable error) {
             return CompletableFuture.failedFuture(error);
         }

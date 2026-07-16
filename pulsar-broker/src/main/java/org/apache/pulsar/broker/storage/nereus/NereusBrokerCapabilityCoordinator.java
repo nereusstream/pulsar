@@ -18,6 +18,8 @@
  */
 package org.apache.pulsar.broker.storage.nereus;
 
+import com.nereusstream.core.capability.GenerationCapabilityReadiness;
+import com.nereusstream.core.capability.GenerationCapabilityReadinessProvider;
 import com.nereusstream.managedledger.cursor.CursorLedgerIdentity;
 import com.nereusstream.managedledger.cursor.CursorProtocolActivationGuard;
 import java.nio.ByteBuffer;
@@ -41,7 +43,8 @@ import org.apache.pulsar.broker.loadbalance.extensions.BrokerRegistry;
 import org.apache.pulsar.broker.loadbalance.extensions.data.BrokerLookupData;
 
 /** Publishes and independently verifies the cluster-wide binding, cursor, and generation protocols. */
-public final class NereusBrokerCapabilityCoordinator implements CursorProtocolActivationGuard {
+public final class NereusBrokerCapabilityCoordinator
+        implements CursorProtocolActivationGuard, GenerationCapabilityReadinessProvider {
     public static final String PROPERTY = "nereus.storage-binding-protocol";
     public static final String VERSION = "1";
 
@@ -160,6 +163,20 @@ public final class NereusBrokerCapabilityCoordinator implements CursorProtocolAc
             return Optional.empty();
         }
         return Optional.of(cached.readiness());
+    }
+
+    @Override
+    public CompletableFuture<GenerationCapabilityReadiness>
+            requireGenerationCapabilityReadiness() {
+        return requireGenerationReadiness()
+                .thenApply(NereusGenerationCapabilityReadiness::toCore);
+    }
+
+    @Override
+    public Optional<GenerationCapabilityReadiness>
+            currentGenerationCapabilityReadiness() {
+        return currentGenerationReadiness()
+                .map(NereusGenerationCapabilityReadiness::toCore);
     }
 
     @Override

@@ -18,6 +18,9 @@
  */
 package org.apache.pulsar.broker.storage.nereus;
 
+import com.nereusstream.api.Checksum;
+import com.nereusstream.api.ChecksumType;
+import com.nereusstream.core.capability.GenerationCapabilityReadiness;
 import java.util.Objects;
 
 /**
@@ -41,6 +44,13 @@ public record NereusGenerationCapabilityReadiness(
         if (persistentBrokerCount < 1) {
             throw new IllegalArgumentException("persistentBrokerCount must be positive");
         }
+    }
+
+    public GenerationCapabilityReadiness toCore() {
+        return new GenerationCapabilityReadiness(
+                brokerReadinessEpoch,
+                new Checksum(ChecksumType.SHA256, brokerSetSha256),
+                persistentBrokerCount);
     }
 
     private static boolean isLowerHex(String value) {
