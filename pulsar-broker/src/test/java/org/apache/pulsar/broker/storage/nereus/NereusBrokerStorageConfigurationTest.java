@@ -20,6 +20,7 @@ package org.apache.pulsar.broker.storage.nereus;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import com.nereusstream.api.StorageProfile;
 import com.nereusstream.pulsar.NereusProcessIdentity;
 import java.security.SecureRandom;
 import org.apache.pulsar.broker.ServiceConfiguration;
@@ -45,6 +46,16 @@ public class NereusBrokerStorageConfigurationTest {
                 .isEqualTo(runtime.streamStorage().maxRetainedAppendAttempts());
         assertThat(runtime.projectionMetadata().maxPendingOperations())
                 .isLessThanOrEqualTo(runtime.oxia().maxPendingOperations());
+        assertThat(runtime.managedLedger().defaultStorageProfile())
+                .isEqualTo(StorageProfile.OBJECT_WAL_SYNC_OBJECT);
+        assertThat(runtime.materialization().committedPolicy().minMergeSourceRanges())
+                .isEqualTo(2);
+        assertThat(runtime.materialization().maxConcurrentWorkers())
+                .isEqualTo(8);
+        assertThat(runtime.materialization().lagThrottleDelay())
+                .isEqualTo(java.time.Duration.ofMillis(25));
+        assertThat(runtime.materialization().stagingDirectory().getFileName().toString())
+                .isEqualTo(identity.processRunId());
         assertThat(checked.generationRegistrationBackfillConcurrency())
                 .isEqualTo(16);
         assertThat(checked.generationRegistrationBackfillTimeout())
@@ -55,6 +66,13 @@ public class NereusBrokerStorageConfigurationTest {
 
         broker.setNereusGenerationProtocolEnabled(true);
         assertThat(checked.generationProtocolEnabled()).isTrue();
+
+        broker.setNereusDefaultStorageProfile(
+                StorageProfile.OBJECT_WAL_ASYNC_OBJECT.name());
+        assertThat(checked.runtimeConfiguration(identity)
+                        .managedLedger()
+                        .defaultStorageProfile())
+                .isEqualTo(StorageProfile.OBJECT_WAL_ASYNC_OBJECT);
     }
 
     @Test
@@ -93,6 +111,37 @@ public class NereusBrokerStorageConfigurationTest {
                 .generationRegistrationBackfillConcurrency())
                 .isInstanceOf(IllegalArgumentException.class)
                 .hasMessageContaining("BackfillConcurrency");
+
+        ServiceConfiguration aliasedProfile = validConfiguration();
+        aliasedProfile.setNereusDefaultStorageProfile("OBJECT_WAL");
+        assertThatThrownBy(() -> new NereusBrokerStorageConfiguration(
+                        aliasedProfile)
+                .runtimeConfiguration(
+                        NereusProcessIdentity.generate(
+                                new SecureRandom())))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("exact Object-WAL profile");
+
+        ServiceConfiguration invalidLag = validConfiguration();
+        invalidLag.setNereusMaterializationLagRejectRecords(100);
+        invalidLag.setNereusMaterializationLagThrottleRecords(100);
+        assertThatThrownBy(() -> new NereusBrokerStorageConfiguration(
+                        invalidLag)
+                .runtimeConfiguration(
+                        NereusProcessIdentity.generate(
+                                new SecureRandom())))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("record lag");
+
+        ServiceConfiguration oversizedRegistryPage = validConfiguration();
+        oversizedRegistryPage.setNereusMaterializationRegistryScanPageSize(257);
+        assertThatThrownBy(() -> new NereusBrokerStorageConfiguration(
+                        oversizedRegistryPage)
+                .runtimeConfiguration(
+                        NereusProcessIdentity.generate(
+                                new SecureRandom())))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("RegistryScanPageSize");
     }
 
     private static ServiceConfiguration validConfiguration() {

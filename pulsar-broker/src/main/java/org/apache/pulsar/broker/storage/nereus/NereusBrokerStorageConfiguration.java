@@ -18,9 +18,12 @@
  */
 package org.apache.pulsar.broker.storage.nereus;
 
+import com.nereusstream.api.StorageProfile;
 import com.nereusstream.core.StreamStorageConfig;
 import com.nereusstream.managedledger.NereusManagedLedgerFactoryConfig;
 import com.nereusstream.managedledger.cursor.CursorStorageConfig;
+import com.nereusstream.materialization.MaterializationConfig;
+import com.nereusstream.materialization.MaterializationPolicyFactory;
 import com.nereusstream.metadata.oxia.CursorMetadataStoreConfig;
 import com.nereusstream.metadata.oxia.OxiaClientConfiguration;
 import com.nereusstream.metadata.oxia.ProjectionMetadataStoreConfig;
@@ -28,6 +31,7 @@ import com.nereusstream.objectstore.ObjectStoreConfiguration;
 import com.nereusstream.pulsar.NereusProcessIdentity;
 import com.nereusstream.pulsar.NereusRuntimeConfiguration;
 import java.net.URI;
+import java.nio.file.Path;
 import java.time.Duration;
 import java.util.Optional;
 import org.apache.pulsar.broker.ServiceConfiguration;
@@ -131,7 +135,8 @@ public final class NereusBrokerStorageConfiguration {
                 positive(broker.getNereusMaxOpenLedgers(), "nereusMaxOpenLedgers"),
                 positive(broker.getNereusMaxPendingCallbacks(), "nereusMaxPendingCallbacks"),
                 positive(broker.getNereusMaxRetainedAppendAttempts(), "nereusMaxRetainedAppendAttempts"),
-                positive(broker.getNereusMaxScanEntries(), "nereusMaxScanEntries"));
+                positive(broker.getNereusMaxScanEntries(), "nereusMaxScanEntries"),
+                storageProfile(broker.getNereusDefaultStorageProfile()));
         ProjectionMetadataStoreConfig projection = new ProjectionMetadataStoreConfig(
                 metadataTimeout,
                 positive(broker.getNereusMaxProjectionMetadataPendingOperations(),
@@ -177,8 +182,99 @@ public final class NereusBrokerStorageConfiguration {
                 metadataTimeout,
                 seconds(broker.getNereusCursorSnapshotOperationTimeoutSeconds(),
                         "nereusCursorSnapshotOperationTimeoutSeconds"));
+        Path stagingBase = absolutePath(
+                broker.getNereusMaterializationStagingDirectory(),
+                "nereusMaterializationStagingDirectory");
+        MaterializationConfig materialization = new MaterializationConfig(
+                MaterializationPolicyFactory.losslessCommitted(
+                        positive(broker.getNereusMaterializationMinMergeSourceRanges(),
+                                "nereusMaterializationMinMergeSourceRanges"),
+                        positive(broker.getNereusMaterializationMaxSourceRanges(),
+                                "nereusMaterializationMaxSourceRanges"),
+                        positive(broker.getNereusMaterializationMaxRangeRecords(),
+                                "nereusMaterializationMaxRangeRecords"),
+                        positive(broker.getNereusMaterializationTargetObjectBytes(),
+                                "nereusMaterializationTargetObjectBytes"),
+                        positive(broker.getNereusMaterializationTargetRowGroupRecords(),
+                                "nereusMaterializationTargetRowGroupRecords"),
+                        text(broker.getNereusMaterializationCompression(),
+                                "nereusMaterializationCompression")),
+                positiveAtMost(
+                        broker.getNereusMaterializationRegistryScanPageSize(),
+                        256,
+                        "nereusMaterializationRegistryScanPageSize"),
+                seconds(broker.getNereusMaterializationRegistryScanIntervalSeconds(),
+                        "nereusMaterializationRegistryScanIntervalSeconds"),
+                positiveAtMost(
+                        broker.getNereusMaterializationPlannerPageSize(),
+                        512,
+                        "nereusMaterializationPlannerPageSize"),
+                positiveAtMost(
+                        broker.getNereusMaterializationTaskScanPageSize(),
+                        256,
+                        "nereusMaterializationTaskScanPageSize"),
+                positive(broker.getNereusMaterializationMaxTasksPerPlan(),
+                        "nereusMaterializationMaxTasksPerPlan"),
+                positive(broker.getNereusMaterializationMaxWorkers(),
+                        "nereusMaterializationMaxWorkers"),
+                positive(broker.getNereusMaterializationMaxWorkersPerStream(),
+                        "nereusMaterializationMaxWorkersPerStream"),
+                positive(broker.getNereusMaterializationSourceReadPageRecords(),
+                        "nereusMaterializationSourceReadPageRecords"),
+                positive(broker.getNereusMaterializationSourceReadPageBytes(),
+                        "nereusMaterializationSourceReadPageBytes"),
+                stagingBase.resolve(identity.processRunId()).normalize(),
+                positive(broker.getNereusMaterializationMaxStagingBytes(),
+                        "nereusMaterializationMaxStagingBytes"),
+                positive(broker.getNereusObjectUploadChunkBytes(),
+                        "nereusObjectUploadChunkBytes"),
+                seconds(broker.getNereusMaterializationWorkerClaimSeconds(),
+                        "nereusMaterializationWorkerClaimSeconds"),
+                seconds(broker.getNereusMaterializationWorkerRenewSeconds(),
+                        "nereusMaterializationWorkerRenewSeconds"),
+                nonNegativeSeconds(broker.getNereusMaximumClockSkewSeconds(),
+                        "nereusMaximumClockSkewSeconds"),
+                seconds(broker.getNereusMaterializationOperationTimeoutSeconds(),
+                        "nereusMaterializationOperationTimeoutSeconds"),
+                seconds(broker.getNereusMaterializationCloseTimeoutSeconds(),
+                        "nereusMaterializationCloseTimeoutSeconds"),
+                millis(broker.getNereusMaterializationRetryMinMillis(),
+                        "nereusMaterializationRetryMinMillis"),
+                millis(broker.getNereusMaterializationRetryMaxMillis(),
+                        "nereusMaterializationRetryMaxMillis"),
+                positive(broker.getNereusMaterializationMaxTaskAttempts(),
+                        "nereusMaterializationMaxTaskAttempts"),
+                nonNegative(broker.getNereusMaterializationLagThrottleRecords(),
+                        "nereusMaterializationLagThrottleRecords"),
+                nonNegative(broker.getNereusMaterializationLagRejectRecords(),
+                        "nereusMaterializationLagRejectRecords"),
+                nonNegative(broker.getNereusMaterializationLagThrottleBytes(),
+                        "nereusMaterializationLagThrottleBytes"),
+                nonNegative(broker.getNereusMaterializationLagRejectBytes(),
+                        "nereusMaterializationLagRejectBytes"),
+                nonNegativeSeconds(broker.getNereusMaterializationLagRejectAgeSeconds(),
+                        "nereusMaterializationLagRejectAgeSeconds"),
+                millis(broker.getNereusMaterializationLagThrottleDelayMillis(),
+                        "nereusMaterializationLagThrottleDelayMillis"),
+                seconds(broker.getNereusSourceRetirementGraceSeconds(),
+                        "nereusSourceRetirementGraceSeconds"),
+                seconds(broker.getNereusAppendReplayGraceSeconds(),
+                        "nereusAppendReplayGraceSeconds"),
+                seconds(broker.getNereusMaterializationMetadataAuditGraceSeconds(),
+                        "nereusMaterializationMetadataAuditGraceSeconds"),
+                positive(broker.getNereusRecoveryCheckpointMaxEntries(),
+                        "nereusRecoveryCheckpointMaxEntries"),
+                positive(broker.getNereusRecoveryCheckpointMaxBytes(),
+                        "nereusRecoveryCheckpointMaxBytes"));
         return new NereusRuntimeConfiguration(
-                oxia, objectStore, stream, managedLedger, projection, cursorMetadata, cursorStorage);
+                oxia,
+                objectStore,
+                stream,
+                managedLedger,
+                projection,
+                cursorMetadata,
+                cursorStorage,
+                materialization);
     }
 
     public String runtimeProviderClassName() {
@@ -248,9 +344,28 @@ public final class NereusBrokerStorageConfiguration {
         return value;
     }
 
+    private static int positiveAtMost(
+            int value,
+            int maximum,
+            String name) {
+        int exact = positive(value, name);
+        if (exact > maximum) {
+            throw new IllegalArgumentException(
+                    name + " must be at most " + maximum);
+        }
+        return exact;
+    }
+
     private static long positive(long value, String name) {
         if (value <= 0) {
             throw new IllegalArgumentException(name + " must be positive");
+        }
+        return value;
+    }
+
+    private static long nonNegative(long value, String name) {
+        if (value < 0) {
+            throw new IllegalArgumentException(name + " must be non-negative");
         }
         return value;
     }
@@ -261,5 +376,38 @@ public final class NereusBrokerStorageConfiguration {
 
     private static Duration millis(long value, String name) {
         return Duration.ofMillis(positive(value, name));
+    }
+
+    private static Duration nonNegativeSeconds(long value, String name) {
+        return Duration.ofSeconds(nonNegative(value, name));
+    }
+
+    private static StorageProfile storageProfile(String value) {
+        String exact = text(value, "nereusDefaultStorageProfile");
+        final StorageProfile profile;
+        try {
+            profile = StorageProfile.valueOf(exact);
+        } catch (IllegalArgumentException failure) {
+            throw new IllegalArgumentException(
+                    "nereusDefaultStorageProfile is unknown",
+                    failure);
+        }
+        if (profile != StorageProfile.OBJECT_WAL_SYNC_OBJECT
+                && profile
+                        != StorageProfile.OBJECT_WAL_ASYNC_OBJECT) {
+            throw new IllegalArgumentException(
+                    "nereusDefaultStorageProfile must be an exact Object-WAL profile");
+        }
+        return profile;
+    }
+
+    private static Path absolutePath(String value, String name) {
+        Path path = Path.of(text(value, name))
+                .normalize();
+        if (!path.isAbsolute()) {
+            throw new IllegalArgumentException(
+                    name + " must be absolute");
+        }
+        return path;
     }
 }
