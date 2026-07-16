@@ -2716,7 +2716,7 @@ public class ServiceConfiguration implements PulsarConfiguration {
     @FieldContext(category = CATEGORY_STORAGE_ML, doc = "Nereus read timeout in seconds")
     private long nereusReadTimeoutSeconds = 30;
     @FieldContext(category = CATEGORY_STORAGE_ML, doc = "Nereus close timeout in seconds")
-    private long nereusCloseTimeoutSeconds = 75;
+    private long nereusCloseTimeoutSeconds = 300;
     @FieldContext(category = CATEGORY_STORAGE_ML, doc = "Nereus tail polling interval in milliseconds")
     private long nereusTailPollIntervalMillis = 1000;
     @FieldContext(category = CATEGORY_STORAGE_ML, doc = "Nereus append-recovery attempt timeout in seconds")
@@ -2835,6 +2835,106 @@ public class ServiceConfiguration implements PulsarConfiguration {
     private boolean nereusEnableMetadataWatch = false;
     @FieldContext(category = CATEGORY_STORAGE_ML, doc = "Enable the Nereus offset-index cache")
     private boolean nereusEnableOffsetIndexCache = true;
+    @FieldContext(category = CATEGORY_STORAGE_ML,
+            doc = "Default Nereus storage profile used only when a topic projection is first created")
+    private String nereusDefaultStorageProfile = "OBJECT_WAL_SYNC_OBJECT";
+    @FieldContext(category = CATEGORY_STORAGE_ML, doc = "Nereus materialization registry scan page size")
+    private int nereusMaterializationRegistryScanPageSize = 256;
+    @FieldContext(category = CATEGORY_STORAGE_ML,
+            doc = "Nereus materialization full-registry scan interval in seconds")
+    private long nereusMaterializationRegistryScanIntervalSeconds = 10;
+    @FieldContext(category = CATEGORY_STORAGE_ML, doc = "Nereus materialization planner scan page size")
+    private int nereusMaterializationPlannerPageSize = 512;
+    @FieldContext(category = CATEGORY_STORAGE_ML, doc = "Nereus materialization task scan page size")
+    private int nereusMaterializationTaskScanPageSize = 256;
+    @FieldContext(category = CATEGORY_STORAGE_ML, doc = "Maximum tasks planned for one Nereus stream pass")
+    private int nereusMaterializationMaxTasksPerPlan = 64;
+    @FieldContext(category = CATEGORY_STORAGE_ML, doc = "Maximum concurrent Nereus materialization workers")
+    private int nereusMaterializationMaxWorkers = 8;
+    @FieldContext(category = CATEGORY_STORAGE_ML,
+            doc = "Maximum concurrent Nereus materialization workers for one stream")
+    private int nereusMaterializationMaxWorkersPerStream = 1;
+    @FieldContext(category = CATEGORY_STORAGE_ML,
+            doc = "Maximum source records in one Nereus materialization read page")
+    private int nereusMaterializationSourceReadPageRecords = 8192;
+    @FieldContext(category = CATEGORY_STORAGE_ML,
+            doc = "Maximum source bytes in one Nereus materialization read page")
+    private long nereusMaterializationSourceReadPageBytes = 8388608;
+    @FieldContext(category = CATEGORY_STORAGE_ML,
+            doc = "Absolute base directory for private Nereus materialization staging")
+    private String nereusMaterializationStagingDirectory =
+            System.getProperty("java.io.tmpdir") + "/nereus-materialization";
+    @FieldContext(category = CATEGORY_STORAGE_ML, doc = "Maximum process-wide Nereus staging bytes")
+    private long nereusMaterializationMaxStagingBytes = 2147483648L;
+    @FieldContext(category = CATEGORY_STORAGE_ML, doc = "Nereus staged object upload chunk bytes")
+    private int nereusObjectUploadChunkBytes = 1048576;
+    @FieldContext(category = CATEGORY_STORAGE_ML, doc = "Nereus materialization worker claim duration in seconds")
+    private long nereusMaterializationWorkerClaimSeconds = 120;
+    @FieldContext(category = CATEGORY_STORAGE_ML,
+            doc = "Nereus materialization worker claim renewal interval in seconds")
+    private long nereusMaterializationWorkerRenewSeconds = 30;
+    @FieldContext(category = CATEGORY_STORAGE_ML, doc = "Maximum admitted Nereus clock skew in seconds")
+    private long nereusMaximumClockSkewSeconds = 5;
+    @FieldContext(category = CATEGORY_STORAGE_ML, doc = "Nereus materialization operation timeout in seconds")
+    private long nereusMaterializationOperationTimeoutSeconds = 60;
+    @FieldContext(category = CATEGORY_STORAGE_ML, doc = "Nereus materialization close timeout in seconds")
+    private long nereusMaterializationCloseTimeoutSeconds = 300;
+    @FieldContext(category = CATEGORY_STORAGE_ML, doc = "Nereus materialization minimum retry backoff in milliseconds")
+    private long nereusMaterializationRetryMinMillis = 1000;
+    @FieldContext(category = CATEGORY_STORAGE_ML, doc = "Nereus materialization maximum retry backoff in milliseconds")
+    private long nereusMaterializationRetryMaxMillis = 60000;
+    @FieldContext(category = CATEGORY_STORAGE_ML, doc = "Maximum attempts for one Nereus materialization task")
+    private int nereusMaterializationMaxTaskAttempts = 20;
+    @FieldContext(category = CATEGORY_STORAGE_ML,
+            doc = "Minimum source ranges required for one Nereus materialization merge")
+    private int nereusMaterializationMinMergeSourceRanges = 2;
+    @FieldContext(category = CATEGORY_STORAGE_ML,
+            doc = "Maximum source ranges in one Nereus materialization task")
+    private int nereusMaterializationMaxSourceRanges = 128;
+    @FieldContext(category = CATEGORY_STORAGE_ML,
+            doc = "Maximum logical records covered by one Nereus materialization task")
+    private long nereusMaterializationMaxRangeRecords = 1048576;
+    @FieldContext(category = CATEGORY_STORAGE_ML,
+            doc = "Target Nereus materialized object bytes")
+    private long nereusMaterializationTargetObjectBytes = 268435456;
+    @FieldContext(category = CATEGORY_STORAGE_ML,
+            doc = "Target records in one Nereus materialized Parquet row group")
+    private int nereusMaterializationTargetRowGroupRecords = 8192;
+    @FieldContext(category = CATEGORY_STORAGE_ML, doc = "Nereus materialization compression")
+    private String nereusMaterializationCompression = "ZSTD";
+    @FieldContext(category = CATEGORY_STORAGE_ML,
+            doc = "Throttle new async Nereus appends at this record lag; zero disables")
+    private long nereusMaterializationLagThrottleRecords = 1000000;
+    @FieldContext(category = CATEGORY_STORAGE_ML,
+            doc = "Reject new async Nereus appends at this record lag; zero disables")
+    private long nereusMaterializationLagRejectRecords = 10000000;
+    @FieldContext(category = CATEGORY_STORAGE_ML,
+            doc = "Throttle new async Nereus appends at this byte lag; zero disables")
+    private long nereusMaterializationLagThrottleBytes = 1073741824;
+    @FieldContext(category = CATEGORY_STORAGE_ML,
+            doc = "Reject new async Nereus appends at this byte lag; zero disables")
+    private long nereusMaterializationLagRejectBytes = 8589934592L;
+    @FieldContext(category = CATEGORY_STORAGE_ML,
+            doc = "Reject new async Nereus appends at this oldest-lag age in seconds; zero disables")
+    private long nereusMaterializationLagRejectAgeSeconds = 600;
+    @FieldContext(category = CATEGORY_STORAGE_ML,
+            doc = "One bounded Nereus async-append lag throttle delay in milliseconds")
+    private long nereusMaterializationLagThrottleDelayMillis = 25;
+    @FieldContext(category = CATEGORY_STORAGE_ML,
+            doc = "Nereus source retirement grace in seconds")
+    private long nereusSourceRetirementGraceSeconds = 3600;
+    @FieldContext(category = CATEGORY_STORAGE_ML,
+            doc = "Nereus append replay evidence grace in seconds")
+    private long nereusAppendReplayGraceSeconds = 21600;
+    @FieldContext(category = CATEGORY_STORAGE_ML,
+            doc = "Nereus materialization workflow metadata audit grace in seconds")
+    private long nereusMaterializationMetadataAuditGraceSeconds = 86400;
+    @FieldContext(category = CATEGORY_STORAGE_ML,
+            doc = "Maximum commit entries in one Nereus recovery checkpoint")
+    private int nereusRecoveryCheckpointMaxEntries = 1000000;
+    @FieldContext(category = CATEGORY_STORAGE_ML,
+            doc = "Maximum bytes in one Nereus recovery checkpoint")
+    private long nereusRecoveryCheckpointMaxBytes = 1073741824;
     @FieldContext(
         category = CATEGORY_STORAGE_ML,
         doc = "Number of threads to be used for managed ledger scheduled tasks"
