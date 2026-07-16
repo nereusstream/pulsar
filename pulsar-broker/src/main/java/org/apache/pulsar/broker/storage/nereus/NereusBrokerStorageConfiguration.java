@@ -202,6 +202,10 @@ public final class NereusBrokerStorageConfiguration {
                 "nereusGenerationRegistrationBackfillTimeoutSeconds");
     }
 
+    public boolean generationProtocolEnabled() {
+        return broker.isNereusGenerationProtocolEnabled();
+    }
+
     public int generationRegistrationBackfillMaxTopicsPerNamespace() {
         return positive(
                 broker.getNereusMaxNamespaceBindingScanEntries(),

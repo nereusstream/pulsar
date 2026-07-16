@@ -2762,6 +2762,9 @@ public class ServiceConfiguration implements PulsarConfiguration {
     @FieldContext(category = CATEGORY_STORAGE_ML,
             doc = "Deadline in seconds for one complete Nereus generation cold-topic backfill")
     private long nereusGenerationRegistrationBackfillTimeoutSeconds = 3600;
+    @FieldContext(category = CATEGORY_STORAGE_ML,
+            doc = "Allow first Nereus topic generation-protocol activation after cluster publication readiness")
+    private boolean nereusGenerationProtocolEnabled = false;
     @FieldContext(category = CATEGORY_STORAGE_ML, doc = "Maximum encoded Nereus projection value bytes")
     private int nereusProjectionMetadataMaxValueBytes = 65536;
     @FieldContext(category = CATEGORY_STORAGE_ML, doc = "Maximum pending Nereus cursor metadata operations")
