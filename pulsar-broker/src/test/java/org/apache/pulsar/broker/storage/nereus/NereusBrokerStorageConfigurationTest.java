@@ -33,7 +33,8 @@ public class NereusBrokerStorageConfigurationTest {
         ServiceConfiguration broker = validConfiguration();
         NereusProcessIdentity identity = NereusProcessIdentity.generate(new SecureRandom());
 
-        var runtime = new NereusBrokerStorageConfiguration(broker).runtimeConfiguration(identity);
+        var checked = new NereusBrokerStorageConfiguration(broker);
+        var runtime = checked.runtimeConfiguration(identity);
 
         assertThat(runtime.streamStorage().cluster()).isEqualTo("test-cluster");
         assertThat(runtime.streamStorage().processRunId()).isEqualTo(identity.processRunId());
@@ -44,6 +45,12 @@ public class NereusBrokerStorageConfigurationTest {
                 .isEqualTo(runtime.streamStorage().maxRetainedAppendAttempts());
         assertThat(runtime.projectionMetadata().maxPendingOperations())
                 .isLessThanOrEqualTo(runtime.oxia().maxPendingOperations());
+        assertThat(checked.generationRegistrationBackfillConcurrency())
+                .isEqualTo(16);
+        assertThat(checked.generationRegistrationBackfillTimeout())
+                .isEqualTo(java.time.Duration.ofHours(1));
+        assertThat(checked.generationRegistrationBackfillMaxTopicsPerNamespace())
+                .isEqualTo(broker.getNereusMaxNamespaceBindingScanEntries());
     }
 
     @Test
@@ -75,6 +82,13 @@ public class NereusBrokerStorageConfigurationTest {
                 .runtimeConfiguration(NereusProcessIdentity.generate(new SecureRandom())))
                 .isInstanceOf(IllegalArgumentException.class)
                 .hasMessageContaining("maxCachedStreams");
+
+        ServiceConfiguration invalidBackfill = validConfiguration();
+        invalidBackfill.setNereusGenerationRegistrationBackfillConcurrency(0);
+        assertThatThrownBy(() -> new NereusBrokerStorageConfiguration(invalidBackfill)
+                .generationRegistrationBackfillConcurrency())
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("BackfillConcurrency");
     }
 
     private static ServiceConfiguration validConfiguration() {
