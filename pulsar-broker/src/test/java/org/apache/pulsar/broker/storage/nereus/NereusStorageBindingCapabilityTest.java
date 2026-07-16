@@ -49,6 +49,8 @@ public class NereusStorageBindingCapabilityTest {
                 NereusStorageBindingCapability.PROPERTY, NereusStorageBindingCapability.VERSION);
         assertThat(properties).containsEntry(
                 NereusCursorProtocolCapability.PROPERTY, NereusCursorProtocolCapability.VERSION);
+        assertThat(properties).containsEntry(
+                NereusGenerationProtocolCapability.PROPERTY, NereusGenerationProtocolCapability.VERSION);
         assertThatThrownBy(() -> coordinator.attachBrokerRegistry(registry))
                 .hasMessage("Nereus broker registry is already attached");
     }
@@ -64,6 +66,10 @@ public class NereusStorageBindingCapabilityTest {
                 Map.of(NereusCursorProtocolCapability.PROPERTY, "1")))
                 .isInstanceOf(IllegalArgumentException.class)
                 .hasMessage("nereus.cursor-protocol is reserved by the broker");
+        assertThatThrownBy(() -> NereusStorageBindingCapability.requireUnreserved(
+                Map.of(NereusGenerationProtocolCapability.PROPERTY, "1")))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessage("nereus.generation-protocol is reserved by the broker");
     }
 
     @Test

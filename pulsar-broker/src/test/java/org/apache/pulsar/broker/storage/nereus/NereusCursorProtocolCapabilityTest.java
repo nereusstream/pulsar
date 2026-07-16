@@ -32,7 +32,7 @@ import org.testng.annotations.Test;
 
 public class NereusCursorProtocolCapabilityTest {
     @Test
-    public void publishesTwoIndependentReservedCapabilities() {
+    public void publishesThreeIndependentReservedCapabilities() {
         NereusBrokerCapabilityCoordinator coordinator = coordinator();
         BrokerRegistry registry = readyRegistry();
         coordinator.markStorageInitialized();
@@ -41,6 +41,9 @@ public class NereusCursorProtocolCapabilityTest {
         assertThat(coordinator.decorateLookupProperties(Map.of("operator", "value")))
                 .containsEntry(NereusStorageBindingCapability.PROPERTY, NereusStorageBindingCapability.VERSION)
                 .containsEntry(NereusCursorProtocolCapability.PROPERTY, NereusCursorProtocolCapability.VERSION)
+                .containsEntry(
+                        NereusGenerationProtocolCapability.PROPERTY,
+                        NereusGenerationProtocolCapability.VERSION)
                 .containsEntry("operator", "value");
         assertThatThrownBy(() -> NereusCursorProtocolCapability.requireUnreserved(
                 Map.of(NereusCursorProtocolCapability.PROPERTY, "spoof")))
