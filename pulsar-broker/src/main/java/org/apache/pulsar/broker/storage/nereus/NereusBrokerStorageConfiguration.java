@@ -25,6 +25,7 @@ import com.nereusstream.managedledger.cursor.CursorStorageConfig;
 import com.nereusstream.managedledger.retention.NereusRetentionConfig;
 import com.nereusstream.materialization.MaterializationConfig;
 import com.nereusstream.materialization.MaterializationPolicyFactory;
+import com.nereusstream.materialization.gc.PhysicalGcConfig;
 import com.nereusstream.metadata.oxia.CursorMetadataStoreConfig;
 import com.nereusstream.metadata.oxia.OxiaClientConfiguration;
 import com.nereusstream.metadata.oxia.ProjectionMetadataStoreConfig;
@@ -284,6 +285,62 @@ public final class NereusBrokerStorageConfiguration {
                 seconds(
                         broker.getNereusRetentionCloseTimeoutSeconds(),
                         "nereusRetentionCloseTimeoutSeconds"));
+        PhysicalGcConfig physicalGc = new PhysicalGcConfig(
+                broker.isNereusPhysicalGcEnabled(),
+                broker.isNereusPhysicalGcDryRun(),
+                positiveAtMost(
+                        broker.getNereusGcMetadataScanPageSize(),
+                        PhysicalGcConfig.MAX_PAGE_SIZE,
+                        "nereusGcMetadataScanPageSize"),
+                positiveAtMost(
+                        broker.getNereusGcObjectListPageSize(),
+                        PhysicalGcConfig.MAX_PAGE_SIZE,
+                        "nereusGcObjectListPageSize"),
+                positive(
+                        broker.getNereusGcMaxConcurrentDeletes(),
+                        "nereusGcMaxConcurrentDeletes"),
+                positiveAtMost(
+                        broker.getNereusGcMaxStreamsPerCandidate(),
+                        PhysicalGcConfig.MAX_STREAMS_PER_CANDIDATE,
+                        "nereusGcMaxStreamsPerCandidate"),
+                positiveAtMost(
+                        broker.getNereusGcMaxAuthoritiesPerDomainSnapshot(),
+                        PhysicalGcConfig.MAX_DOMAIN_VALUES,
+                        "nereusGcMaxAuthoritiesPerDomainSnapshot"),
+                positiveAtMost(
+                        broker.getNereusGcMaxReferencesPerDomainSnapshot(),
+                        PhysicalGcConfig.MAX_DOMAIN_VALUES,
+                        "nereusGcMaxReferencesPerDomainSnapshot"),
+                seconds(
+                        broker.getNereusGcScanIntervalSeconds(),
+                        "nereusGcScanIntervalSeconds"),
+                seconds(
+                        broker.getNereusReaderLeaseSeconds(),
+                        "nereusReaderLeaseSeconds"),
+                seconds(
+                        broker.getNereusReaderLeaseRenewSeconds(),
+                        "nereusReaderLeaseRenewSeconds"),
+                nonNegativeSeconds(
+                        broker.getNereusMaximumClockSkewSeconds(),
+                        "nereusMaximumClockSkewSeconds"),
+                seconds(
+                        broker.getNereusGcDrainGraceSeconds(),
+                        "nereusGcDrainGraceSeconds"),
+                seconds(
+                        broker.getNereusPendingProtectionSeconds(),
+                        "nereusPendingProtectionSeconds"),
+                seconds(
+                        broker.getNereusOrphanGraceSeconds(),
+                        "nereusOrphanGraceSeconds"),
+                seconds(
+                        broker.getNereusGcTombstoneAuditGraceSeconds(),
+                        "nereusGcTombstoneAuditGraceSeconds"),
+                seconds(
+                        broker.getNereusGcOperationTimeoutSeconds(),
+                        "nereusGcOperationTimeoutSeconds"),
+                seconds(
+                        broker.getNereusGcCloseTimeoutSeconds(),
+                        "nereusGcCloseTimeoutSeconds"));
         return new NereusRuntimeConfiguration(
                 oxia,
                 objectStore,
@@ -293,7 +350,8 @@ public final class NereusBrokerStorageConfiguration {
                 cursorMetadata,
                 cursorStorage,
                 materialization,
-                retention);
+                retention,
+                physicalGc);
     }
 
     public String runtimeProviderClassName() {
