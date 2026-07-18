@@ -197,6 +197,11 @@ public final class NereusManagedLedgerStorage implements ManagedLedgerStorage {
         return capabilityCoordinator;
     }
 
+    public boolean generationProtocolEnabled() {
+        ensureReady();
+        return generationProtocolEnabled;
+    }
+
     public void attachGenerationRegistrationBackfill(
             TenantResources tenantResources,
             NamespaceResources namespaceResources,
@@ -336,13 +341,40 @@ public final class NereusManagedLedgerStorage implements ManagedLedgerStorage {
                     || !StorageClassBindingRecord.NEREUS.equals(current.storageClass())) {
                 return CompletableFuture.completedFuture(null);
             }
+            return validateBoundNereusAdminOperation(
+                    operation,
+                    generationProtocolEnabled,
+                    capabilityCoordinator::requireGenerationReadiness);
+        });
+    }
+
+    static CompletableFuture<Void> validateBoundNereusAdminOperation(
+            NereusAdminOperation operation,
+            boolean generationProtocolEnabled,
+            Supplier<? extends CompletableFuture<?>> readiness) {
+        Objects.requireNonNull(operation, "operation");
+        Objects.requireNonNull(readiness, "readiness");
+        if (operation == NereusAdminOperation.TRIM_TOPIC && generationProtocolEnabled) {
+            final CompletableFuture<?> ready;
             try {
-                FEATURE_VALIDATOR.validateAdminOperation(operation);
-                return CompletableFuture.completedFuture(null);
-            } catch (NotAllowedException error) {
+                ready = Objects.requireNonNull(readiness.get(), "readiness future");
+            } catch (Throwable error) {
                 return CompletableFuture.failedFuture(error);
             }
-        });
+            return ready.thenCompose(ignored -> validateAdminOperation(operation, true));
+        }
+        return validateAdminOperation(operation, false);
+    }
+
+    private static CompletableFuture<Void> validateAdminOperation(
+            NereusAdminOperation operation,
+            boolean generationProtocolRuntimeReady) {
+        try {
+            FEATURE_VALIDATOR.validateAdminOperation(operation, generationProtocolRuntimeReady);
+            return CompletableFuture.completedFuture(null);
+        } catch (NotAllowedException error) {
+            return CompletableFuture.failedFuture(error);
+        }
     }
 
     @Override

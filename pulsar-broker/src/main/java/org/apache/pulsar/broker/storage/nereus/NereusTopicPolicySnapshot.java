@@ -35,6 +35,19 @@ public record NereusTopicPolicySnapshot(
         globalPolicies = clonePolicies(globalPolicies, true);
     }
 
+    /** Compares the complete policy authority tuple while deliberately ignoring mutable config object identity. */
+    public boolean hasSamePolicyInputs(NereusTopicPolicySnapshot other) {
+        NereusTopicPolicySnapshot exact = java.util.Objects.requireNonNull(other, "other");
+        return namespacePolicies.equals(exact.namespacePolicies)
+                && localPolicies.equals(exact.localPolicies)
+                && globalPolicies.equals(exact.globalPolicies)
+                && openContext.features().equals(exact.openContext.features())
+                && openContext.retentionPolicy().equals(exact.openContext.retentionPolicy())
+                && java.util.Objects.equals(
+                        openContext.managedLedgerConfig().getStorageClassName(),
+                        exact.openContext.managedLedgerConfig().getStorageClassName());
+    }
+
     private static Optional<TopicPolicies> clonePolicies(
             Optional<TopicPolicies> policies, boolean global) {
         java.util.Objects.requireNonNull(policies, "policies");

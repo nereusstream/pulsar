@@ -28,7 +28,7 @@ import org.apache.pulsar.common.api.proto.MessageMetadata;
 import org.apache.pulsar.common.naming.TopicName;
 import org.apache.pulsar.common.protocol.Commands;
 
-/** Closed F3 topic, subscription, and admin admission gate for the Nereus storage class. */
+/** Closed F4 topic, subscription, and admin admission gate for the Nereus storage class. */
 public final class NereusTopicFeatureValidator {
     public void validateTopicOpen(
             TopicName topic,
@@ -41,8 +41,12 @@ public final class NereusTopicFeatureValidator {
         reject(!features.remoteReplicationClusters().isEmpty(), "GEO_REPLICATION");
         reject(features.deduplicationEnabled(), "DEDUPLICATION");
         reject(features.compactionThresholdBytes() != 0, "COMPACTION");
-        reject(features.retentionEnabled(), "RETENTION");
-        reject(features.backlogEvictionEnabled(), "BACKLOG_EVICTION");
+        reject(features.timeBacklogEvictionEnabled()
+                        && !features.preciseTimeBasedBacklogQuotaCheck(),
+                "BACKLOG_TIME_EVICTION_REQUIRES_PRECISE_CHECK");
+        reject(features.requiresGenerationProtocolRuntime()
+                        && !features.generationProtocolRuntimeReady(),
+                "GENERATION_PROTOCOL_NOT_READY");
         reject(features.pulsarOffloadEnabled(), "PULSAR_OFFLOAD");
         reject(features.entryFiltersEnabled(), "ENTRY_FILTERS");
         reject(features.shadowOrMigrationEnabled(), "SHADOW_OR_MIGRATION");
@@ -114,15 +118,30 @@ public final class NereusTopicFeatureValidator {
         throw new NotAllowedException("NEREUS_UNSUPPORTED_TRANSACTION");
     }
 
-    public void validateAdminOperation(NereusAdminOperation operation) throws NotAllowedException {
+    public void validateAdminOperation(
+            NereusAdminOperation operation,
+            NereusResolvedTopicFeatures features) throws NotAllowedException {
+        java.util.Objects.requireNonNull(features, "features");
+        validateAdminOperation(operation, features.generationProtocolRuntimeReady());
+    }
+
+    public void validateAdminOperation(
+            NereusAdminOperation operation,
+            boolean generationProtocolRuntimeReady) throws NotAllowedException {
         java.util.Objects.requireNonNull(operation, "operation");
         switch (operation) {
             case TERMINATE_TOPIC, DELETE_TOPIC, UNLOAD_TOPIC, DELETE_DURABLE_SUBSCRIPTION,
                     ANALYZE_BACKLOG, CLEAR_BACKLOG, SKIP_MESSAGES, EXPIRE_MESSAGES, RESET_CURSOR -> {
                 return;
             }
+            case TRIM_TOPIC -> {
+                if (!generationProtocolRuntimeReady) {
+                    throw new NotAllowedException(
+                            "NEREUS_UNSUPPORTED_ADMIN_OPERATION:TRIM_TOPIC:GENERATION_PROTOCOL_NOT_READY");
+                }
+            }
             case TRIGGER_COMPACTION, READ_COMPACTION_STATUS, TRIGGER_OFFLOAD, READ_OFFLOAD_STATUS,
-                    TRIM_TOPIC, TRUNCATE_TOPIC, SET_SHADOW_TOPICS, MIGRATE_TOPIC -> throw new NotAllowedException(
+                    TRUNCATE_TOPIC, SET_SHADOW_TOPICS, MIGRATE_TOPIC -> throw new NotAllowedException(
                             "NEREUS_UNSUPPORTED_ADMIN_OPERATION:" + operation.name());
         }
     }

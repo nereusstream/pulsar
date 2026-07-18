@@ -4949,7 +4949,9 @@ public class PersistentTopicsBase extends AdminResource {
                     "Trim on a non-persistent topic is not allowed"));
             return null;
         }
-        CompletableFuture<Void> future = validateTopicOperationAsync(topicName, TopicOperation.TRIM_TOPIC);
+        CompletableFuture<Void> future = validateTopicOperationAsync(topicName, TopicOperation.TRIM_TOPIC)
+                .thenCompose(ignored -> validateNereusAdminOperationForLoadedOrBoundTopic(
+                        NereusAdminOperation.TRIM_TOPIC));
         if (topicName.isPartitioned()) {
             return future.thenCompose((x)
                     -> trimNonPartitionedTopic(asyncResponse, topicName, authoritative));

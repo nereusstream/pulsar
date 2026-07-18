@@ -30,6 +30,7 @@ import com.google.common.annotations.VisibleForTesting;
 import com.google.common.collect.Queues;
 import com.google.common.util.concurrent.RateLimiter;
 import com.nereusstream.managedledger.NereusManagedLedger;
+import com.nereusstream.managedledger.retention.RetentionPolicySnapshot;
 import io.github.merlimat.slog.LoggerBuilder;
 import io.netty.bootstrap.ServerBootstrap;
 import io.netty.buffer.ByteBuf;
@@ -2705,12 +2706,16 @@ public class BrokerService implements Closeable {
                     topicP,
                     globalTopicP,
                     topicName);
+            RetentionPolicySnapshot retentionPolicy =
+                    RetentionPolicySnapshot.fromCanonicalMinutesAndMebibytes(
+                            retentionPolicies.getRetentionTimeInMinutes(),
+                            retentionPolicies.getRetentionSizeInMB());
             return new NereusTopicPolicySnapshot(
-                    new NereusTopicOpenContext(managedLedgerConfig, features),
+                    new NereusTopicOpenContext(managedLedgerConfig, features, retentionPolicy),
                     namespacePolicies,
                     topicP,
                     globalTopicP);
-        }).exceptionally(ex -> {
+        }).thenCompose(this::resolveNereusGenerationReadiness).exceptionally(ex -> {
             final Throwable rc = FutureUtil.unwrapCompletionException(ex);
             log.error().attr("topic", topicName)
                     .exceptionMessage(rc)
@@ -2724,6 +2729,31 @@ public class BrokerService implements Closeable {
             throw FutureUtil.wrapToCompletionException(
                     new ServiceUnitNotReadyException(errorInfo));
         });
+    }
+
+    private CompletableFuture<NereusTopicPolicySnapshot> resolveNereusGenerationReadiness(
+            NereusTopicPolicySnapshot snapshot) {
+        NereusTopicOpenContext openContext = snapshot.openContext();
+        if (!StorageClassBindingRecord.NEREUS.equals(
+                openContext.managedLedgerConfig().getStorageClassName())) {
+            return CompletableFuture.completedFuture(snapshot);
+        }
+        if (!(managedLedgerStorage instanceof NereusManagedLedgerStorage nereusStorage)) {
+            return FutureUtil.failedFuture(new IllegalStateException(
+                    "Nereus topic policy resolved without the Nereus managed-ledger storage provider"));
+        }
+        if (!nereusStorage.generationProtocolEnabled()) {
+            return CompletableFuture.completedFuture(snapshot);
+        }
+        return nereusStorage.capabilityCoordinator().requireGenerationReadiness()
+                .thenApply(ignored -> new NereusTopicPolicySnapshot(
+                        new NereusTopicOpenContext(
+                                openContext.managedLedgerConfig(),
+                                openContext.features().withGenerationProtocolRuntimeReady(true),
+                                openContext.retentionPolicy()),
+                        snapshot.namespacePolicies(),
+                        snapshot.localPolicies(),
+                        snapshot.globalPolicies()));
     }
 
     private void addTopicToStatsMaps(TopicName topicName, Topic topic) {

@@ -25,12 +25,16 @@ import static org.mockito.Mockito.doReturn;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.spy;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 import com.nereusstream.api.AppendAttemptId;
 import com.nereusstream.managedledger.NereusManagedLedger;
 import com.nereusstream.managedledger.NereusWriteFenceResolution;
 import com.nereusstream.managedledger.NereusWriteFenceSnapshot;
+import com.nereusstream.managedledger.retention.RetentionPolicySnapshot;
+import java.util.EnumMap;
+import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
@@ -50,25 +54,31 @@ import org.apache.pulsar.broker.storage.nereus.NereusAdminOperation;
 import org.apache.pulsar.broker.storage.nereus.NereusResolvedTopicFeatures;
 import org.apache.pulsar.broker.storage.nereus.NereusTopicOpenContext;
 import org.apache.pulsar.broker.storage.nereus.NereusTopicPolicySnapshot;
+import org.apache.pulsar.common.naming.TopicName;
+import org.apache.pulsar.common.policies.data.BacklogQuota;
+import org.apache.pulsar.common.policies.data.BacklogQuota.BacklogQuotaType;
 import org.apache.pulsar.common.policies.data.Policies;
+import org.apache.pulsar.common.policies.data.RetentionPolicies;
 import org.testng.annotations.Test;
 
 public class PersistentTopicNereusAdmissionTest {
     @Test
     public void gatesAdminOperationsOnlyForNereusLedger() throws Exception {
         BrokerService brokerService = brokerService();
+        NereusManagedLedger ledger = mock(NereusManagedLedger.class);
         PersistentTopic nereusTopic = new PersistentTopic(
                 "persistent://tenant/ns/nereus",
                 brokerService,
-                mock(NereusManagedLedger.class),
+                ledger,
                 mock(MessageDeduplication.class));
+        RetentionPolicySnapshot disabled = retention(0, 0);
         nereusTopic.installNereusTopicOpenContext(new NereusTopicOpenContext(
-                new ManagedLedgerConfig(),
-                new NereusResolvedTopicFeatures(
-                        Set.of(), false, 0, 0, 0, false, false, false, false, false, false)));
+                new ManagedLedgerConfig(), safeFeatures(true), disabled));
 
         assertThat(nereusTopic.isNereusManagedLedger()).isTrue();
+        verify(ledger).installRetentionPolicy(disabled);
         nereusTopic.validateNereusAdminOperation(NereusAdminOperation.TERMINATE_TOPIC).get();
+        nereusTopic.validateNereusAdminOperation(NereusAdminOperation.TRIM_TOPIC).get();
         assertThatThrownBy(() -> nereusTopic
                 .validateNereusAdminOperation(NereusAdminOperation.TRUNCATE_TOPIC).get())
                 .hasRootCauseMessage("NEREUS_UNSUPPORTED_ADMIN_OPERATION:TRUNCATE_TOPIC");
@@ -93,19 +103,65 @@ public class PersistentTopicNereusAdmissionTest {
                 mock(MessageDeduplication.class));
         topic.installNereusTopicOpenContext(new NereusTopicOpenContext(
                 new ManagedLedgerConfig(),
-                safeFeatures()));
+                safeFeatures(false),
+                retention(0, 0)));
         ManagedLedgerConfig unsafeConfig = new ManagedLedgerConfig();
         unsafeConfig.setStorageClassName("nereus");
         NereusResolvedTopicFeatures unsafeFeatures = new NereusResolvedTopicFeatures(
-                Set.of(), false, 1, 1, 0, true, false, false, false, false, false);
+                Set.of(), false, 1, 1, 0,
+                Optional.of(new RetentionPolicies(30, 64)), disabledBacklogQuotas(), false,
+                false, false, false, false, false);
 
         assertThatThrownBy(() -> topic.applyNereusPolicySnapshot(new NereusTopicPolicySnapshot(
-                new NereusTopicOpenContext(unsafeConfig, unsafeFeatures),
+                new NereusTopicOpenContext(unsafeConfig, unsafeFeatures, retention(30, 64)),
                 new Policies(),
                 java.util.Optional.empty(),
                 java.util.Optional.empty())))
-                .hasRootCauseMessage("NEREUS_UNSUPPORTED_TOPIC_FEATURE:RETENTION");
+                .hasRootCauseMessage("NEREUS_UNSUPPORTED_TOPIC_FEATURE:GENERATION_PROTOCOL_NOT_READY");
         verify(ledger, never()).setConfig(any());
+    }
+
+    @Test
+    public void generationPolicyPreparationWaitsForMarkerAdmissionAndStablePolicyReload() {
+        BrokerService brokerService = brokerService();
+        NereusManagedLedger ledger = mock(NereusManagedLedger.class);
+        PersistentTopic topic = new PersistentTopic(
+                "persistent://tenant/ns/nereus-retention-policy",
+                brokerService,
+                ledger,
+                mock(MessageDeduplication.class));
+        topic.installNereusTopicOpenContext(new NereusTopicOpenContext(
+                new ManagedLedgerConfig(),
+                safeFeatures(false),
+                retention(0, 0)));
+        ManagedLedgerConfig config = new ManagedLedgerConfig();
+        config.setStorageClassName("nereus");
+        RetentionPolicySnapshot activeRetention = retention(30, 64);
+        NereusTopicPolicySnapshot snapshot = new NereusTopicPolicySnapshot(
+                new NereusTopicOpenContext(
+                        config,
+                        retentionFeatures(new RetentionPolicies(30, 64), true),
+                        activeRetention),
+                new Policies(),
+                Optional.empty(),
+                Optional.empty());
+        CompletableFuture<Void> markerAdmission = new CompletableFuture<>();
+        when(ledger.ensureGenerationProtocolReadyForPolicy()).thenReturn(markerAdmission);
+        TopicName topicName = TopicName.get(topic.getName());
+        when(brokerService.getNereusTopicPolicySnapshot(topicName)).thenReturn(
+                CompletableFuture.completedFuture(snapshot),
+                CompletableFuture.completedFuture(snapshot));
+
+        CompletableFuture<NereusTopicPolicySnapshot> prepared =
+                topic.loadPreparedNereusPolicySnapshot(topicName, 0);
+
+        assertThat(prepared).isNotDone();
+        verify(brokerService).getNereusTopicPolicySnapshot(topicName);
+        verify(ledger, never()).installRetentionPolicy(activeRetention);
+        markerAdmission.complete(null);
+        assertThat(prepared.join()).isSameAs(snapshot);
+        verify(brokerService, times(2)).getNereusTopicPolicySnapshot(topicName);
+        verify(ledger, never()).installRetentionPolicy(activeRetention);
     }
 
     @Test
@@ -245,9 +301,33 @@ public class PersistentTopicNereusAdmissionTest {
         return brokerService;
     }
 
-    private static NereusResolvedTopicFeatures safeFeatures() {
+    private static NereusResolvedTopicFeatures safeFeatures(boolean generationReady) {
+        return retentionFeatures(new RetentionPolicies(0, 0), generationReady);
+    }
+
+    private static NereusResolvedTopicFeatures retentionFeatures(
+            RetentionPolicies retention,
+            boolean generationReady) {
         return new NereusResolvedTopicFeatures(
-                Set.of(), false, 0, 0, 0, false, false, false, false, false, false);
+                Set.of(), false, 0, 0, 0,
+                Optional.of(retention), disabledBacklogQuotas(), false,
+                false, false, false, false, generationReady);
+    }
+
+    private static Map<BacklogQuotaType, BacklogQuota> disabledBacklogQuotas() {
+        EnumMap<BacklogQuotaType, BacklogQuota> quotas = new EnumMap<>(BacklogQuotaType.class);
+        for (BacklogQuotaType type : BacklogQuotaType.values()) {
+            quotas.put(type, BacklogQuota.builder()
+                    .limitSize(-1)
+                    .limitTime(-1)
+                    .retentionPolicy(BacklogQuota.RetentionPolicy.producer_request_hold)
+                    .build());
+        }
+        return quotas;
+    }
+
+    private static RetentionPolicySnapshot retention(long minutes, long mebibytes) {
+        return RetentionPolicySnapshot.fromCanonicalMinutesAndMebibytes(minutes, mebibytes);
     }
 
     private static Optional<NereusWriteFenceSnapshot> fence(long generation) {

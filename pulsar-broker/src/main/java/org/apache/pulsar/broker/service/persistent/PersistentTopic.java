@@ -503,6 +503,7 @@ public class PersistentTopic extends AbstractTopic implements Topic, AddEntryCal
         if (nereusFeatures != null) {
             throw new IllegalStateException("Nereus topic context is already installed");
         }
+        ((NereusManagedLedger) ledger).installRetentionPolicy(openContext.retentionPolicy());
         nereusFeatures = openContext.features();
     }
 
@@ -5082,7 +5083,7 @@ public class PersistentTopic extends AbstractTopic implements Topic, AddEntryCal
     private CompletableFuture<Void> refreshNereusPolicies() {
         TopicName topicName = TopicName.get(topic);
         return nereusPolicyUpdateCoordinator.refresh(
-                        () -> brokerService.getNereusTopicPolicySnapshot(topicName),
+                        () -> loadPreparedNereusPolicySnapshot(topicName, 0),
                         getPoliciesNotifyThread(),
                         snapshot -> {
                             applyNereusPolicySnapshot(snapshot);
@@ -5099,6 +5100,46 @@ public class PersistentTopic extends AbstractTopic implements Topic, AddEntryCal
                     });
                     return FutureUtil.failedFuture(cause);
                 });
+    }
+
+    @VisibleForTesting
+    CompletableFuture<NereusTopicPolicySnapshot> loadPreparedNereusPolicySnapshot(
+            TopicName topicName,
+            int attempt) {
+        if (attempt >= 4) {
+            return FutureUtil.failedFuture(new NotAllowedException(
+                    "NEREUS_TOPIC_POLICY_DID_NOT_STABILIZE_DURING_GENERATION_ADMISSION"));
+        }
+        return brokerService.getNereusTopicPolicySnapshot(topicName)
+                .thenCompose(snapshot -> prepareNereusPolicySnapshot(snapshot)
+                        .thenCompose(ignored -> {
+                            if (!snapshot.openContext().features().requiresGenerationProtocolRuntime()) {
+                                return CompletableFuture.completedFuture(snapshot);
+                            }
+                            return brokerService.getNereusTopicPolicySnapshot(topicName)
+                                    .thenCompose(reloaded -> snapshot.hasSamePolicyInputs(reloaded)
+                                            ? CompletableFuture.completedFuture(reloaded)
+                                            : loadPreparedNereusPolicySnapshot(topicName, attempt + 1));
+                        }));
+    }
+
+    private CompletableFuture<Void> prepareNereusPolicySnapshot(
+            NereusTopicPolicySnapshot snapshot) {
+        NereusTopicOpenContext openContext = snapshot.openContext();
+        try {
+            if (!StorageClassBindingRecord.NEREUS.equals(
+                    openContext.managedLedgerConfig().getStorageClassName())) {
+                throw new NotAllowedException("NEREUS_STORAGE_CLASS_CHANGE_NOT_SUPPORTED");
+            }
+            NEREUS_FEATURE_VALIDATOR.validateTopicOpen(
+                    TopicName.get(topic), openContext.managedLedgerConfig(), openContext.features());
+        } catch (NotAllowedException error) {
+            return FutureUtil.failedFuture(error);
+        }
+        if (!openContext.features().requiresGenerationProtocolRuntime()) {
+            return CompletableFuture.completedFuture(null);
+        }
+        return ((NereusManagedLedger) ledger).ensureGenerationProtocolReadyForPolicy();
     }
 
     @VisibleForTesting
@@ -5126,6 +5167,7 @@ public class PersistentTopic extends AbstractTopic implements Topic, AddEntryCal
         snapshot.localPolicies().ifPresent(this::updateTopicPolicy);
 
         ledger.setConfig(openContext.managedLedgerConfig());
+        ((NereusManagedLedger) ledger).installRetentionPolicy(openContext.retentionPolicy());
         nereusFeatures = openContext.features();
         nereusPolicyAdmissionFailed = false;
         shadowTopics = Collections.emptyList();
@@ -5143,7 +5185,7 @@ public class PersistentTopic extends AbstractTopic implements Topic, AddEntryCal
         }
         try {
             requireNereusAdmissionContext();
-            NEREUS_FEATURE_VALIDATOR.validateAdminOperation(operation);
+            NEREUS_FEATURE_VALIDATOR.validateAdminOperation(operation, nereusFeatures);
             return CompletableFuture.completedFuture(null);
         } catch (NotAllowedException error) {
             return FutureUtil.failedFuture(error);
