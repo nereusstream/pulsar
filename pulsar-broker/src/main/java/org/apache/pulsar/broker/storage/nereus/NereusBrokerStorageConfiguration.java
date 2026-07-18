@@ -22,6 +22,7 @@ import com.nereusstream.api.StorageProfile;
 import com.nereusstream.core.StreamStorageConfig;
 import com.nereusstream.managedledger.NereusManagedLedgerFactoryConfig;
 import com.nereusstream.managedledger.cursor.CursorStorageConfig;
+import com.nereusstream.managedledger.retention.NereusRetentionConfig;
 import com.nereusstream.materialization.MaterializationConfig;
 import com.nereusstream.materialization.MaterializationPolicyFactory;
 import com.nereusstream.metadata.oxia.CursorMetadataStoreConfig;
@@ -266,6 +267,23 @@ public final class NereusBrokerStorageConfiguration {
                         "nereusRecoveryCheckpointMaxEntries"),
                 positive(broker.getNereusRecoveryCheckpointMaxBytes(),
                         "nereusRecoveryCheckpointMaxBytes"));
+        NereusRetentionConfig retention = new NereusRetentionConfig(
+                positiveAtMost(
+                        broker.getNereusRetentionStatsScanPageSize(),
+                        NereusRetentionConfig.MAX_STATS_SCAN_PAGE_SIZE,
+                        "nereusRetentionStatsScanPageSize"),
+                positive(
+                        broker.getNereusRetentionMaxConcurrentPlans(),
+                        "nereusRetentionMaxConcurrentPlans"),
+                positive(
+                        broker.getNereusRetentionMaxQueuedPlans(),
+                        "nereusRetentionMaxQueuedPlans"),
+                seconds(
+                        broker.getNereusRetentionOperationTimeoutSeconds(),
+                        "nereusRetentionOperationTimeoutSeconds"),
+                seconds(
+                        broker.getNereusRetentionCloseTimeoutSeconds(),
+                        "nereusRetentionCloseTimeoutSeconds"));
         return new NereusRuntimeConfiguration(
                 oxia,
                 objectStore,
@@ -274,7 +292,8 @@ public final class NereusBrokerStorageConfiguration {
                 projection,
                 cursorMetadata,
                 cursorStorage,
-                materialization);
+                materialization,
+                retention);
     }
 
     public String runtimeProviderClassName() {
