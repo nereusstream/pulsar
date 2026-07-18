@@ -65,7 +65,8 @@ public class NereusBrokerStorageConfigurationCursorTest {
                 .hasMessageContaining("cursor scan page");
 
         ServiceConfiguration snapshotDeadline = validConfiguration();
-        snapshotDeadline.setNereusCursorSnapshotOperationTimeoutSeconds(76);
+        snapshotDeadline.setNereusCursorSnapshotOperationTimeoutSeconds(
+                Math.addExact(snapshotDeadline.getNereusCloseTimeoutSeconds(), 1));
         assertThatThrownBy(() -> runtime(snapshotDeadline))
                 .hasMessageContaining("snapshot timeout");
 
