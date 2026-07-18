@@ -364,8 +364,9 @@ public final class NereusBrokerStorageConfiguration {
     }
 
     public int generationRegistrationBackfillConcurrency() {
-        return positive(
+        return positiveAtMost(
                 broker.getNereusGenerationRegistrationBackfillConcurrency(),
+                GenerationRegistrationBackfillRequest.MAX_CONCURRENCY,
                 "nereusGenerationRegistrationBackfillConcurrency");
     }
 

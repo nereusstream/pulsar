@@ -292,10 +292,18 @@ public final class NereusManagedLedgerStorage implements ManagedLedgerStorage {
 
     public CompletableFuture<Void> completeGenerationRegistrationBackfill(
             GenerationRegistrationBackfillCompletion completion) {
+        return completeGenerationRegistrationBackfill(
+                completion, 1, Duration.ofHours(1));
+    }
+
+    public CompletableFuture<Void> completeGenerationRegistrationBackfill(
+            GenerationRegistrationBackfillCompletion completion,
+            int maxConcurrentStreams,
+            Duration timeout) {
         try {
             ensureReady();
             return nereusFactory.completeGenerationRegistrationBackfill(
-                    completion);
+                    completion, maxConcurrentStreams, timeout);
         } catch (Throwable error) {
             return CompletableFuture.failedFuture(error);
         }
