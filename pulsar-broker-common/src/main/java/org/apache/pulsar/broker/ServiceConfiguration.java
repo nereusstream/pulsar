@@ -2900,6 +2900,21 @@ public class ServiceConfiguration implements PulsarConfiguration {
     @FieldContext(category = CATEGORY_STORAGE_ML,
             doc = "Maximum bytes in one Nereus recovery checkpoint")
     private long nereusRecoveryCheckpointMaxBytes = 1073741824;
+    @FieldContext(category = CATEGORY_STORAGE_ML,
+            doc = "Nereus logical-retention metadata statistics scan page size")
+    private int nereusRetentionStatsScanPageSize = 512;
+    @FieldContext(category = CATEGORY_STORAGE_ML,
+            doc = "Maximum concurrent Nereus logical-retention plans")
+    private int nereusRetentionMaxConcurrentPlans = 4;
+    @FieldContext(category = CATEGORY_STORAGE_ML,
+            doc = "Maximum queued Nereus logical-retention plans")
+    private int nereusRetentionMaxQueuedPlans = 1024;
+    @FieldContext(category = CATEGORY_STORAGE_ML,
+            doc = "Nereus logical-retention operation timeout in seconds")
+    private long nereusRetentionOperationTimeoutSeconds = 60;
+    @FieldContext(category = CATEGORY_STORAGE_ML,
+            doc = "Nereus logical-retention lane close timeout in seconds")
+    private long nereusRetentionCloseTimeoutSeconds = 120;
     @FieldContext(
         category = CATEGORY_STORAGE_ML,
         doc = "Number of threads to be used for managed ledger scheduled tasks"

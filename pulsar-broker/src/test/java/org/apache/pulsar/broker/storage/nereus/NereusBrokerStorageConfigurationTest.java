@@ -56,6 +56,13 @@ public class NereusBrokerStorageConfigurationTest {
                 .isEqualTo(java.time.Duration.ofMillis(25));
         assertThat(runtime.materialization().stagingDirectory().getFileName().toString())
                 .isEqualTo(identity.processRunId());
+        assertThat(runtime.retention().statsScanPageSize()).isEqualTo(512);
+        assertThat(runtime.retention().maxConcurrentPlans()).isEqualTo(4);
+        assertThat(runtime.retention().maxQueuedPlans()).isEqualTo(1024);
+        assertThat(runtime.retention().operationTimeout())
+                .isEqualTo(java.time.Duration.ofSeconds(60));
+        assertThat(runtime.retention().closeTimeout())
+                .isEqualTo(java.time.Duration.ofSeconds(120));
         assertThat(checked.generationRegistrationBackfillConcurrency())
                 .isEqualTo(16);
         assertThat(checked.generationRegistrationBackfillTimeout())
@@ -142,6 +149,26 @@ public class NereusBrokerStorageConfigurationTest {
                                 new SecureRandom())))
                 .isInstanceOf(IllegalArgumentException.class)
                 .hasMessageContaining("RegistryScanPageSize");
+
+        ServiceConfiguration oversizedRetentionPage = validConfiguration();
+        oversizedRetentionPage.setNereusRetentionStatsScanPageSize(513);
+        assertThatThrownBy(() -> new NereusBrokerStorageConfiguration(
+                        oversizedRetentionPage)
+                .runtimeConfiguration(
+                        NereusProcessIdentity.generate(
+                                new SecureRandom())))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("RetentionStatsScanPageSize");
+
+        ServiceConfiguration invalidRetentionDeadline = validConfiguration();
+        invalidRetentionDeadline.setNereusRetentionOperationTimeoutSeconds(121);
+        assertThatThrownBy(() -> new NereusBrokerStorageConfiguration(
+                        invalidRetentionDeadline)
+                .runtimeConfiguration(
+                        NereusProcessIdentity.generate(
+                                new SecureRandom())))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("retention operation timeout");
     }
 
     private static ServiceConfiguration validConfiguration() {
