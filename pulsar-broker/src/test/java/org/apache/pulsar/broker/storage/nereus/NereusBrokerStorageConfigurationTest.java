@@ -63,6 +63,34 @@ public class NereusBrokerStorageConfigurationTest {
                 .isEqualTo(java.time.Duration.ofSeconds(60));
         assertThat(runtime.retention().closeTimeout())
                 .isEqualTo(java.time.Duration.ofSeconds(120));
+        assertThat(runtime.physicalGc().enabled()).isFalse();
+        assertThat(runtime.physicalGc().dryRun()).isTrue();
+        assertThat(runtime.physicalGc().metadataScanPageSize()).isEqualTo(1000);
+        assertThat(runtime.physicalGc().objectListPageSize()).isEqualTo(1000);
+        assertThat(runtime.physicalGc().maxConcurrentDeletes()).isEqualTo(4);
+        assertThat(runtime.physicalGc().maxStreamsPerCandidate()).isEqualTo(1024);
+        assertThat(runtime.physicalGc().maxAuthoritiesPerDomainSnapshot()).isEqualTo(100000);
+        assertThat(runtime.physicalGc().maxReferencesPerDomainSnapshot()).isEqualTo(100000);
+        assertThat(runtime.physicalGc().scanInterval())
+                .isEqualTo(java.time.Duration.ofSeconds(60));
+        assertThat(runtime.physicalGc().readerLeaseDuration())
+                .isEqualTo(java.time.Duration.ofSeconds(120));
+        assertThat(runtime.physicalGc().readerLeaseRenewInterval())
+                .isEqualTo(java.time.Duration.ofSeconds(30));
+        assertThat(runtime.physicalGc().maximumClockSkew())
+                .isEqualTo(java.time.Duration.ofSeconds(5));
+        assertThat(runtime.physicalGc().drainGrace())
+                .isEqualTo(java.time.Duration.ofSeconds(300));
+        assertThat(runtime.physicalGc().pendingProtectionDuration())
+                .isEqualTo(java.time.Duration.ofSeconds(300));
+        assertThat(runtime.physicalGc().orphanGrace())
+                .isEqualTo(java.time.Duration.ofDays(1));
+        assertThat(runtime.physicalGc().tombstoneAuditGrace())
+                .isEqualTo(java.time.Duration.ofDays(7));
+        assertThat(runtime.physicalGc().operationTimeout())
+                .isEqualTo(java.time.Duration.ofSeconds(60));
+        assertThat(runtime.physicalGc().closeTimeout())
+                .isEqualTo(java.time.Duration.ofSeconds(300));
         assertThat(checked.generationRegistrationBackfillConcurrency())
                 .isEqualTo(16);
         assertThat(checked.generationRegistrationBackfillTimeout())
@@ -73,6 +101,11 @@ public class NereusBrokerStorageConfigurationTest {
 
         broker.setNereusGenerationProtocolEnabled(true);
         assertThat(checked.generationProtocolEnabled()).isTrue();
+
+        broker.setNereusPhysicalGcEnabled(true);
+        broker.setNereusPhysicalGcDryRun(false);
+        assertThat(checked.runtimeConfiguration(identity).physicalGc().mutationsAllowed())
+                .isTrue();
 
         broker.setNereusDefaultStorageProfile(
                 StorageProfile.OBJECT_WAL_ASYNC_OBJECT.name());
@@ -169,6 +202,26 @@ public class NereusBrokerStorageConfigurationTest {
                                 new SecureRandom())))
                 .isInstanceOf(IllegalArgumentException.class)
                 .hasMessageContaining("retention operation timeout");
+
+        ServiceConfiguration oversizedGcPage = validConfiguration();
+        oversizedGcPage.setNereusGcMetadataScanPageSize(1001);
+        assertThatThrownBy(() -> new NereusBrokerStorageConfiguration(
+                        oversizedGcPage)
+                .runtimeConfiguration(
+                        NereusProcessIdentity.generate(
+                                new SecureRandom())))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("nereusGcMetadataScanPageSize");
+
+        ServiceConfiguration invalidGcLease = validConfiguration();
+        invalidGcLease.setNereusGcOperationTimeoutSeconds(115);
+        assertThatThrownBy(() -> new NereusBrokerStorageConfiguration(
+                        invalidGcLease)
+                .runtimeConfiguration(
+                        NereusProcessIdentity.generate(
+                                new SecureRandom())))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("shorter than readerLeaseDuration");
     }
 
     private static ServiceConfiguration validConfiguration() {

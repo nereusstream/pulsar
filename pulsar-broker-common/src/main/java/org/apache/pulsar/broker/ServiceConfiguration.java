@@ -2730,6 +2730,12 @@ public class ServiceConfiguration implements PulsarConfiguration {
     @FieldContext(category = CATEGORY_STORAGE_ML,
             doc = "Allow first Nereus topic generation-protocol activation after cluster publication readiness")
     private boolean nereusGenerationProtocolEnabled = false;
+    @FieldContext(category = CATEGORY_STORAGE_ML,
+            doc = "Enable the Nereus physical-GC lifecycle; durable cluster deletion authority remains mandatory")
+    private boolean nereusPhysicalGcEnabled = false;
+    @FieldContext(category = CATEGORY_STORAGE_ML,
+            doc = "Run Nereus physical GC in observation-only mode without MARK or DELETE mutations")
+    private boolean nereusPhysicalGcDryRun = true;
     @FieldContext(category = CATEGORY_STORAGE_ML, doc = "Maximum encoded Nereus projection value bytes")
     private int nereusProjectionMetadataMaxValueBytes = 65536;
     @FieldContext(category = CATEGORY_STORAGE_ML, doc = "Maximum pending Nereus cursor metadata operations")
@@ -2840,6 +2846,43 @@ public class ServiceConfiguration implements PulsarConfiguration {
     private long nereusMaterializationWorkerRenewSeconds = 30;
     @FieldContext(category = CATEGORY_STORAGE_ML, doc = "Maximum admitted Nereus clock skew in seconds")
     private long nereusMaximumClockSkewSeconds = 5;
+    @FieldContext(category = CATEGORY_STORAGE_ML, doc = "Nereus physical-object reader lease duration in seconds")
+    private long nereusReaderLeaseSeconds = 120;
+    @FieldContext(category = CATEGORY_STORAGE_ML,
+            doc = "Nereus physical-object reader lease renewal interval in seconds")
+    private long nereusReaderLeaseRenewSeconds = 30;
+    @FieldContext(category = CATEGORY_STORAGE_ML, doc = "Nereus physical-GC complete-pass interval in seconds")
+    private long nereusGcScanIntervalSeconds = 60;
+    @FieldContext(category = CATEGORY_STORAGE_ML, doc = "Nereus physical-GC metadata scan page size")
+    private int nereusGcMetadataScanPageSize = 1000;
+    @FieldContext(category = CATEGORY_STORAGE_ML, doc = "Nereus physical-GC object-list page size")
+    private int nereusGcObjectListPageSize = 1000;
+    @FieldContext(category = CATEGORY_STORAGE_ML,
+            doc = "Maximum concurrent Nereus physical-object retirement operations")
+    private int nereusGcMaxConcurrentDeletes = 4;
+    @FieldContext(category = CATEGORY_STORAGE_ML,
+            doc = "Maximum streams admitted by one Nereus ownerless GC candidate")
+    private int nereusGcMaxStreamsPerCandidate = 1024;
+    @FieldContext(category = CATEGORY_STORAGE_ML,
+            doc = "Maximum authority values in one Nereus GC domain snapshot")
+    private int nereusGcMaxAuthoritiesPerDomainSnapshot = 100000;
+    @FieldContext(category = CATEGORY_STORAGE_ML,
+            doc = "Maximum references in one Nereus GC domain snapshot")
+    private int nereusGcMaxReferencesPerDomainSnapshot = 100000;
+    @FieldContext(category = CATEGORY_STORAGE_ML, doc = "Nereus physical-GC operation timeout in seconds")
+    private long nereusGcOperationTimeoutSeconds = 60;
+    @FieldContext(category = CATEGORY_STORAGE_ML, doc = "Nereus physical-GC close timeout in seconds")
+    private long nereusGcCloseTimeoutSeconds = 300;
+    @FieldContext(category = CATEGORY_STORAGE_ML, doc = "Nereus physical-GC reader drain grace in seconds")
+    private long nereusGcDrainGraceSeconds = 300;
+    @FieldContext(category = CATEGORY_STORAGE_ML,
+            doc = "Nereus pending physical-object protection duration in seconds")
+    private long nereusPendingProtectionSeconds = 300;
+    @FieldContext(category = CATEGORY_STORAGE_ML, doc = "Nereus unreferenced-object grace in seconds")
+    private long nereusOrphanGraceSeconds = 86400;
+    @FieldContext(category = CATEGORY_STORAGE_ML,
+            doc = "Nereus deleted-root and object-audit retirement grace in seconds")
+    private long nereusGcTombstoneAuditGraceSeconds = 604800;
     @FieldContext(category = CATEGORY_STORAGE_ML, doc = "Nereus materialization operation timeout in seconds")
     private long nereusMaterializationOperationTimeoutSeconds = 60;
     @FieldContext(category = CATEGORY_STORAGE_ML, doc = "Nereus materialization close timeout in seconds")
