@@ -22,6 +22,8 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import com.nereusstream.api.Checksum;
 import com.nereusstream.api.ChecksumType;
+import com.nereusstream.managedledger.generation.ManagedLedgerPhysicalDeletionActivationResult;
+import com.nereusstream.managedledger.generation.ManagedLedgerPhysicalDeletionActivationResult.Status;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
@@ -31,17 +33,24 @@ import org.testng.annotations.Test;
 public class NereusManagedLedgerStorageGenerationActivationTest {
     @Test
     public void disabledOrFailedBackfillNeverInvokesClusterActivation() {
-        AtomicInteger activations = new AtomicInteger();
+        AtomicInteger publications = new AtomicInteger();
+        AtomicInteger deletions = new AtomicInteger();
 
         GenerationRegistrationBackfillReport disabled =
                 NereusManagedLedgerStorage
                         .activateAfterSuccessfulBackfill(
                                 report(0),
                                 false,
+                                true,
                                 () -> {
-                                    activations.incrementAndGet();
+                                    publications.incrementAndGet();
                                     return CompletableFuture
                                             .completedFuture(null);
+                                },
+                                () -> {
+                                    deletions.incrementAndGet();
+                                    return CompletableFuture.completedFuture(
+                                            physicalActivation());
                                 })
                         .join();
         GenerationRegistrationBackfillReport failed =
@@ -49,16 +58,23 @@ public class NereusManagedLedgerStorageGenerationActivationTest {
                         .activateAfterSuccessfulBackfill(
                                 report(1),
                                 true,
+                                true,
                                 () -> {
-                                    activations.incrementAndGet();
+                                    publications.incrementAndGet();
                                     return CompletableFuture
                                             .completedFuture(null);
+                                },
+                                () -> {
+                                    deletions.incrementAndGet();
+                                    return CompletableFuture.completedFuture(
+                                            physicalActivation());
                                 })
                         .join();
 
         assertThat(disabled.failureCount()).isZero();
         assertThat(failed.failureCount()).isEqualTo(1);
-        assertThat(activations).hasValue(0);
+        assertThat(publications).hasValue(0);
+        assertThat(deletions).hasValue(0);
     }
 
     @Test
@@ -73,10 +89,41 @@ public class NereusManagedLedgerStorageGenerationActivationTest {
                                 .activateAfterSuccessfulBackfill(
                                         report,
                                         true,
-                                        () -> activation);
+                                        false,
+                                        () -> activation,
+                                        () -> CompletableFuture.completedFuture(
+                                                physicalActivation()));
 
         assertThat(result).isNotDone();
         activation.complete(null);
+        assertThat(result.join()).isSameAs(report);
+    }
+
+    @Test
+    public void physicalDeletionActivationRunsOnlyAfterPublicationAndIsAwaited() {
+        CompletableFuture<Void> publication = new CompletableFuture<>();
+        CompletableFuture<ManagedLedgerPhysicalDeletionActivationResult>
+                deletion = new CompletableFuture<>();
+        AtomicInteger deletionCalls = new AtomicInteger();
+        GenerationRegistrationBackfillReport report = report(0);
+
+        CompletableFuture<GenerationRegistrationBackfillReport> result =
+                NereusManagedLedgerStorage.activateAfterSuccessfulBackfill(
+                        report,
+                        true,
+                        true,
+                        () -> publication,
+                        () -> {
+                            deletionCalls.incrementAndGet();
+                            return deletion;
+                        });
+
+        assertThat(result).isNotDone();
+        assertThat(deletionCalls).hasValue(0);
+        publication.complete(null);
+        assertThat(deletionCalls).hasValue(1);
+        assertThat(result).isNotDone();
+        deletion.complete(physicalActivation());
         assertThat(result.join()).isSameAs(report);
     }
 
@@ -88,15 +135,48 @@ public class NereusManagedLedgerStorageGenerationActivationTest {
                                 .activateAfterSuccessfulBackfill(
                                         report(0),
                                         true,
+                                        false,
                                         () -> CompletableFuture
                                                 .failedFuture(
                                                         new IllegalStateException(
-                                                                "activation failed")));
+                                                                "activation failed")),
+                                        () -> CompletableFuture.completedFuture(
+                                                physicalActivation()));
 
         assertThatThrownBy(result::join)
                 .isInstanceOf(CompletionException.class)
                 .hasCauseInstanceOf(IllegalStateException.class)
                 .hasMessageContaining("activation failed");
+    }
+
+    @Test
+    public void physicalDeletionFailureFailsTheBackfillCompletionPromise() {
+        CompletableFuture<GenerationRegistrationBackfillReport> result =
+                NereusManagedLedgerStorage.activateAfterSuccessfulBackfill(
+                        report(0),
+                        true,
+                        true,
+                        () -> CompletableFuture.completedFuture(null),
+                        () -> CompletableFuture.failedFuture(
+                                new IllegalStateException(
+                                        "physical activation failed")));
+
+        assertThatThrownBy(result::join)
+                .isInstanceOf(CompletionException.class)
+                .hasCauseInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("physical activation failed");
+    }
+
+    private static ManagedLedgerPhysicalDeletionActivationResult
+            physicalActivation() {
+        return new ManagedLedgerPhysicalDeletionActivationResult(
+                "abcdefghijklmnopqrstuvwxyz",
+                7,
+                "33".repeat(32),
+                "44".repeat(32),
+                "55".repeat(32),
+                9,
+                Status.ACTIVATED);
     }
 
     private static GenerationRegistrationBackfillReport report(
