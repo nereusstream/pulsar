@@ -28,6 +28,7 @@ import java.nio.ByteOrder;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.HexFormat;
@@ -102,7 +103,11 @@ public final class DefaultNereusGenerationRegistrationBackfill
                                 candidate);
                     }
                 },
-                storage::completeGenerationRegistrationBackfill,
+                (completion, maxConcurrentStreams, timeout) ->
+                        storage.completeGenerationRegistrationBackfill(
+                                completion,
+                                maxConcurrentStreams,
+                                timeout),
                 capabilityCoordinator,
                 maxTopicsPerNamespace);
     }
@@ -181,9 +186,18 @@ public final class DefaultNereusGenerationRegistrationBackfill
                                                         first.toCore(),
                                                         report.coverageSha256(),
                                                         report.failureCount());
+                                final Duration remaining;
+                                try {
+                                    remaining = remaining(deadlineNanos);
+                                } catch (TimeoutException timeout) {
+                                    return CompletableFuture.failedFuture(
+                                            timeout);
+                                }
                                 return bound(
                                                 () -> proofs.complete(
-                                                        completion),
+                                                        completion,
+                                                        exact.maxConcurrency(),
+                                                        remaining),
                                                 deadlineNanos)
                                         .thenApply(ignored -> report);
                             });
@@ -603,6 +617,16 @@ public final class DefaultNereusGenerationRegistrationBackfill
                 : now + timeout;
     }
 
+    private static Duration remaining(long deadlineNanos)
+            throws TimeoutException {
+        long remainingNanos = deadlineNanos - System.nanoTime();
+        if (remainingNanos < TimeUnit.MILLISECONDS.toNanos(1)) {
+            throw new TimeoutException(
+                    "Nereus generation registration backfill timed out before proof completion");
+        }
+        return Duration.ofNanos(remainingNanos);
+    }
+
     private static String errorCode(Throwable error) {
         Throwable cause = unwrap(error);
         if (cause instanceof TimeoutException) {
@@ -674,7 +698,9 @@ public final class DefaultNereusGenerationRegistrationBackfill
 
     interface ProofAccess {
         CompletableFuture<Void> complete(
-                GenerationRegistrationBackfillCompletion completion);
+                GenerationRegistrationBackfillCompletion completion,
+                int maxConcurrentStreams,
+                Duration timeout);
     }
 
     private record TopicOutcome(

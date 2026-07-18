@@ -27,13 +27,16 @@ public record GenerationRegistrationBackfillRequest(
         long expectedBrokerReadinessEpoch,
         int maxConcurrency,
         Duration timeout) {
+    public static final int MAX_CONCURRENCY = 1_024;
+
     public GenerationRegistrationBackfillRequest {
         runId = requireBase32Id(runId);
         if (expectedBrokerReadinessEpoch < 0) {
             throw new IllegalArgumentException("expectedBrokerReadinessEpoch must be non-negative");
         }
-        if (maxConcurrency < 1) {
-            throw new IllegalArgumentException("maxConcurrency must be positive");
+        if (maxConcurrency < 1 || maxConcurrency > MAX_CONCURRENCY) {
+            throw new IllegalArgumentException(
+                    "maxConcurrency must be in [1, 1024]");
         }
         timeout = Objects.requireNonNull(timeout, "timeout");
         if (timeout.isZero() || timeout.isNegative()) {

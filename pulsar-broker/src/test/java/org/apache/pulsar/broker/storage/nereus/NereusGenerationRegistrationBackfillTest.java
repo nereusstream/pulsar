@@ -34,6 +34,7 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 import org.apache.pulsar.broker.resources.NamespaceResources;
 import org.apache.pulsar.broker.resources.TenantResources;
 import org.apache.pulsar.broker.resources.TopicResources;
@@ -76,6 +77,8 @@ public class NereusGenerationRegistrationBackfillTest {
         AtomicInteger registrations = new AtomicInteger();
         List<GenerationRegistrationBackfillCompletion> proofs =
                 new ArrayList<>();
+        AtomicInteger proofConcurrency = new AtomicInteger();
+        AtomicReference<Duration> proofTimeout = new AtomicReference<>();
         DefaultNereusGenerationRegistrationBackfill.RegistrationAccess access =
                 registrationAccess(registrations);
         var backfill = new DefaultNereusGenerationRegistrationBackfill(
@@ -84,8 +87,10 @@ public class NereusGenerationRegistrationBackfillTest {
                 topics,
                 bindings,
                 access,
-                completion -> {
+                (completion, maxConcurrentStreams, timeout) -> {
                     proofs.add(completion);
+                    proofConcurrency.set(maxConcurrentStreams);
+                    proofTimeout.set(timeout);
                     return completed(null);
                 },
                 capabilities,
@@ -106,6 +111,10 @@ public class NereusGenerationRegistrationBackfillTest {
         assertThat(first.coverageSha256().value())
                 .isEqualTo("2f234d6b9baa3a760460090850d22734f94cd72d51fd0f27706fda272fc01d7c");
         assertThat(registrations).hasValue(4);
+        assertThat(proofConcurrency).hasValue(request.maxConcurrency());
+        assertThat(proofTimeout.get())
+                .isPositive()
+                .isLessThan(request.timeout());
         assertThat(proofs).hasSize(2).allSatisfy(proof -> {
             assertThat(proof.runId()).isEqualTo(RUN_ID);
             assertThat(proof.readiness())
@@ -349,7 +358,7 @@ public class NereusGenerationRegistrationBackfillTest {
 
     private static DefaultNereusGenerationRegistrationBackfill.ProofAccess
             proofAccess(AtomicInteger completions) {
-        return completion -> {
+        return (completion, maxConcurrentStreams, timeout) -> {
             completions.incrementAndGet();
             return completed(null);
         };

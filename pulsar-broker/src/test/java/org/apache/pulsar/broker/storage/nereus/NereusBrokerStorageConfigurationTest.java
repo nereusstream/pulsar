@@ -152,6 +152,14 @@ public class NereusBrokerStorageConfigurationTest {
                 .isInstanceOf(IllegalArgumentException.class)
                 .hasMessageContaining("BackfillConcurrency");
 
+        ServiceConfiguration oversizedBackfill = validConfiguration();
+        oversizedBackfill.setNereusGenerationRegistrationBackfillConcurrency(
+                GenerationRegistrationBackfillRequest.MAX_CONCURRENCY + 1);
+        assertThatThrownBy(() -> new NereusBrokerStorageConfiguration(oversizedBackfill)
+                .generationRegistrationBackfillConcurrency())
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("at most 1024");
+
         ServiceConfiguration aliasedProfile = validConfiguration();
         aliasedProfile.setNereusDefaultStorageProfile("OBJECT_WAL");
         assertThatThrownBy(() -> new NereusBrokerStorageConfiguration(
