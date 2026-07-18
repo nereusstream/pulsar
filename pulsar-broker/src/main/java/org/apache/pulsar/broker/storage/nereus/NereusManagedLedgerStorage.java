@@ -22,6 +22,8 @@ import com.nereusstream.core.capability.GenerationRegistrationBackfillCompletion
 import com.nereusstream.managedledger.NereusManagedLedgerFactory;
 import com.nereusstream.managedledger.NereusManagedLedgerRuntime;
 import com.nereusstream.managedledger.generation.ManagedLedgerMaterializationRegistrationCandidate;
+import com.nereusstream.managedledger.generation.ManagedLedgerPhysicalDeletionActivationRequest;
+import com.nereusstream.managedledger.generation.ManagedLedgerPhysicalDeletionActivationResult;
 import com.nereusstream.objectstore.ObjectStoreSecretResolver;
 import com.nereusstream.pulsar.NereusProcessIdentity;
 import com.nereusstream.pulsar.NereusRuntimeConfiguration;
@@ -73,6 +75,7 @@ public final class NereusManagedLedgerStorage implements ManagedLedgerStorage {
     private Duration generationRegistrationBackfillTimeout;
     private int generationRegistrationBackfillMaxTopicsPerNamespace;
     private boolean generationProtocolEnabled;
+    private boolean physicalGcMutationsAllowed;
     private Collection<ManagedLedgerStorageClass> storageClasses = List.of();
 
     public NereusManagedLedgerStorage() {
@@ -103,6 +106,7 @@ public final class NereusManagedLedgerStorage implements ManagedLedgerStorage {
                     Duration.ofSeconds(conf.getNereusMetadataTimeoutSeconds()));
             NereusProcessIdentity identity = NereusProcessIdentity.generate(new SecureRandom());
             NereusRuntimeConfiguration runtimeConfiguration = checked.runtimeConfiguration(identity);
+            physicalGcMutationsAllowed = runtimeConfiguration.physicalGc().mutationsAllowed();
             ClassLoader classLoader = Thread.currentThread().getContextClassLoader();
             ObjectStoreSecretResolver secretResolver = Reflections.createInstance(
                     checked.secretResolverClassName(), ObjectStoreSecretResolver.class, classLoader);
@@ -236,7 +240,13 @@ public final class NereusManagedLedgerStorage implements ManagedLedgerStorage {
                 .thenCompose(report -> activateAfterSuccessfulBackfill(
                         report,
                         generationProtocolEnabled,
-                        this::activateGenerationPublication));
+                        physicalGcMutationsAllowed,
+                        this::activateGenerationPublication,
+                        () -> activatePhysicalDeletion(
+                                new ManagedLedgerPhysicalDeletionActivationRequest(
+                                        request.runId(),
+                                        request.maxConcurrency(),
+                                        request.timeout()))));
     }
 
     public CompletableFuture<GenerationRegistrationBackfillReport>
@@ -300,22 +310,48 @@ public final class NereusManagedLedgerStorage implements ManagedLedgerStorage {
         }
     }
 
+    public CompletableFuture<ManagedLedgerPhysicalDeletionActivationResult>
+            activatePhysicalDeletion(
+                    ManagedLedgerPhysicalDeletionActivationRequest request) {
+        try {
+            ensureReady();
+            return nereusFactory.activatePhysicalDeletion(request);
+        } catch (Throwable error) {
+            return CompletableFuture.failedFuture(error);
+        }
+    }
+
     static CompletableFuture<GenerationRegistrationBackfillReport>
             activateAfterSuccessfulBackfill(
                     GenerationRegistrationBackfillReport report,
-                    boolean activationEnabled,
-                    Supplier<CompletableFuture<Void>> activation) {
+                    boolean publicationActivationEnabled,
+                    boolean physicalDeletionActivationEnabled,
+                    Supplier<CompletableFuture<Void>> publicationActivation,
+                    Supplier<CompletableFuture<ManagedLedgerPhysicalDeletionActivationResult>>
+                            physicalDeletionActivation) {
         final GenerationRegistrationBackfillReport exact;
         try {
             exact = Objects.requireNonNull(report, "report");
-            if (!activationEnabled || exact.failureCount() != 0) {
+            if (!publicationActivationEnabled || exact.failureCount() != 0) {
                 return CompletableFuture.completedFuture(exact);
             }
-            Objects.requireNonNull(activation, "activation");
+            Objects.requireNonNull(
+                    publicationActivation, "publicationActivation");
             return Objects.requireNonNull(
-                            activation.get(),
-                            "activation future")
-                    .thenApply(ignored -> exact);
+                            publicationActivation.get(),
+                            "publication activation future")
+                    .thenCompose(ignored -> {
+                        if (!physicalDeletionActivationEnabled) {
+                            return CompletableFuture.completedFuture(exact);
+                        }
+                        Objects.requireNonNull(
+                                physicalDeletionActivation,
+                                "physicalDeletionActivation");
+                        return Objects.requireNonNull(
+                                        physicalDeletionActivation.get(),
+                                        "physical deletion activation future")
+                                .thenApply(activated -> exact);
+                    });
         } catch (Throwable error) {
             return CompletableFuture.failedFuture(error);
         }
