@@ -23,11 +23,14 @@ import static org.assertj.core.api.Assertions.assertThatCode;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
+import com.nereusstream.managedledger.retention.RetentionPolicySnapshot;
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.Unpooled;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.EnumMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
@@ -43,7 +46,9 @@ import org.apache.pulsar.common.naming.TopicName;
 import org.apache.pulsar.common.policies.data.BacklogQuota;
 import org.apache.pulsar.common.policies.data.BacklogQuota.BacklogQuotaType;
 import org.apache.pulsar.common.policies.data.Policies;
+import org.apache.pulsar.common.policies.data.RetentionPolicies;
 import org.apache.pulsar.common.policies.data.TopicPolicies;
+import org.apache.pulsar.common.policies.data.impl.BacklogQuotaImpl;
 import org.apache.pulsar.common.protocol.Commands;
 import org.testng.annotations.DataProvider;
 import org.testng.annotations.Test;
@@ -62,6 +67,16 @@ public class NereusTopicFeatureResolverTest {
         assertThat(features).isEqualTo(safeFeatures());
         assertThatCode(() -> new NereusTopicFeatureValidator().validateTopicOpen(
                 USER_TOPIC, new ManagedLedgerConfig(), features)).doesNotThrowAnyException();
+    }
+
+    @Test
+    public void openContextRejectsRetentionProjectionThatDoesNotMatchExactPulsarFacts() {
+        assertThatThrownBy(() -> new NereusTopicOpenContext(
+                new ManagedLedgerConfig(),
+                safeFeatures(),
+                RetentionPolicySnapshot.fromCanonicalMinutesAndMebibytes(1, 1)))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("exact resolved Pulsar retention values");
     }
 
     @Test
@@ -113,7 +128,50 @@ public class NereusTopicFeatureResolverTest {
                 TopicName.get("persistent://pulsar/system/transaction_coordinator_assign"));
 
         assertThat(userFeatures.backlogEvictionEnabled()).isTrue();
+        assertThat(userFeatures.sizeBacklogEvictionEnabled()).isTrue();
+        assertThat(userFeatures.timeBacklogEvictionEnabled()).isFalse();
+        assertThat(userFeatures.backlogQuotas().get(BacklogQuotaType.destination_storage).getLimitSize())
+                .isEqualTo(1024);
         assertThat(systemFeatures.systemOrInternalTopic()).isTrue();
+    }
+
+    @Test
+    public void preservesExactRetentionAndBacklogPrecedenceInImmutableCopies() {
+        ServiceConfiguration broker = new ServiceConfiguration();
+        broker.setClusterName("local");
+        broker.setPreciseTimeBasedBacklogQuotaCheck(true);
+        Policies namespace = new Policies();
+        namespace.retention_policies = new RetentionPolicies(11, 12);
+        namespace.backlog_quota_map.put(
+                BacklogQuotaType.destination_storage,
+                quota(1_024, -1, BacklogQuota.RetentionPolicy.consumer_backlog_eviction));
+        TopicPolicies global = TopicPolicies.builder()
+                .retentionPolicies(new RetentionPolicies(21, 22))
+                .build();
+        global.getBackLogQuotaMap().put(
+                BacklogQuotaType.message_age.toString(),
+                quota(-1, 31, BacklogQuota.RetentionPolicy.consumer_backlog_eviction));
+        TopicPolicies local = TopicPolicies.builder()
+                .retentionPolicies(new RetentionPolicies(-1, 32))
+                .build();
+        BacklogQuotaImpl mutableSource = quota(
+                2_048, -1, BacklogQuota.RetentionPolicy.producer_exception);
+        local.getBackLogQuotaMap().put(BacklogQuotaType.destination_storage.toString(), mutableSource);
+
+        NereusResolvedTopicFeatures features = NereusTopicFeatureResolver.resolve(
+                broker, namespace, Optional.of(local), Optional.of(global), USER_TOPIC, true);
+
+        assertThat(features.retention()).contains(new RetentionPolicies(-1, 32));
+        assertThat(features.backlogQuotas().get(BacklogQuotaType.destination_storage).getLimitSize())
+                .isEqualTo(2_048);
+        assertThat(features.backlogQuotas().get(BacklogQuotaType.destination_storage))
+                .isNotSameAs(mutableSource);
+        assertThat(features.backlogQuotas().get(BacklogQuotaType.message_age).getLimitTime())
+                .isEqualTo(31);
+        assertThat(features.preciseTimeBasedBacklogQuotaCheck()).isTrue();
+        assertThat(features.generationProtocolRuntimeReady()).isTrue();
+        assertThatThrownBy(() -> features.backlogQuotas().clear())
+                .isInstanceOf(UnsupportedOperationException.class);
     }
 
     @DataProvider
@@ -123,8 +181,6 @@ public class NereusTopicFeatureResolverTest {
             {"GEO_REPLICATION"},
             {"DEDUPLICATION"},
             {"COMPACTION"},
-            {"RETENTION"},
-            {"BACKLOG_EVICTION"},
             {"PULSAR_OFFLOAD"},
             {"ENTRY_FILTERS"},
             {"SHADOW_OR_MIGRATION"}
@@ -134,7 +190,9 @@ public class NereusTopicFeatureResolverTest {
     @Test
     public void admitsTtlAndSubscriptionExpirationWithoutAdmittingPhysicalGcPolicies() {
         NereusResolvedTopicFeatures lifecyclePolicies = new NereusResolvedTopicFeatures(
-                Set.of(), false, 30, 60, 0, false, false, false, false, false, false);
+                Set.of(), false, 30, 60, 0,
+                Optional.of(new RetentionPolicies(0, 0)), disabledBacklogQuotas(), false,
+                false, false, false, false, false);
         assertThatCode(() -> new NereusTopicFeatureValidator().validateTopicOpen(
                 USER_TOPIC, new ManagedLedgerConfig(), lifecyclePolicies)).doesNotThrowAnyException();
     }
@@ -248,9 +306,9 @@ public class NereusTopicFeatureResolverTest {
     @Test
     public void validatesTheClosedAdminOperationSet() {
         NereusTopicFeatureValidator validator = new NereusTopicFeatureValidator();
-        assertThatCode(() -> validator.validateAdminOperation(NereusAdminOperation.TERMINATE_TOPIC))
+        assertThatCode(() -> validator.validateAdminOperation(NereusAdminOperation.TERMINATE_TOPIC, false))
                 .doesNotThrowAnyException();
-        assertThatCode(() -> validator.validateAdminOperation(NereusAdminOperation.DELETE_TOPIC))
+        assertThatCode(() -> validator.validateAdminOperation(NereusAdminOperation.DELETE_TOPIC, false))
                 .doesNotThrowAnyException();
         java.util.Set<NereusAdminOperation> allowed = java.util.Set.of(
                 NereusAdminOperation.TERMINATE_TOPIC,
@@ -262,14 +320,19 @@ public class NereusTopicFeatureResolverTest {
                 NereusAdminOperation.SKIP_MESSAGES,
                 NereusAdminOperation.EXPIRE_MESSAGES,
                 NereusAdminOperation.RESET_CURSOR);
-        allowed.forEach(operation -> assertThatCode(() -> validator.validateAdminOperation(operation))
+        allowed.forEach(operation -> assertThatCode(() -> validator.validateAdminOperation(operation, false))
                 .doesNotThrowAnyException());
         for (NereusAdminOperation operation : NereusAdminOperation.values()) {
             if (allowed.contains(operation)) {
                 continue;
             }
-            assertThatThrownBy(() -> validator.validateAdminOperation(operation))
-                    .hasMessage("NEREUS_UNSUPPORTED_ADMIN_OPERATION:" + operation.name());
+            if (operation == NereusAdminOperation.TRIM_TOPIC) {
+                assertThatThrownBy(() -> validator.validateAdminOperation(operation, false))
+                        .hasMessage("NEREUS_UNSUPPORTED_ADMIN_OPERATION:TRIM_TOPIC:GENERATION_PROTOCOL_NOT_READY");
+            } else {
+                assertThatThrownBy(() -> validator.validateAdminOperation(operation, false))
+                        .hasMessage("NEREUS_UNSUPPORTED_ADMIN_OPERATION:" + operation.name());
+            }
         }
     }
 
@@ -338,14 +401,18 @@ public class NereusTopicFeatureResolverTest {
 
     private static NereusResolvedTopicFeatures safeFeatures() {
         return new NereusResolvedTopicFeatures(
-                Set.of(), false, 0, 0, 0, false, false, false, false, false, false);
+                Set.of(), false, 0, 0, 0,
+                Optional.of(new RetentionPolicies(0, 0)), disabledBacklogQuotas(), false,
+                false, false, false, false, false);
     }
 
     private static NereusTopicPolicySnapshot safePolicySnapshot() {
         ManagedLedgerConfig config = new ManagedLedgerConfig();
         config.setStorageClassName("nereus");
+        RetentionPolicySnapshot retention =
+                RetentionPolicySnapshot.fromCanonicalMinutesAndMebibytes(0, 0);
         return new NereusTopicPolicySnapshot(
-                new NereusTopicOpenContext(config, safeFeatures()),
+                new NereusTopicOpenContext(config, safeFeatures(), retention),
                 new Policies(),
                 Optional.empty(),
                 Optional.empty());
@@ -353,26 +420,55 @@ public class NereusTopicFeatureResolverTest {
 
     private static NereusResolvedTopicFeatures unsupported(String feature) {
         return switch (feature) {
-            case "SYSTEM_OR_INTERNAL_TOPIC" -> new NereusResolvedTopicFeatures(
-                    Set.of(), false, 0, 0, 0, false, false, false, false, false, true);
-            case "GEO_REPLICATION" -> new NereusResolvedTopicFeatures(
-                    Set.of("remote"), false, 0, 0, 0, false, false, false, false, false, false);
-            case "DEDUPLICATION" -> new NereusResolvedTopicFeatures(
-                    Set.of(), true, 0, 0, 0, false, false, false, false, false, false);
-            case "COMPACTION" -> new NereusResolvedTopicFeatures(
-                    Set.of(), false, 0, 0, 1, false, false, false, false, false, false);
-            case "RETENTION" -> new NereusResolvedTopicFeatures(
-                    Set.of(), false, 0, 0, 0, true, false, false, false, false, false);
-            case "BACKLOG_EVICTION" -> new NereusResolvedTopicFeatures(
-                    Set.of(), false, 0, 0, 0, false, true, false, false, false, false);
-            case "PULSAR_OFFLOAD" -> new NereusResolvedTopicFeatures(
-                    Set.of(), false, 0, 0, 0, false, false, true, false, false, false);
-            case "ENTRY_FILTERS" -> new NereusResolvedTopicFeatures(
-                    Set.of(), false, 0, 0, 0, false, false, false, true, false, false);
-            case "SHADOW_OR_MIGRATION" -> new NereusResolvedTopicFeatures(
-                    Set.of(), false, 0, 0, 0, false, false, false, false, true, false);
+            case "SYSTEM_OR_INTERNAL_TOPIC" -> featureFlags(
+                    Set.of(), false, 0, false, false, false, true);
+            case "GEO_REPLICATION" -> featureFlags(
+                    Set.of("remote"), false, 0, false, false, false, false);
+            case "DEDUPLICATION" -> featureFlags(
+                    Set.of(), true, 0, false, false, false, false);
+            case "COMPACTION" -> featureFlags(
+                    Set.of(), false, 1, false, false, false, false);
+            case "PULSAR_OFFLOAD" -> featureFlags(
+                    Set.of(), false, 0, true, false, false, false);
+            case "ENTRY_FILTERS" -> featureFlags(
+                    Set.of(), false, 0, false, true, false, false);
+            case "SHADOW_OR_MIGRATION" -> featureFlags(
+                    Set.of(), false, 0, false, false, true, false);
             default -> throw new IllegalArgumentException("unknown feature " + feature);
         };
+    }
+
+    private static NereusResolvedTopicFeatures featureFlags(
+            Set<String> remote,
+            boolean deduplication,
+            long compaction,
+            boolean offload,
+            boolean filters,
+            boolean shadowOrMigration,
+            boolean systemOrInternal) {
+        return new NereusResolvedTopicFeatures(
+                remote, deduplication, 0, 0, compaction,
+                Optional.of(new RetentionPolicies(0, 0)), disabledBacklogQuotas(), false,
+                offload, filters, shadowOrMigration, systemOrInternal, false);
+    }
+
+    private static Map<BacklogQuotaType, BacklogQuota> disabledBacklogQuotas() {
+        EnumMap<BacklogQuotaType, BacklogQuota> quotas = new EnumMap<>(BacklogQuotaType.class);
+        for (BacklogQuotaType type : BacklogQuotaType.values()) {
+            quotas.put(type, quota(-1, -1, BacklogQuota.RetentionPolicy.producer_request_hold));
+        }
+        return quotas;
+    }
+
+    private static BacklogQuotaImpl quota(
+            long size,
+            int time,
+            BacklogQuota.RetentionPolicy policy) {
+        return BacklogQuotaImpl.builder()
+                .limitSize(size)
+                .limitTime(time)
+                .retentionPolicy(policy)
+                .build();
     }
 
     private static ByteBuf entry(MessageMetadata metadata) {

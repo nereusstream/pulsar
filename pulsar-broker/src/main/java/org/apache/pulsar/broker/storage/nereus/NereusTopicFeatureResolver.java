@@ -19,6 +19,7 @@
 package org.apache.pulsar.broker.storage.nereus;
 
 import java.util.Collection;
+import java.util.EnumMap;
 import java.util.HashSet;
 import java.util.Map;
 import java.util.Optional;
@@ -50,6 +51,16 @@ public final class NereusTopicFeatureResolver {
             Optional<TopicPolicies> localPolicies,
             Optional<TopicPolicies> globalPolicies,
             TopicName topic) {
+        return resolve(broker, namespacePolicies, localPolicies, globalPolicies, topic, false);
+    }
+
+    public static NereusResolvedTopicFeatures resolve(
+            ServiceConfiguration broker,
+            Policies namespacePolicies,
+            Optional<TopicPolicies> localPolicies,
+            Optional<TopicPolicies> globalPolicies,
+            TopicName topic,
+            boolean generationProtocolRuntimeReady) {
         java.util.Objects.requireNonNull(broker, "broker");
         java.util.Objects.requireNonNull(namespacePolicies, "namespacePolicies");
         java.util.Objects.requireNonNull(localPolicies, "localPolicies");
@@ -94,9 +105,7 @@ public final class NereusTopicFeatureResolver {
                 namespacePolicies.retention_policies,
                 new RetentionPolicies(
                         broker.getDefaultRetentionTimeInMinutes(), broker.getDefaultRetentionSizeInMB()));
-        boolean retentionEnabled = retention != null
-                && (retention.getRetentionTimeInMinutes() != 0 || retention.getRetentionSizeInMB() != 0);
-        boolean backlogEvictionEnabled = hasFiniteBacklogEviction(
+        Map<BacklogQuotaType, BacklogQuota> backlogQuotas = resolveBacklogQuotas(
                 broker, namespacePolicies, localPolicies, globalPolicies);
         boolean offloadEnabled = isOffloadEnabled(
                 broker, namespacePolicies, localPolicies, globalPolicies);
@@ -125,19 +134,22 @@ public final class NereusTopicFeatureResolver {
                 ttl,
                 expiration,
                 compaction,
-                retentionEnabled,
-                backlogEvictionEnabled,
+                Optional.ofNullable(retention),
+                backlogQuotas,
+                broker.isPreciseTimeBasedBacklogQuotaCheck(),
                 offloadEnabled,
                 entryFiltersEnabled,
                 shadowOrMigration,
-                systemOrInternal);
+                systemOrInternal,
+                generationProtocolRuntimeReady);
     }
 
-    private static boolean hasFiniteBacklogEviction(
+    private static Map<BacklogQuotaType, BacklogQuota> resolveBacklogQuotas(
             ServiceConfiguration broker,
             Policies namespacePolicies,
             Optional<TopicPolicies> localPolicies,
             Optional<TopicPolicies> globalPolicies) {
+        EnumMap<BacklogQuotaType, BacklogQuota> result = new EnumMap<>(BacklogQuotaType.class);
         for (BacklogQuotaType type : BacklogQuotaType.values()) {
             BacklogQuota quota = effectiveTopicValue(
                     localPolicies,
@@ -145,13 +157,9 @@ public final class NereusTopicFeatureResolver {
                     policies -> quota(policies.getBackLogQuotaMap(), type),
                     namespacePolicies.backlog_quota_map.get(type),
                     defaultQuota(broker));
-            if (quota != null
-                    && quota.getPolicy() == BacklogQuota.RetentionPolicy.consumer_backlog_eviction
-                    && (quota.getLimitSize() >= 0 || quota.getLimitTime() >= 0)) {
-                return true;
-            }
+            result.put(type, java.util.Objects.requireNonNull(quota, "effective backlog quota"));
         }
-        return false;
+        return result;
     }
 
     private static boolean isOffloadEnabled(

@@ -18,14 +18,25 @@
  */
 package org.apache.pulsar.broker.storage.nereus;
 
+import com.nereusstream.managedledger.retention.RetentionPolicySnapshot;
 import org.apache.bookkeeper.mledger.ManagedLedgerConfig;
 
 /** Managed-ledger config and admission features derived from the same policy input tuple. */
 public record NereusTopicOpenContext(
         ManagedLedgerConfig managedLedgerConfig,
-        NereusResolvedTopicFeatures features) {
+        NereusResolvedTopicFeatures features,
+        RetentionPolicySnapshot retentionPolicy) {
     public NereusTopicOpenContext {
         java.util.Objects.requireNonNull(managedLedgerConfig, "managedLedgerConfig");
         java.util.Objects.requireNonNull(features, "features");
+        java.util.Objects.requireNonNull(retentionPolicy, "retentionPolicy");
+        RetentionPolicySnapshot expected = features.retention()
+                .map(value -> RetentionPolicySnapshot.fromCanonicalMinutesAndMebibytes(
+                        value.getRetentionTimeInMinutes(), value.getRetentionSizeInMB()))
+                .orElseGet(() -> RetentionPolicySnapshot.fromCanonicalMinutesAndMebibytes(0, 0));
+        if (!expected.equals(retentionPolicy)) {
+            throw new IllegalArgumentException(
+                    "retentionPolicy must be derived from the exact resolved Pulsar retention values");
+        }
     }
 }
