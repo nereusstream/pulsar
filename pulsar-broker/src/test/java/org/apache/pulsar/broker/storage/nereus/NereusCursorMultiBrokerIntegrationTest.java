@@ -603,7 +603,24 @@ public class NereusCursorMultiBrokerIntegrationTest {
         long objectsBefore = cluster.objectCount();
         cluster.admin(0).namespaces().setNamespaceMessageTTL(cluster.namespace(), 1);
         try {
-            cluster.admin(0).topics().expireMessages(topic, "ttl-subscription", 0);
+            PersistentTopic loaded = loadedTopic(topic);
+            Awaitility.await()
+                    .atMost(Duration.ofSeconds(30))
+                    .pollInterval(Duration.ofMillis(100))
+                    .until(() -> {
+                        if (loaded.getSubscription("ttl-subscription")
+                                .getNumberOfEntriesInBacklog(false) == 0) {
+                            return true;
+                        }
+                        try {
+                            cluster.admin(0).topics().expireMessages(topic, "ttl-subscription", 0);
+                        } catch (PulsarAdminException.ConflictException ignored) {
+                            // Applying the namespace TTL starts an asynchronous expiry check. A concurrent manual
+                            // request is allowed to return 409 until that check releases the subscription monitor.
+                        }
+                        return loaded.getSubscription("ttl-subscription")
+                                .getNumberOfEntriesInBacklog(false) == 0;
+                    });
             try (PulsarClient client = cluster.multiBrokerClient();
                     Consumer<byte[]> reopened = consumer(
                             client,
