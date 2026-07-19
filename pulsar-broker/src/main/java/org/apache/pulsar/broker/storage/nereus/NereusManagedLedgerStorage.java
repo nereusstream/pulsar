@@ -42,6 +42,7 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Supplier;
+import org.apache.bookkeeper.client.api.BookKeeper;
 import org.apache.bookkeeper.mledger.ManagedLedgerConfig;
 import org.apache.bookkeeper.mledger.ManagedLedgerException;
 import org.apache.bookkeeper.mledger.ManagedLedgerFactoryConfig;
@@ -52,6 +53,7 @@ import org.apache.pulsar.broker.resources.NamespaceResources;
 import org.apache.pulsar.broker.resources.TenantResources;
 import org.apache.pulsar.broker.resources.TopicResources;
 import org.apache.pulsar.broker.service.BrokerServiceException.NotAllowedException;
+import org.apache.pulsar.broker.storage.BookkeeperManagedLedgerStorageClass;
 import org.apache.pulsar.broker.storage.ManagedLedgerStorage;
 import org.apache.pulsar.broker.storage.ManagedLedgerStorageClass;
 import org.apache.pulsar.common.naming.TopicName;
@@ -121,6 +123,7 @@ public final class NereusManagedLedgerStorage implements ManagedLedgerStorage {
             if (!"bookkeeper".equals(bookkeeperClass.getName())) {
                 throw new IllegalStateException("stock managed-ledger storage class must be bookkeeper");
             }
+            BookKeeper borrowedBookKeeperClient = requireBorrowedBookKeeperClient(bookkeeperClass);
 
             bindingStore = new NereusStorageClassBindingStore(
                     metadataStore,
@@ -135,7 +138,8 @@ public final class NereusManagedLedgerStorage implements ManagedLedgerStorage {
                     capabilityCoordinator,
                     checked.generationProtocolEnabled(),
                     secretResolver,
-                    classLoader);
+                    classLoader,
+                    Optional.of(borrowedBookKeeperClient));
             runtime = runtimeProvider.create(runtimeConfiguration, context);
             ManagedLedgerFactoryConfig compatibilityFactoryConfig = new ManagedLedgerFactoryConfig();
             compatibilityFactoryConfig.setMaxCacheSize(0);
@@ -165,6 +169,16 @@ public final class NereusManagedLedgerStorage implements ManagedLedgerStorage {
             }
             throw new IllegalStateException("unexpected Nereus initialization failure", failure);
         }
+    }
+
+    static BookKeeper requireBorrowedBookKeeperClient(ManagedLedgerStorageClass storageClass) {
+        if (!(storageClass instanceof BookkeeperManagedLedgerStorageClass bookkeeperBacked)) {
+            throw new IllegalStateException(
+                    "stock managed-ledger storage class must expose its borrowed BookKeeper client");
+        }
+        return Objects.requireNonNull(
+                bookkeeperBacked.getBookKeeperClient(),
+                "stock managed-ledger storage class returned a null BookKeeper client");
     }
 
     @Override
