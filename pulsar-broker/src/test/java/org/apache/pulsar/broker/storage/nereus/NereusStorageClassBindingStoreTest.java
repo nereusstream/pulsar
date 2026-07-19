@@ -64,6 +64,31 @@ public class NereusStorageClassBindingStoreTest {
     }
 
     @Test
+    public void ignoresAnEmptyPartitionCatalogPlaceholderWhenSelectingNereus() {
+        MetadataStoreExtended metadata = mock(MetadataStoreExtended.class);
+        ManagedLedgerFactory bookkeeper = mock(ManagedLedgerFactory.class);
+        NereusManagedLedgerFactory nereus = mock(NereusManagedLedgerFactory.class);
+        when(metadata.sync(anyString())).thenReturn(CompletableFuture.completedFuture(null));
+        when(metadata.get(anyString())).thenReturn(CompletableFuture.completedFuture(Optional.empty()));
+        when(metadata.get("/managed-ledgers/" + PERSISTENCE_NAME)).thenReturn(CompletableFuture.completedFuture(
+                Optional.of(new GetResult(new byte[0], MutableBindingMetadata.stat(0)))));
+        when(metadata.put(anyString(), any(), any()))
+                .thenReturn(CompletableFuture.completedFuture(MutableBindingMetadata.stat(0)));
+        when(bookkeeper.asyncExists(PERSISTENCE_NAME)).thenReturn(CompletableFuture.completedFuture(true));
+        when(nereus.inspectStorageState(PERSISTENCE_NAME))
+                .thenReturn(CompletableFuture.completedFuture(NereusStorageStateSnapshot.missing()));
+        NereusStorageClassBindingStore store =
+                new NereusStorageClassBindingStore(metadata, bookkeeper, Duration.ofSeconds(1));
+        store.attachNereusFactory(nereus);
+
+        StorageClassOpenPermit permit = store.prepareStorageClassOpen(
+                PERSISTENCE_NAME, StorageClassBindingRecord.NEREUS, true).join();
+
+        assertThat(permit.storageClass()).isEqualTo(StorageClassBindingRecord.NEREUS);
+        assertThat(permit.activationRequired()).isTrue();
+    }
+
+    @Test
     public void claimsMissingStorageAtGenerationOne() {
         MetadataStoreExtended metadata = mock(MetadataStoreExtended.class);
         ManagedLedgerFactory bookkeeper = mock(ManagedLedgerFactory.class);

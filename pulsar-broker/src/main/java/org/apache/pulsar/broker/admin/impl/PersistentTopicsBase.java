@@ -176,18 +176,35 @@ public class PersistentTopicsBase extends AdminResource {
 
     protected CompletableFuture<Void> validateNereusAdminOperationForLoadedOrBoundTopic(
             NereusAdminOperation operation) {
-        return pulsar().getBrokerService().getTopicIfExists(topicName.toString())
-                .thenCompose(optionalTopic -> {
-                    if (optionalTopic.isPresent()) {
-                        return validateNereusAdminOperation(
-                                optionalTopic.orElseThrow(), operation).thenApply(__ -> (Void) null);
+        if (topicName.isPartitioned()) {
+            return validateNereusAdminOperationForExactTopic(topicName, operation);
+        }
+        return pulsar().getBrokerService().fetchPartitionedTopicMetadataAsync(topicName)
+                .thenCompose(metadata -> {
+                    if (metadata.partitions <= 0) {
+                        return validateNereusAdminOperationForExactTopic(topicName, operation);
                     }
-                    if (pulsar().getManagedLedgerStorage()
-                            instanceof NereusManagedLedgerStorage nereusStorage) {
-                        return nereusStorage.validateUnloadedAdminOperation(topicName, operation);
+                    List<CompletableFuture<Void>> validations = new ArrayList<>(metadata.partitions);
+                    for (int partition = 0; partition < metadata.partitions; partition++) {
+                        validations.add(validateNereusAdminOperationForExactTopic(
+                                topicName.getPartition(partition), operation));
                     }
-                    return CompletableFuture.completedFuture(null);
+                    return FutureUtil.waitForAll(validations);
                 });
+    }
+
+    private CompletableFuture<Void> validateNereusAdminOperationForExactTopic(
+            TopicName exactTopicName, NereusAdminOperation operation) {
+        var optionalTopic = pulsar().getBrokerService().getTopicReference(exactTopicName.toString());
+        if (optionalTopic.isPresent()) {
+            return validateNereusAdminOperation(
+                    optionalTopic.orElseThrow(), operation).thenApply(__ -> (Void) null);
+        }
+        if (pulsar().getManagedLedgerStorage()
+                instanceof NereusManagedLedgerStorage nereusStorage) {
+            return nereusStorage.validateUnloadedAdminOperation(exactTopicName, operation);
+        }
+        return CompletableFuture.completedFuture(null);
     }
 
     protected CompletableFuture<List<String>> internalGetListAsync(Optional<String> bundle,

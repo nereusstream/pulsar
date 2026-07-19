@@ -90,6 +90,7 @@ public class NereusCursorMultiBrokerIntegrationTest {
         assertMessageIdsSurviveSeekHistoryUnloadFailoverAndRestart(topic(runId, "message-id"));
         assertCursorPropertiesSurvivePeerOwnershipAndRestart(topic(runId, "properties"));
         assertLoadedUnloadedAndNamespaceAdminRoutes(topic(runId, "admin"), topic(runId, "shadow"));
+        assertPartitionedAdminRoutes(topic(runId, "partitioned-admin"), topic(runId, "partitioned-shadow"));
         assertTopicRecreationUsesFreshProjectionAndCursorTruth(topic(runId, "recreate"));
     }
 
@@ -274,6 +275,55 @@ public class NereusCursorMultiBrokerIntegrationTest {
         assertThatThrownBy(operation::run)
                 .isInstanceOf(PulsarAdminException.class)
                 .hasMessageContaining("NEREUS_UNSUPPORTED_ADMIN_OPERATION:" + expected.name());
+    }
+
+    private void assertPartitionedAdminRoutes(String sourceTopic, String shadowTopic) throws Exception {
+        cluster.admin(0).topics().createPartitionedTopic(sourceTopic, 2);
+        configureNereus(sourceTopic);
+        Awaitility.await().atMost(Duration.ofSeconds(30)).untilAsserted(() -> {
+            for (int partition = 0; partition < 2; partition++) {
+                TopicName exact = TopicName.get(sourceTopic).getPartition(partition);
+                for (int broker = 0; broker < 2; broker++) {
+                    assertThat(cluster.broker(broker).getBrokerService()
+                                    .getManagedLedgerConfig(exact)
+                                    .join()
+                                    .getStorageClassName())
+                            .isEqualTo(StorageClassBindingRecord.NEREUS);
+                }
+            }
+        });
+        try (PulsarClient client = cluster.multiBrokerClient();
+                Producer<byte[]> first = producer(client, TopicName.get(sourceTopic).getPartition(0).toString());
+                Producer<byte[]> second = producer(client, TopicName.get(sourceTopic).getPartition(1).toString());
+                Producer<byte[]> shadow = producer(client, shadowTopic)) {
+            first.send(bytes("partitioned-admin-0"));
+            second.send(bytes("partitioned-admin-1"));
+            shadow.send(bytes("partitioned-shadow"));
+        }
+
+        assertAdminRejected(
+                () -> cluster.admin(0).topics().triggerCompaction(sourceTopic),
+                NereusAdminOperation.TRIGGER_COMPACTION);
+
+        cluster.admin(0).topics().unload(sourceTopic);
+        Awaitility.await().atMost(Duration.ofSeconds(30)).untilAsserted(() -> {
+            for (int partition = 0; partition < 2; partition++) {
+                String exact = TopicName.get(sourceTopic).getPartition(partition).toString();
+                for (int broker = 0; broker < 2; broker++) {
+                    assertThat(cluster.broker(broker).getBrokerService().getTopicReference(exact)).isEmpty();
+                }
+            }
+        });
+        assertAdminRejected(
+                () -> cluster.admin(0).topics().setShadowTopics(sourceTopic, List.of(shadowTopic)),
+                NereusAdminOperation.SET_SHADOW_TOPICS);
+        assertThat(cluster.broker(0).getTopicPoliciesService()
+                        .getTopicPoliciesAsync(
+                                TopicName.get(sourceTopic), TopicPoliciesService.GetType.LOCAL_ONLY)
+                        .join()
+                        .map(policies -> policies.getShadowTopics())
+                        .orElse(null))
+                .isNullOrEmpty();
     }
 
     private void assertTopicRecreationUsesFreshProjectionAndCursorTruth(String topic) throws Exception {
