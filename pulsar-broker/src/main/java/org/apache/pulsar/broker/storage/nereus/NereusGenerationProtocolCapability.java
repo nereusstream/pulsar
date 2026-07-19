@@ -23,7 +23,7 @@ import java.util.Map;
 /** Defines and protects the independently negotiated F4 generation protocol capability. */
 public final class NereusGenerationProtocolCapability {
     public static final String PROPERTY = "nereus.generation-protocol";
-    public static final String VERSION = "1";
+    public static final String VERSION = "2";
 
     private NereusGenerationProtocolCapability() {
     }
