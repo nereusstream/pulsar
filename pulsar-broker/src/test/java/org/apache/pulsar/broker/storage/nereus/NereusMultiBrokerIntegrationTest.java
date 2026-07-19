@@ -19,6 +19,7 @@
 package org.apache.pulsar.broker.storage.nereus;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import com.nereusstream.api.StorageProfile;
 import com.nereusstream.managedledger.NereusManagedLedger;
 import com.nereusstream.managedledger.generation.ManagedLedgerPhysicalDeletionActivationRequest;
 import com.nereusstream.objectstore.ObjectStoreSecretResolver;
@@ -89,7 +90,9 @@ public class NereusMultiBrokerIntegrationTest {
     private static final DockerImageName LOCALSTACK_IMAGE =
             DockerImageName.parse("localstack/localstack:4.14.0");
 
+    private final boolean generationProtocolEnabled;
     private final boolean physicalGcEnabled;
+    private final StorageProfile defaultStorageProfile;
     private final List<PulsarService> brokers = new ArrayList<>(
             Collections.nCopies(NUM_BROKERS, null));
     private final List<PulsarAdmin> admins = new ArrayList<>(
@@ -104,7 +107,30 @@ public class NereusMultiBrokerIntegrationTest {
     }
 
     NereusMultiBrokerIntegrationTest(boolean physicalGcEnabled) {
+        this(
+                physicalGcEnabled,
+                physicalGcEnabled,
+                StorageProfile.OBJECT_WAL_SYNC_OBJECT);
+    }
+
+    NereusMultiBrokerIntegrationTest(
+            boolean generationProtocolEnabled,
+            boolean physicalGcEnabled,
+            StorageProfile defaultStorageProfile) {
+        if (physicalGcEnabled && !generationProtocolEnabled) {
+            throw new IllegalArgumentException(
+                    "physical GC requires the generation protocol");
+        }
+        this.generationProtocolEnabled = generationProtocolEnabled;
         this.physicalGcEnabled = physicalGcEnabled;
+        this.defaultStorageProfile = java.util.Objects.requireNonNull(
+                defaultStorageProfile, "defaultStorageProfile");
+        if (defaultStorageProfile != StorageProfile.OBJECT_WAL_SYNC_OBJECT
+                && defaultStorageProfile
+                        != StorageProfile.OBJECT_WAL_ASYNC_OBJECT) {
+            throw new IllegalArgumentException(
+                    "the broker fixture accepts only exact Object-WAL profiles");
+        }
     }
 
     @BeforeClass(alwaysRun = true)
@@ -368,10 +394,10 @@ public class NereusMultiBrokerIntegrationTest {
         configuration.setNereusAppendSessionTtlSeconds(3);
         configuration.setNereusAppendSessionRenewBeforeSeconds(1);
         configuration.setNereusAppendSessionMinCommitRemainingSeconds(1);
-        if (physicalGcEnabled) {
+        configuration.setNereusDefaultStorageProfile(
+                defaultStorageProfile.name());
+        if (generationProtocolEnabled) {
             configuration.setNereusGenerationProtocolEnabled(true);
-            configuration.setNereusPhysicalGcEnabled(true);
-            configuration.setNereusPhysicalGcDryRun(false);
             configuration.setNereusGenerationRegistrationBackfillConcurrency(2);
             configuration.setNereusGenerationRegistrationBackfillTimeoutSeconds(60);
             configuration.setNereusObjectStoreRequestTimeoutSeconds(5);
@@ -390,6 +416,12 @@ public class NereusMultiBrokerIntegrationTest {
             configuration.setNereusMaterializationRetryMinMillis(100);
             configuration.setNereusMaterializationRetryMaxMillis(1000);
             configuration.setNereusMaximumClockSkewSeconds(0);
+            configuration.setNereusRetentionOperationTimeoutSeconds(20);
+            configuration.setNereusRetentionCloseTimeoutSeconds(30);
+        }
+        if (physicalGcEnabled) {
+            configuration.setNereusPhysicalGcEnabled(true);
+            configuration.setNereusPhysicalGcDryRun(false);
             configuration.setNereusReaderLeaseSeconds(15);
             configuration.setNereusReaderLeaseRenewSeconds(5);
             configuration.setNereusGcScanIntervalSeconds(3600);
@@ -717,17 +749,34 @@ public class NereusMultiBrokerIntegrationTest {
     }
 
     NereusManagedLedger loadedNereusLedger(String topicName) {
+        return (NereusManagedLedger) loadedPersistentTopic(topicName)
+                .getManagedLedger();
+    }
+
+    PersistentTopic loadedPersistentTopic(String topicName) {
         int owner = awaitOwner(admins.stream().filter(java.util.Objects::nonNull).findFirst().orElseThrow(),
                 topicName, null);
-        AtomicReference<NereusManagedLedger> ledger = new AtomicReference<>();
+        AtomicReference<PersistentTopic> loaded = new AtomicReference<>();
         Awaitility.await().atMost(Duration.ofSeconds(60)).untilAsserted(() -> {
             PersistentTopic topic = (PersistentTopic) brokers.get(owner).getBrokerService()
                     .getTopicReference(topicName)
                     .orElseThrow();
             assertThat(topic.getManagedLedger()).isInstanceOf(NereusManagedLedger.class);
-            ledger.set((NereusManagedLedger) topic.getManagedLedger());
+            loaded.set(topic);
         });
-        return ledger.get();
+        return loaded.get();
+    }
+
+    void awaitTopicUnloaded(String topicName) {
+        Awaitility.await().atMost(Duration.ofSeconds(60)).untilAsserted(() -> {
+            for (PulsarService broker : brokers) {
+                if (broker != null) {
+                    assertThat(broker.getBrokerService()
+                                    .getTopicReference(topicName))
+                            .isEmpty();
+                }
+            }
+        });
     }
 
     Phase4ObjectWalRuntime materializationRuntime(String topicName) {
@@ -743,6 +792,11 @@ public class NereusMultiBrokerIntegrationTest {
     }
 
     GenerationRegistrationBackfillReport activateOrRolloverPhysicalDeletion(
+            int brokerIndex, String runId) throws Exception {
+        return activateOrRolloverGeneration(brokerIndex, runId);
+    }
+
+    GenerationRegistrationBackfillReport activateOrRolloverGeneration(
             int brokerIndex, String runId) throws Exception {
         NereusManagedLedgerStorage storage =
                 (NereusManagedLedgerStorage) brokers.get(brokerIndex).getManagedLedgerStorage();
