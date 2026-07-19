@@ -2543,7 +2543,7 @@ public class PersistentTopics extends PersistentTopicsBase {
             @QueryParam("isGlobal") @DefaultValue("false") boolean isGlobal) {
         validateTopicName(tenant, namespace, encodedTopic);
         validateTopicPolicyOperationAsync(topicName, PolicyName.BACKLOG, PolicyOperation.READ)
-            .thenCompose(__ -> preValidation(authoritative))
+            .thenCompose(__ -> preValidationForBoundTopicPolicy(authoritative))
             .thenCompose(__ -> internalGetBacklogQuota(applied, isGlobal))
             .thenAccept(asyncResponse::resume)
             .exceptionally(ex -> {
@@ -2576,7 +2576,7 @@ public class PersistentTopics extends PersistentTopicsBase {
                     BacklogQuotaImpl backlogQuota) {
         validateTopicName(tenant, namespace, encodedTopic);
         validateTopicPolicyOperationAsync(topicName, PolicyName.BACKLOG, PolicyOperation.WRITE)
-            .thenCompose(__ -> preValidation(authoritative))
+            .thenCompose(__ -> preValidationForBoundTopicPolicy(authoritative))
             .thenCompose(__ -> internalSetBacklogQuota(backlogQuotaType, backlogQuota, isGlobal))
             .thenRun(() -> asyncResponse.resume(Response.noContent().build()))
             .exceptionally(ex -> {
@@ -2604,7 +2604,7 @@ public class PersistentTopics extends PersistentTopicsBase {
             @QueryParam("isGlobal") @DefaultValue("false") boolean isGlobal) {
         validateTopicName(tenant, namespace, encodedTopic);
         validateTopicPolicyOperationAsync(topicName, PolicyName.BACKLOG, PolicyOperation.WRITE)
-            .thenCompose(__ -> preValidation(authoritative))
+            .thenCompose(__ -> preValidationForBoundTopicPolicy(authoritative))
             .thenCompose(__ -> internalSetBacklogQuota(backlogQuotaType, null, isGlobal))
             .thenRun(() -> asyncResponse.resume(Response.noContent().build()))
             .exceptionally(ex -> {
@@ -3038,7 +3038,7 @@ public class PersistentTopics extends PersistentTopicsBase {
             @QueryParam("authoritative") @DefaultValue("false") boolean authoritative) {
         validateTopicName(tenant, namespace, encodedTopic);
         validateTopicPolicyOperationAsync(topicName, PolicyName.RETENTION, PolicyOperation.READ)
-                .thenCompose(__ -> preValidation(authoritative))
+                .thenCompose(__ -> preValidationForBoundTopicPolicy(authoritative))
             .thenCompose(__ -> internalGetRetention(applied, isGlobal))
             .thenAccept(asyncResponse::resume)
             .exceptionally(ex -> {
@@ -3068,7 +3068,7 @@ public class PersistentTopics extends PersistentTopicsBase {
             @RequestBody(description = "Retention policies for the specified topic") RetentionPolicies retention) {
         validateTopicName(tenant, namespace, encodedTopic);
         validateTopicPolicyOperationAsync(topicName, PolicyName.RETENTION, PolicyOperation.WRITE)
-            .thenCompose(__ -> preValidation(authoritative))
+            .thenCompose(__ -> preValidationForBoundTopicPolicy(authoritative))
             .thenCompose(__ -> internalSetRetention(retention, isGlobal))
             .thenRun(() -> {
                 try {
@@ -3107,7 +3107,7 @@ public class PersistentTopics extends PersistentTopicsBase {
             @QueryParam("authoritative") @DefaultValue("false") boolean authoritative) {
         validateTopicName(tenant, namespace, encodedTopic);
         validateTopicPolicyOperationAsync(topicName, PolicyName.RETENTION, PolicyOperation.WRITE)
-                .thenCompose(__ -> preValidation(authoritative))
+                .thenCompose(__ -> preValidationForBoundTopicPolicy(authoritative))
             .thenCompose(__ -> internalRemoveRetention(isGlobal))
             .thenRun(() -> {
                 log.info()
