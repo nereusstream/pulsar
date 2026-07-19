@@ -60,9 +60,9 @@ public class NereusGenerationRegistrationBackfillTest {
                 completed(List.of("tenant-b", "tenant-a")),
                 completed(List.of("tenant-a", "tenant-b")));
         when(namespaces.listNamespacesAsync("tenant-a")).thenReturn(
-                completed(List.of("tenant-a/ns-a")));
+                completed(List.of("ns-a")));
         when(namespaces.listNamespacesAsync("tenant-b")).thenReturn(
-                completed(List.of("tenant-b/ns-b")));
+                completed(List.of("ns-b")));
         when(topics.listPersistentTopicsAsync(NamespaceName.get("tenant-a/ns-a"))).thenReturn(
                 completed(List.of(topicA, bookkeeper)),
                 completed(List.of(bookkeeper, topicA)));
@@ -138,7 +138,8 @@ public class NereusGenerationRegistrationBackfillTest {
             topicNames.add("persistent://tenant/ns/topic-" + index);
         }
         when(tenants.listTenantsAsync()).thenReturn(completed(List.of("tenant")));
-        when(namespaces.listNamespacesAsync("tenant")).thenReturn(completed(List.of(namespace.toString())));
+        when(namespaces.listNamespacesAsync("tenant"))
+                .thenReturn(completed(List.of(namespace.getLocalName())));
         when(topics.listPersistentTopicsAsync(namespace)).thenReturn(completed(topicNames));
         when(bindings.getBinding(any())).thenAnswer(invocation -> {
             String persistenceName = invocation.getArgument(0);
@@ -210,7 +211,8 @@ public class NereusGenerationRegistrationBackfillTest {
             topicNames.add("persistent://tenant/ns/topic-" + String.format("%03d", index));
         }
         when(tenants.listTenantsAsync()).thenReturn(completed(List.of("tenant")));
-        when(namespaces.listNamespacesAsync("tenant")).thenReturn(completed(List.of(namespace.toString())));
+        when(namespaces.listNamespacesAsync("tenant"))
+                .thenReturn(completed(List.of(namespace.getLocalName())));
         when(topics.listPersistentTopicsAsync(namespace)).thenReturn(completed(topicNames));
         when(bindings.getBinding(any())).thenReturn(
                 CompletableFuture.failedFuture(new IllegalStateException("read failed")));
@@ -249,7 +251,8 @@ public class NereusGenerationRegistrationBackfillTest {
         String topic = "persistent://tenant/ns/topic";
         NamespaceName namespace = TopicName.get(topic).getNamespaceObject();
         when(tenants.listTenantsAsync()).thenReturn(completed(List.of("tenant")));
-        when(namespaces.listNamespacesAsync("tenant")).thenReturn(completed(List.of(namespace.toString())));
+        when(namespaces.listNamespacesAsync("tenant"))
+                .thenReturn(completed(List.of(namespace.getLocalName())));
         when(topics.listPersistentTopicsAsync(namespace)).thenReturn(completed(List.of(topic)));
         when(bindings.getBinding(persistence(topic))).thenReturn(
                 completed(Optional.of(activeBinding(
@@ -277,6 +280,43 @@ public class NereusGenerationRegistrationBackfillTest {
                 .isEqualTo(GenerationRegistrationBackfillStage.BINDING_READ);
         assertThat(report.boundedFailures().get(0).errorCode())
                 .isEqualTo("BINDING_CHANGED");
+        assertThat(proofs).hasValue(0);
+    }
+
+    @Test
+    public void namespaceFailureIsReportedWithoutBeingCountedAsATopicOutcome() {
+        TenantResources tenants = mock(TenantResources.class);
+        NamespaceResources namespaces = mock(NamespaceResources.class);
+        TopicResources topics = mock(TopicResources.class);
+        NereusStorageClassBindingStore bindings = mock(NereusStorageClassBindingStore.class);
+        NereusBrokerCapabilityCoordinator capabilities = capabilities(readiness("77"));
+        NamespaceName namespace = NamespaceName.get("tenant/ns");
+        when(tenants.listTenantsAsync()).thenReturn(completed(List.of("tenant")));
+        when(namespaces.listNamespacesAsync("tenant"))
+                .thenReturn(completed(List.of(namespace.getLocalName())));
+        when(topics.listPersistentTopicsAsync(namespace))
+                .thenReturn(CompletableFuture.failedFuture(
+                        new IllegalStateException("topic listing failed")));
+        AtomicInteger proofs = new AtomicInteger();
+        var backfill = new DefaultNereusGenerationRegistrationBackfill(
+                tenants,
+                namespaces,
+                topics,
+                bindings,
+                registrationAccess(new AtomicInteger()),
+                proofAccess(proofs),
+                capabilities,
+                10);
+
+        GenerationRegistrationBackfillReport report = backfill.run(request(1)).join();
+
+        assertThat(report.namespacesScanned()).isOne();
+        assertThat(report.persistentTopicsScanned()).isZero();
+        assertThat(report.failureCount()).isOne();
+        assertThat(report.boundedFailures()).singleElement().satisfies(failure -> {
+            assertThat(failure.stage()).isEqualTo(GenerationRegistrationBackfillStage.TOPIC_LIST);
+            assertThat(failure.errorCode()).isEqualTo("OPERATION_FAILED");
+        });
         assertThat(proofs).hasValue(0);
     }
 
@@ -335,7 +375,7 @@ public class NereusGenerationRegistrationBackfillTest {
                                 "00".repeat(32)),
                         List.of()))
                 .isInstanceOf(IllegalArgumentException.class)
-                .hasMessageContaining("registered + skipped + failed");
+                .hasMessageContaining("registered + skipped + topic failures");
     }
 
     private static DefaultNereusGenerationRegistrationBackfill.RegistrationAccess registrationAccess(

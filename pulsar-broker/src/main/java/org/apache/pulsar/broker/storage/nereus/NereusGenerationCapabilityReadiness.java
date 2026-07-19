@@ -27,7 +27,8 @@ import java.util.Objects;
  * Deterministic identity of one two-snapshot-capable persistent broker set.
  *
  * <p>The epoch is derived from the full SHA-256 identity and is used only as the bounded V1 activation/backfill
- * field. The complete digest remains available for exact in-process comparison.
+ * field. It is an opaque identity token, not a monotonic sequence; only equality comparisons are valid. The complete
+ * digest remains available for exact in-process comparison.
  */
 public record NereusGenerationCapabilityReadiness(
         long brokerReadinessEpoch,

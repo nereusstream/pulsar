@@ -20,7 +20,11 @@ package org.apache.pulsar.broker.storage.nereus;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import com.nereusstream.managedledger.NereusManagedLedger;
+import com.nereusstream.managedledger.generation.ManagedLedgerPhysicalDeletionActivationRequest;
 import com.nereusstream.objectstore.ObjectStoreSecretResolver;
+import com.nereusstream.objectstore.S3ObjectKeyMapper;
+import com.nereusstream.pulsar.Phase4ObjectWalRuntime;
+import com.nereusstream.pulsar.Phase4PhysicalGcRuntime;
 import io.oxia.testcontainers.OxiaContainer;
 import java.net.URI;
 import java.nio.charset.StandardCharsets;
@@ -85,6 +89,7 @@ public class NereusMultiBrokerIntegrationTest {
     private static final DockerImageName LOCALSTACK_IMAGE =
             DockerImageName.parse("localstack/localstack:4.14.0");
 
+    private final boolean physicalGcEnabled;
     private final List<PulsarService> brokers = new ArrayList<>(
             Collections.nCopies(NUM_BROKERS, null));
     private final List<PulsarAdmin> admins = new ArrayList<>(
@@ -93,6 +98,14 @@ public class NereusMultiBrokerIntegrationTest {
     private LocalStackContainer localstack;
     private BKCluster bookkeeper;
     private String metadataStoreUrl;
+
+    public NereusMultiBrokerIntegrationTest() {
+        this(false);
+    }
+
+    NereusMultiBrokerIntegrationTest(boolean physicalGcEnabled) {
+        this.physicalGcEnabled = physicalGcEnabled;
+    }
 
     @BeforeClass(alwaysRun = true)
     public void startCluster() throws Exception {
@@ -196,7 +209,7 @@ public class NereusMultiBrokerIntegrationTest {
             appendSingles(producer, expected, "initial", 4);
             appendBatch(client, expected, "batch", 3);
             appendBookKeeperControl(client, bookkeeperExpected, "bookkeeper-before");
-            assertFacadeEntriesReadable(admins.get(0), 5);
+            assertFacadeEntriesReadable(admins.get(0), NEREUS_TOPIC, 5);
             assertReadAll(client, NEREUS_TOPIC, expected);
             assertSavedMessageIdStarts(client, expected);
             assertReadAll(client, BOOKKEEPER_TOPIC, bookkeeperExpected);
@@ -355,6 +368,41 @@ public class NereusMultiBrokerIntegrationTest {
         configuration.setNereusAppendSessionTtlSeconds(3);
         configuration.setNereusAppendSessionRenewBeforeSeconds(1);
         configuration.setNereusAppendSessionMinCommitRemainingSeconds(1);
+        if (physicalGcEnabled) {
+            configuration.setNereusGenerationProtocolEnabled(true);
+            configuration.setNereusPhysicalGcEnabled(true);
+            configuration.setNereusPhysicalGcDryRun(false);
+            configuration.setNereusGenerationRegistrationBackfillConcurrency(2);
+            configuration.setNereusGenerationRegistrationBackfillTimeoutSeconds(60);
+            configuration.setNereusObjectStoreRequestTimeoutSeconds(5);
+            configuration.setNereusAppendTimeoutSeconds(5);
+            configuration.setNereusAppendRecoveryTimeoutSeconds(10);
+            configuration.setNereusAppendRecoveryAttemptTimeoutSeconds(2);
+            configuration.setNereusAppendRecoveryBackoffMaxSeconds(1);
+            configuration.setNereusAppendRecoveryTerminalTtlSeconds(3);
+            configuration.setNereusReadTimeoutSeconds(10);
+            configuration.setNereusCursorSnapshotOperationTimeoutSeconds(5);
+            configuration.setNereusMaterializationRegistryScanIntervalSeconds(3600);
+            configuration.setNereusMaterializationWorkerClaimSeconds(7);
+            configuration.setNereusMaterializationWorkerRenewSeconds(2);
+            configuration.setNereusMaterializationOperationTimeoutSeconds(5);
+            configuration.setNereusMaterializationCloseTimeoutSeconds(30);
+            configuration.setNereusMaterializationRetryMinMillis(100);
+            configuration.setNereusMaterializationRetryMaxMillis(1000);
+            configuration.setNereusMaximumClockSkewSeconds(0);
+            configuration.setNereusReaderLeaseSeconds(15);
+            configuration.setNereusReaderLeaseRenewSeconds(5);
+            configuration.setNereusGcScanIntervalSeconds(3600);
+            configuration.setNereusGcOperationTimeoutSeconds(5);
+            configuration.setNereusGcCloseTimeoutSeconds(30);
+            configuration.setNereusGcDrainGraceSeconds(15);
+            configuration.setNereusPendingProtectionSeconds(6);
+            configuration.setNereusSourceRetirementGraceSeconds(1);
+            configuration.setNereusAppendReplayGraceSeconds(1);
+            configuration.setNereusMaterializationMetadataAuditGraceSeconds(1);
+            configuration.setNereusOrphanGraceSeconds(7);
+            configuration.setNereusGcTombstoneAuditGraceSeconds(20);
+        }
         return configuration;
     }
 
@@ -494,10 +542,15 @@ public class NereusMultiBrokerIntegrationTest {
         }
     }
 
-    private void assertFacadeEntriesReadable(PulsarAdmin admin, int expectedEntries) throws Exception {
-        int owner = awaitOwner(admin, NEREUS_TOPIC, null);
+    void assertFacadeEntriesReadable(String topicName, int expectedEntries) throws Exception {
+        assertFacadeEntriesReadable(admins.get(0), topicName, expectedEntries);
+    }
+
+    private void assertFacadeEntriesReadable(
+            PulsarAdmin admin, String topicName, int expectedEntries) throws Exception {
+        int owner = awaitOwner(admin, topicName, null);
         PersistentTopic topic = (PersistentTopic) brokers.get(owner).getBrokerService()
-                .getTopicReference(NEREUS_TOPIC)
+                .getTopicReference(topicName)
                 .orElseThrow();
         assertThat(topic.getManagedLedger().getLastConfirmedEntry().getEntryId())
                 .isEqualTo(expectedEntries - 1L);
@@ -635,6 +688,119 @@ public class NereusMultiBrokerIntegrationTest {
         return listing.getStdout().lines().filter(line -> !line.isBlank()).count();
     }
 
+    Set<String> logicalObjectKeys() throws Exception {
+        Container.ExecResult listing = localstack.execInContainer(
+                "awslocal",
+                "s3api",
+                "list-objects-v2",
+                "--bucket",
+                BUCKET,
+                "--prefix",
+                OBJECT_PREFIX + "/objects/v1/",
+                "--query",
+                "Contents[].Key",
+                "--output",
+                "text");
+        assertThat(listing.getExitCode()).withFailMessage(listing.getStderr()).isZero();
+        String output = listing.getStdout().trim();
+        if (output.isEmpty() || output.equals("None")) {
+            return Set.of();
+        }
+        S3ObjectKeyMapper mapper = new S3ObjectKeyMapper(OBJECT_PREFIX);
+        java.util.LinkedHashSet<String> logical = new java.util.LinkedHashSet<>();
+        for (String physical : output.split("\\s+")) {
+            assertThat(logical.add(mapper.unmap(physical).value()))
+                    .withFailMessage("duplicate mapped object key %s", physical)
+                    .isTrue();
+        }
+        return Set.copyOf(logical);
+    }
+
+    NereusManagedLedger loadedNereusLedger(String topicName) {
+        int owner = awaitOwner(admins.stream().filter(java.util.Objects::nonNull).findFirst().orElseThrow(),
+                topicName, null);
+        AtomicReference<NereusManagedLedger> ledger = new AtomicReference<>();
+        Awaitility.await().atMost(Duration.ofSeconds(60)).untilAsserted(() -> {
+            PersistentTopic topic = (PersistentTopic) brokers.get(owner).getBrokerService()
+                    .getTopicReference(topicName)
+                    .orElseThrow();
+            assertThat(topic.getManagedLedger()).isInstanceOf(NereusManagedLedger.class);
+            ledger.set((NereusManagedLedger) topic.getManagedLedger());
+        });
+        return ledger.get();
+    }
+
+    Phase4ObjectWalRuntime materializationRuntime(String topicName) {
+        return (Phase4ObjectWalRuntime) loadedNereusLedger(topicName)
+                .runtime()
+                .materializationRuntime();
+    }
+
+    Phase4PhysicalGcRuntime physicalGcRuntime(String topicName) {
+        return (Phase4PhysicalGcRuntime) loadedNereusLedger(topicName)
+                .runtime()
+                .physicalGcRuntime();
+    }
+
+    GenerationRegistrationBackfillReport activateOrRolloverPhysicalDeletion(
+            int brokerIndex, String runId) throws Exception {
+        NereusManagedLedgerStorage storage =
+                (NereusManagedLedgerStorage) brokers.get(brokerIndex).getManagedLedgerStorage();
+        AtomicReference<GenerationRegistrationBackfillReport> completed = new AtomicReference<>();
+        Awaitility.await().atMost(Duration.ofSeconds(120)).pollInterval(Duration.ofMillis(250))
+                .untilAsserted(() -> {
+                    final GenerationRegistrationBackfillReport report;
+                    try {
+                        storage.capabilityCoordinator()
+                                .requireGenerationReadiness()
+                                .get(60, TimeUnit.SECONDS);
+                        report = storage.runGenerationRegistrationBackfill(runId)
+                                .get(120, TimeUnit.SECONDS);
+                    } catch (Exception transientFailure) {
+                        throw new AssertionError(
+                                "generation readiness/backfill has not converged",
+                                transientFailure);
+                    }
+                    assertThat(report.failureCount())
+                            .withFailMessage(
+                                    "generation registration backfill failures: %s",
+                                    report.boundedFailures())
+                            .isZero();
+                    assertThat(report.boundedFailures()).isEmpty();
+                    completed.set(report);
+                });
+        return completed.get();
+    }
+
+    void startPhysicalDeletionLifecycleOnEveryBroker(
+            String runId, int concurrency, Duration timeout) throws Exception {
+        for (PulsarService broker : brokers) {
+            if (broker == null) {
+                continue;
+            }
+            NereusManagedLedgerStorage storage =
+                    (NereusManagedLedgerStorage) broker.getManagedLedgerStorage();
+            storage.activatePhysicalDeletion(
+                            new ManagedLedgerPhysicalDeletionActivationRequest(
+                                    runId, concurrency, timeout))
+                    .get(120, TimeUnit.SECONDS);
+        }
+    }
+
+    void awaitGenerationCapabilityConvergence() {
+        Awaitility.await().atMost(Duration.ofSeconds(60)).pollInterval(Duration.ofMillis(100))
+                .untilAsserted(() -> {
+                    for (PulsarService broker : brokers) {
+                        if (broker == null) {
+                            continue;
+                        }
+                        NereusManagedLedgerStorage storage =
+                                (NereusManagedLedgerStorage) broker.getManagedLedgerStorage();
+                        storage.capabilityCoordinator().requireGenerationReadiness().join();
+                    }
+                });
+    }
+
     private static int otherBroker(int index) {
         return index == 0 ? 1 : 0;
     }
@@ -649,6 +815,10 @@ public class NereusMultiBrokerIntegrationTest {
 
     String namespace() {
         return NAMESPACE;
+    }
+
+    String clusterName() {
+        return CLUSTER;
     }
 
     private static byte[] bytes(String value) {
