@@ -3949,14 +3949,28 @@ public class PersistentTopicsBase extends AdminResource {
     }
 
     protected CompletableFuture<Void> preValidation(boolean authoritative) {
-        return preValidation(authoritative, false);
+        return preValidation(authoritative, false, false);
     }
 
     protected CompletableFuture<Void> preValidationForPersistencePolicy(boolean authoritative) {
-        return preValidation(authoritative, pulsar().getBrokerService().usesStorageClassBindings());
+        return preValidation(
+                authoritative,
+                pulsar().getBrokerService().usesStorageClassBindings(),
+                false);
     }
 
-    private CompletableFuture<Void> preValidation(boolean authoritative, boolean allowMissingTopic) {
+    protected CompletableFuture<Void> preValidationForBoundTopicPolicy(
+            boolean authoritative) {
+        return preValidation(
+                authoritative,
+                false,
+                pulsar().getBrokerService().usesStorageClassBindings());
+    }
+
+    private CompletableFuture<Void> preValidation(
+            boolean authoritative,
+            boolean allowMissingTopic,
+            boolean allowActiveNereusBinding) {
         if (!config().isTopicLevelPoliciesEnabled()) {
             return FutureUtil.failedFuture(new RestException(Status.METHOD_NOT_ALLOWED,
                     "Topic level policies is disabled, to enable the topic level policy and retry."));
@@ -3971,8 +3985,17 @@ public class PersistentTopicsBase extends AdminResource {
                     if (!topicExistsInfo.isExists()) {
                         topicExistsInfo.recycle();
                         if (!allowMissingTopic) {
-                            throw new RestException(
-                                    Status.NOT_FOUND, getTopicNotFoundErrorMessage(topicName.toString()));
+                            if (!allowActiveNereusBinding) {
+                                throw new RestException(
+                                        Status.NOT_FOUND,
+                                        getTopicNotFoundErrorMessage(
+                                                topicName.toString()));
+                            }
+                            return requireActiveNereusBinding()
+                                    .thenCompose(__ ->
+                                            validateTopicOwnershipAsync(
+                                                    topicName,
+                                                    authoritative));
                         }
                         return validateTopicOwnershipAsync(topicName, authoritative);
                     } else {
@@ -3987,6 +4010,24 @@ public class PersistentTopicsBase extends AdminResource {
                         });
                     }
         });
+    }
+
+    private CompletableFuture<Void> requireActiveNereusBinding() {
+        if (!(pulsar().getManagedLedgerStorage()
+                instanceof NereusManagedLedgerStorage nereusStorage)) {
+            return FutureUtil.failedFuture(new RestException(
+                    Status.NOT_FOUND,
+                    getTopicNotFoundErrorMessage(topicName.toString())));
+        }
+        return nereusStorage.hasActiveNereusBinding(topicName)
+                .thenAccept(active -> {
+                    if (!active) {
+                        throw new RestException(
+                                Status.NOT_FOUND,
+                                getTopicNotFoundErrorMessage(
+                                        topicName.toString()));
+                    }
+                });
     }
 
     protected CompletableFuture<Void> internalRemoveMaxProducers(boolean isGlobal) {

@@ -392,6 +392,27 @@ public final class NereusManagedLedgerStorage implements ManagedLedgerStorage {
         });
     }
 
+    /** Returns true only for an existing, live Nereus topic incarnation. */
+    public CompletableFuture<Boolean> hasActiveNereusBinding(
+            TopicName topicName) {
+        final String persistenceName;
+        try {
+            ensureReady();
+            persistenceName = Objects.requireNonNull(
+                            topicName, "topicName")
+                    .getPersistenceNamingEncoding();
+        } catch (RuntimeException error) {
+            return CompletableFuture.failedFuture(error);
+        }
+        return bindingStore.getBinding(persistenceName)
+                .thenApply(binding -> binding
+                        .filter(current -> current.state()
+                                == StorageClassBindingState.ACTIVE)
+                        .filter(current -> StorageClassBindingRecord.NEREUS
+                                .equals(current.storageClass()))
+                        .isPresent());
+    }
+
     static CompletableFuture<Void> validateBoundNereusAdminOperation(
             NereusAdminOperation operation,
             boolean generationProtocolEnabled,
