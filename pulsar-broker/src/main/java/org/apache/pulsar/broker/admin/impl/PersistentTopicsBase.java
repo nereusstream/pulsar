@@ -4795,6 +4795,38 @@ public class PersistentTopicsBase extends AdminResource {
                         .orElseGet(() -> topicNotFoundReasonAsync(topicName)));
     }
 
+    private CompletableFuture<Topic> getTopicReferenceOrLoadActiveNereusAsync(
+            TopicName topicName) {
+        return pulsar().getBrokerService()
+                .getTopicIfExists(topicName.toString())
+                .thenCompose(optionalTopic -> {
+                    if (optionalTopic.isPresent()) {
+                        return CompletableFuture.completedFuture(
+                                optionalTopic.orElseThrow());
+                    }
+                    if (!(pulsar().getManagedLedgerStorage()
+                            instanceof NereusManagedLedgerStorage nereusStorage)) {
+                        return topicNotFoundReasonAsync(topicName);
+                    }
+                    return nereusStorage.hasActiveNereusBinding(topicName)
+                            .thenCompose(active -> active
+                                    ? pulsar().getBrokerService()
+                                            .getTopic(
+                                                    topicName.toString(),
+                                                    true)
+                                    : CompletableFuture.completedFuture(
+                                            Optional.empty()))
+                            .thenCompose(loaded -> loaded
+                                    .filter(topic -> topic
+                                            instanceof PersistentTopic persistentTopic
+                                            && persistentTopic
+                                                    .isNereusManagedLedger())
+                                    .map(CompletableFuture::completedFuture)
+                                    .orElseGet(() ->
+                                            topicNotFoundReasonAsync(topicName)));
+                });
+    }
+
     private CompletableFuture<Topic> topicNotFoundReasonAsync(TopicName topicName) {
         if (!topicName.isPartitioned()) {
             return FutureUtil.failedFuture(new RestException(Status.NOT_FOUND,
@@ -5010,7 +5042,8 @@ public class PersistentTopicsBase extends AdminResource {
     private CompletableFuture<Void> trimNonPartitionedTopic(AsyncResponse asyncResponse,
                                                             TopicName topicName, boolean authoritative) {
         return  validateTopicOwnershipAsync(topicName, authoritative)
-                .thenCompose(__ -> getTopicReferenceAsync(topicName))
+                .thenCompose(__ ->
+                        getTopicReferenceOrLoadActiveNereusAsync(topicName))
                 .thenCompose(topic -> validateNereusAdminOperation(
                         topic, NereusAdminOperation.TRIM_TOPIC))
                 .thenCompose(topic -> {
