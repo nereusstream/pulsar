@@ -555,9 +555,12 @@ public final class DefaultNereusGenerationRegistrationBackfill
         TreeSet<NamespaceName> canonical = new TreeSet<>(
                 Comparator.comparing(NamespaceName::toString));
         for (String value : supplied) {
-            NamespaceName namespace = NamespaceName.get(value);
-            if (!tenant.equals(namespace.getTenant())
-                    || !namespace.toString().equals(value)
+            if (value == null || value.isBlank() || value.indexOf('/') >= 0) {
+                throw new IllegalArgumentException(
+                        "namespace list contains a non-local name");
+            }
+            NamespaceName namespace = NamespaceName.get(tenant, value);
+            if (!namespace.getLocalName().equals(value)
                     || !canonical.add(namespace)) {
                 throw new IllegalArgumentException(
                         "namespace list is not canonical and unique");

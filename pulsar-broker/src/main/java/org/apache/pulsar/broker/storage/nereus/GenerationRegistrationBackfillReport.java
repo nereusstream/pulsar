@@ -50,20 +50,20 @@ public record GenerationRegistrationBackfillReport(
         requireNonNegative(nereusProjectionsRegistered, "nereusProjectionsRegistered");
         requireNonNegative(deletedOrNonNereusSkipped, "deletedOrNonNereusSkipped");
         requireNonNegative(failureCount, "failureCount");
-        long terminalTopics;
+        long successfulTopics;
         try {
-            terminalTopics = Math.addExact(
-                    Math.addExact(
-                            nereusProjectionsRegistered,
-                            deletedOrNonNereusSkipped),
-                    failureCount);
+            successfulTopics = Math.addExact(
+                    nereusProjectionsRegistered,
+                    deletedOrNonNereusSkipped);
         } catch (ArithmeticException overflow) {
             throw new IllegalArgumentException(
                     "topic outcome counters overflow", overflow);
         }
-        if (persistentTopicsScanned != terminalTopics) {
+        if (successfulTopics > persistentTopicsScanned
+                || persistentTopicsScanned - successfulTopics > failureCount) {
             throw new IllegalArgumentException(
-                    "persistentTopicsScanned must equal registered + skipped + failed");
+                    "persistentTopicsScanned must equal registered + skipped + topic failures, "
+                            + "and topic failures cannot exceed total failures");
         }
         coverageSha256 = Objects.requireNonNull(coverageSha256, "coverageSha256");
         if (coverageSha256.type() != ChecksumType.SHA256) {
