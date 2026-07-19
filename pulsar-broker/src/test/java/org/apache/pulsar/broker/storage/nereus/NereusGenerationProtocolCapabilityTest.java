@@ -38,7 +38,7 @@ import org.testng.annotations.Test;
 public class NereusGenerationProtocolCapabilityTest {
     @Test
     public void readinessIdentityRejectsNonCanonicalFields() {
-        String digest = "bc63f01d0aa01a65c7205625a2714f0246d8ba7e7b88b8a653137abbc719cc0d";
+        String digest = "80806f90349e89afb16f65d2e90f06339f48babe836f9954ad41fefc2869ab75";
 
         assertThatThrownBy(() -> new NereusGenerationCapabilityReadiness(-1, digest, 1))
                 .isInstanceOf(IllegalArgumentException.class)
@@ -94,9 +94,9 @@ public class NereusGenerationProtocolCapabilityTest {
                 coordinator.requireGenerationReadiness().join();
 
         assertThat(readiness.persistentBrokerCount()).isEqualTo(2);
-        assertThat(readiness.brokerReadinessEpoch()).isEqualTo(4351585672493013605L);
+        assertThat(readiness.brokerReadinessEpoch()).isEqualTo(36151462167742895L);
         assertThat(readiness.brokerSetSha256())
-                .isEqualTo("bc63f01d0aa01a65c7205625a2714f0246d8ba7e7b88b8a653137abbc719cc0d");
+                .isEqualTo("80806f90349e89afb16f65d2e90f06339f48babe836f9954ad41fefc2869ab75");
         assertThat(coordinator.currentGenerationReadiness()).contains(readiness);
         assertThat(coordinator.currentGenerationCapabilityReadiness())
                 .contains(readiness.toCore());
