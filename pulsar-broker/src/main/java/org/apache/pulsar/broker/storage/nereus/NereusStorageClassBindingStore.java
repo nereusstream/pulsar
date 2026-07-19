@@ -43,6 +43,8 @@ import org.apache.pulsar.metadata.api.extended.MetadataStoreExtended;
 
 /** Single-key Nereus storage-class claim used before projection publication. */
 public final class NereusStorageClassBindingStore implements AutoCloseable {
+    private static final String BOOKKEEPER_MANAGED_LEDGER_ROOT = "/managed-ledgers/";
+
     private final MetadataStoreExtended metadataStore;
     private final ManagedLedgerFactory bookkeeperFactory;
     private final Duration timeout;
@@ -214,7 +216,7 @@ public final class NereusStorageClassBindingStore implements AutoCloseable {
                 return CompletableFuture.failedFuture(
                         new IllegalStateException("storage-class binding claim is no longer abortable"));
             }
-            return bookkeeperFactory.asyncExists(permit.persistenceName()).thenCombine(
+            return bookkeeperDurableStateExists(permit.persistenceName()).thenCombine(
                     factory.inspectStorageState(permit.persistenceName()), StorageObservations::new)
                     .thenCompose(observations -> {
                         if (observations.bookkeeperExists()
@@ -247,7 +249,7 @@ public final class NereusStorageClassBindingStore implements AutoCloseable {
             return CompletableFuture.failedFuture(error);
         }
         return metadataStore.sync(path).thenCompose(ignored -> metadataStore.get(path)).thenCompose(current -> {
-            CompletableFuture<Boolean> bookkeeperState = bookkeeperFactory.asyncExists(persistenceName);
+            CompletableFuture<Boolean> bookkeeperState = bookkeeperDurableStateExists(persistenceName);
             CompletableFuture<NereusStorageStateSnapshot> nereusState = factory.inspectStorageState(persistenceName);
             return bookkeeperState.thenCombine(nereusState, StorageObservations::new).thenAccept(observations -> {
                 if (current.isEmpty()) {
@@ -364,7 +366,7 @@ public final class NereusStorageClassBindingStore implements AutoCloseable {
                 StorageClassBindingRecord binding = decode(existing.orElseThrow(), persistenceName);
                 return CompletableFuture.completedFuture(permit(path, binding));
             }
-            return bookkeeperFactory.asyncExists(persistenceName).thenCompose(bookkeeperExists -> {
+            return bookkeeperDurableStateExists(persistenceName).thenCompose(bookkeeperExists -> {
                 if (bookkeeperExists) {
                     return CompletableFuture.failedFuture(new IllegalStateException(
                             "existing BookKeeper storage cannot be opened as Nereus"));
@@ -406,7 +408,7 @@ public final class NereusStorageClassBindingStore implements AutoCloseable {
                             new IllegalStateException("Nereus binding store is closed"));
                 }
                 return metadataStore.sync(path).thenCompose(ignored -> metadataStore.get(path)).thenCombine(
-                        bookkeeperFactory.asyncExists(binding.persistenceName()),
+                        bookkeeperDurableStateExists(binding.persistenceName()),
                         (current, bookkeeperExists) -> {
                     if (bookkeeperExists) {
                         throw new IllegalStateException(
@@ -444,7 +446,7 @@ public final class NereusStorageClassBindingStore implements AutoCloseable {
                     new IllegalStateException("storage-class binding CAS retry limit exceeded"));
         }
         return metadataStore.sync(path).thenCompose(ignored -> metadataStore.get(path)).thenCompose(current -> {
-            CompletableFuture<Boolean> bookkeeperState = bookkeeperFactory.asyncExists(persistenceName);
+            CompletableFuture<Boolean> bookkeeperState = bookkeeperDurableStateExists(persistenceName);
             CompletableFuture<NereusStorageStateSnapshot> nereusState = factory.inspectStorageState(persistenceName);
             return bookkeeperState.thenCombine(nereusState, StorageObservations::new).thenCompose(observations -> {
                 if (current.isEmpty()) {
@@ -480,7 +482,7 @@ public final class NereusStorageClassBindingStore implements AutoCloseable {
                     new IllegalStateException("storage-class binding CAS retry limit exceeded"));
         }
         return metadataStore.sync(path).thenCompose(ignored -> metadataStore.get(path)).thenCompose(current -> {
-            CompletableFuture<Boolean> bookkeeperState = bookkeeperFactory.asyncExists(persistenceName);
+            CompletableFuture<Boolean> bookkeeperState = bookkeeperDurableStateExists(persistenceName);
             CompletableFuture<NereusStorageStateSnapshot> nereusState = factory.inspectStorageState(persistenceName);
             return bookkeeperState.thenCombine(nereusState, StorageObservations::new).thenCompose(observations -> {
                 if (current.isEmpty()) {
@@ -666,7 +668,7 @@ public final class NereusStorageClassBindingStore implements AutoCloseable {
                 return CompletableFuture.failedFuture(
                         new IllegalStateException("storage-class binding cannot complete delete"));
             }
-            CompletableFuture<Boolean> bookkeeperState = bookkeeperFactory.asyncExists(permit.persistenceName());
+            CompletableFuture<Boolean> bookkeeperState = bookkeeperDurableStateExists(permit.persistenceName());
             CompletableFuture<NereusStorageStateSnapshot> nereusState =
                     factory.inspectStorageState(permit.persistenceName());
             return bookkeeperState.thenCombine(nereusState, StorageObservations::new).thenCompose(observations -> {
@@ -910,6 +912,20 @@ public final class NereusStorageClassBindingStore implements AutoCloseable {
         }
         requireNereusGeneration(snapshot, expectedGeneration);
         return snapshot.state() != NereusDurableStorageState.DELETED;
+    }
+
+    private CompletableFuture<Boolean> bookkeeperDurableStateExists(String persistenceName) {
+        return bookkeeperFactory.asyncExists(persistenceName).thenCompose(exists -> {
+            if (!exists) {
+                return CompletableFuture.completedFuture(false);
+            }
+            String path = BOOKKEEPER_MANAGED_LEDGER_ROOT + persistenceName;
+            return metadataStore.get(path).thenApply(current -> current
+                    .map(result -> result.getValue().length > 0)
+                    // A disappeared node after asyncExists is an observation race. Fail closed instead of
+                    // authorizing a different storage class from an unstable absence.
+                    .orElse(true));
+        });
     }
 
     private static void requireBoundStorageDeleted(
