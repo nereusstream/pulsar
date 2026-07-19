@@ -296,10 +296,8 @@ public final class DefaultNereusGenerationRegistrationBackfill
         }
         NamespaceName namespace = namespaces.get(index);
         accumulator.namespace(namespace.toString());
-        return bound(
-                        () -> topicResources.listPersistentTopicsAsync(
-                                namespace),
-                        deadlineNanos)
+        return listNamespaceTopics(
+                        namespace, request, deadlineNanos)
                 .handle((topics, error) -> {
                     if (error != null) {
                         accumulator.failure(
@@ -314,7 +312,7 @@ public final class DefaultNereusGenerationRegistrationBackfill
                                     "NEREUS_GENERATION_BACKFILL_TOPIC_LIST_LIMIT_EXCEEDED");
                         }
                         return processTopicBatches(
-                                canonicalTopics(namespace, topics),
+                                topics,
                                 0,
                                 accumulator,
                                 request,
@@ -335,6 +333,25 @@ public final class DefaultNereusGenerationRegistrationBackfill
                         accumulator,
                         request,
                         deadlineNanos));
+    }
+
+    private CompletableFuture<List<TopicName>> listNamespaceTopics(
+            NamespaceName namespace,
+            GenerationRegistrationBackfillRequest request,
+            long deadlineNanos) {
+        CompletableFuture<List<String>> pulsarTopics = bound(
+                () -> topicResources.listPersistentTopicsAsync(namespace),
+                deadlineNanos);
+        CompletableFuture<List<StorageClassBindingRecord>> boundTopics = bound(
+                () -> bindingStore.listNonDeletedBindings(
+                        namespace,
+                        maxTopicsPerNamespace,
+                        request.maxConcurrency()),
+                deadlineNanos);
+        return pulsarTopics.thenCombine(
+                boundTopics,
+                (catalog, bindings) -> canonicalTopics(
+                        namespace, catalog, bindings));
     }
 
     private CompletableFuture<Void> processTopicBatches(
@@ -571,8 +588,10 @@ public final class DefaultNereusGenerationRegistrationBackfill
 
     private static List<TopicName> canonicalTopics(
             NamespaceName namespace,
-            List<String> supplied) {
+            List<String> supplied,
+            List<StorageClassBindingRecord> bindings) {
         Objects.requireNonNull(supplied, "topics");
+        Objects.requireNonNull(bindings, "bindings");
         TreeSet<TopicName> canonical = new TreeSet<>(
                 Comparator.comparing(TopicName::toString));
         for (String value : supplied) {
@@ -584,6 +603,25 @@ public final class DefaultNereusGenerationRegistrationBackfill
                 throw new IllegalArgumentException(
                         "topic list is not canonical and unique");
             }
+        }
+        TreeSet<TopicName> bound = new TreeSet<>(
+                Comparator.comparing(TopicName::toString));
+        for (StorageClassBindingRecord binding : bindings) {
+            String persistenceName = Objects.requireNonNull(
+                            binding, "binding")
+                    .persistenceName();
+            TopicName topic = TopicName.get(
+                    TopicName.fromPersistenceNamingEncoding(
+                            persistenceName));
+            if (topic.getDomain() != TopicDomain.persistent
+                    || !namespace.equals(topic.getNamespaceObject())
+                    || !topic.getPersistenceNamingEncoding()
+                            .equals(persistenceName)
+                    || !bound.add(topic)) {
+                throw new IllegalArgumentException(
+                        "binding topic list is not canonical and unique");
+            }
+            canonical.add(topic);
         }
         return List.copyOf(canonical);
     }

@@ -21,6 +21,8 @@ package org.apache.pulsar.broker.storage.nereus;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyInt;
+import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 import com.nereusstream.core.capability.GenerationRegistrationBackfillCompletion;
@@ -72,6 +74,15 @@ public class NereusGenerationRegistrationBackfillTest {
                 persistence(topicA), activeBinding(topicA, StorageClassBindingRecord.NEREUS, 3),
                 persistence(topicB), activeBinding(topicB, StorageClassBindingRecord.NEREUS, 5),
                 persistence(bookkeeper), activeBinding(bookkeeper, StorageClassBindingRecord.BOOKKEEPER, 2));
+        when(bindings.listNonDeletedBindings(
+                        eq(NamespaceName.get("tenant-a/ns-a")), anyInt(), anyInt()))
+                .thenReturn(completed(List.of(
+                        records.get(persistence(bookkeeper)),
+                        records.get(persistence(topicA)))));
+        when(bindings.listNonDeletedBindings(
+                        eq(NamespaceName.get("tenant-b/ns-b")), anyInt(), anyInt()))
+                .thenReturn(completed(List.of(
+                        records.get(persistence(topicB)))));
         when(bindings.getBinding(any())).thenAnswer(invocation ->
                 completed(Optional.ofNullable(records.get(invocation.getArgument(0)))));
         AtomicInteger registrations = new AtomicInteger();
@@ -141,6 +152,8 @@ public class NereusGenerationRegistrationBackfillTest {
         when(namespaces.listNamespacesAsync("tenant"))
                 .thenReturn(completed(List.of(namespace.getLocalName())));
         when(topics.listPersistentTopicsAsync(namespace)).thenReturn(completed(topicNames));
+        when(bindings.listNonDeletedBindings(eq(namespace), anyInt(), anyInt()))
+                .thenReturn(completed(List.of()));
         when(bindings.getBinding(any())).thenAnswer(invocation -> {
             String persistenceName = invocation.getArgument(0);
             return completed(Optional.of(StorageClassBindingRecord.claimed(
@@ -214,6 +227,8 @@ public class NereusGenerationRegistrationBackfillTest {
         when(namespaces.listNamespacesAsync("tenant"))
                 .thenReturn(completed(List.of(namespace.getLocalName())));
         when(topics.listPersistentTopicsAsync(namespace)).thenReturn(completed(topicNames));
+        when(bindings.listNonDeletedBindings(eq(namespace), anyInt(), anyInt()))
+                .thenReturn(completed(List.of()));
         when(bindings.getBinding(any())).thenReturn(
                 CompletableFuture.failedFuture(new IllegalStateException("read failed")));
         AtomicInteger proofs = new AtomicInteger();
@@ -254,6 +269,9 @@ public class NereusGenerationRegistrationBackfillTest {
         when(namespaces.listNamespacesAsync("tenant"))
                 .thenReturn(completed(List.of(namespace.getLocalName())));
         when(topics.listPersistentTopicsAsync(namespace)).thenReturn(completed(List.of(topic)));
+        when(bindings.listNonDeletedBindings(eq(namespace), anyInt(), anyInt()))
+                .thenReturn(completed(List.of(
+                        activeBinding(topic, StorageClassBindingRecord.NEREUS, 3))));
         when(bindings.getBinding(persistence(topic))).thenReturn(
                 completed(Optional.of(activeBinding(
                         topic, StorageClassBindingRecord.NEREUS, 3))),
@@ -297,6 +315,8 @@ public class NereusGenerationRegistrationBackfillTest {
         when(topics.listPersistentTopicsAsync(namespace))
                 .thenReturn(CompletableFuture.failedFuture(
                         new IllegalStateException("topic listing failed")));
+        when(bindings.listNonDeletedBindings(eq(namespace), anyInt(), anyInt()))
+                .thenReturn(completed(List.of()));
         AtomicInteger proofs = new AtomicInteger();
         var backfill = new DefaultNereusGenerationRegistrationBackfill(
                 tenants,
@@ -318,6 +338,48 @@ public class NereusGenerationRegistrationBackfillTest {
             assertThat(failure.errorCode()).isEqualTo("OPERATION_FAILED");
         });
         assertThat(proofs).hasValue(0);
+    }
+
+    @Test
+    public void discoversNereusBindingMissingFromManagedLedgerCatalog() {
+        TenantResources tenants = mock(TenantResources.class);
+        NamespaceResources namespaces = mock(NamespaceResources.class);
+        TopicResources topics = mock(TopicResources.class);
+        NereusStorageClassBindingStore bindings = mock(NereusStorageClassBindingStore.class);
+        NereusBrokerCapabilityCoordinator capabilities = capabilities(readiness("88"));
+        String topic = "persistent://tenant/ns/cold-nereus-topic";
+        NamespaceName namespace = TopicName.get(topic).getNamespaceObject();
+        StorageClassBindingRecord binding = activeBinding(
+                topic, StorageClassBindingRecord.NEREUS, 3);
+        when(tenants.listTenantsAsync()).thenReturn(completed(List.of("tenant")));
+        when(namespaces.listNamespacesAsync("tenant"))
+                .thenReturn(completed(List.of(namespace.getLocalName())));
+        when(topics.listPersistentTopicsAsync(namespace))
+                .thenReturn(completed(List.of()));
+        when(bindings.listNonDeletedBindings(eq(namespace), anyInt(), anyInt()))
+                .thenReturn(completed(List.of(binding)));
+        when(bindings.getBinding(persistence(topic)))
+                .thenReturn(completed(Optional.of(binding)));
+        AtomicInteger registrations = new AtomicInteger();
+        AtomicInteger proofs = new AtomicInteger();
+        var backfill = new DefaultNereusGenerationRegistrationBackfill(
+                tenants,
+                namespaces,
+                topics,
+                bindings,
+                registrationAccess(registrations),
+                proofAccess(proofs),
+                capabilities,
+                10);
+
+        GenerationRegistrationBackfillReport report = backfill.run(request(2)).join();
+
+        assertThat(report.namespacesScanned()).isOne();
+        assertThat(report.persistentTopicsScanned()).isOne();
+        assertThat(report.nereusProjectionsRegistered()).isOne();
+        assertThat(report.failureCount()).isZero();
+        assertThat(registrations).hasValue(1);
+        assertThat(proofs).hasValue(1);
     }
 
     @Test
