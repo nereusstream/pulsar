@@ -18,10 +18,12 @@
  */
 package org.apache.pulsar.broker.storage.nereus;
 
+import com.nereusstream.api.StorageProfile;
 import com.nereusstream.core.capability.GenerationCapabilityReadiness;
 import com.nereusstream.core.capability.GenerationCapabilityReadinessProvider;
 import com.nereusstream.managedledger.cursor.CursorLedgerIdentity;
 import com.nereusstream.managedledger.cursor.CursorProtocolActivationGuard;
+import com.nereusstream.pulsar.BookKeeperPrimaryWalCapabilityBinding;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.charset.StandardCharsets;
@@ -54,6 +56,8 @@ public final class NereusBrokerCapabilityCoordinator
     private final AtomicLong brokerRegistryRevision = new AtomicLong();
     private final AtomicReference<CachedGenerationReadiness> generationReadiness =
             new AtomicReference<>();
+    private final AtomicReference<BookKeeperPrimaryWalCapabilityBinding> bookKeeperBinding =
+            new AtomicReference<>();
 
     public NereusBrokerCapabilityCoordinator(Duration operationTimeout) {
         this.operationTimeout = java.util.Objects.requireNonNull(operationTimeout, "operationTimeout");
@@ -65,6 +69,19 @@ public final class NereusBrokerCapabilityCoordinator
     public void markStorageInitialized() {
         if (!storageInitialized.compareAndSet(false, true)) {
             throw new IllegalStateException("Nereus storage capability was already initialized");
+        }
+    }
+
+    public void installBookKeeperPrimaryWalCapability(
+            BookKeeperPrimaryWalCapabilityBinding binding) {
+        java.util.Objects.requireNonNull(binding, "binding");
+        if (storageInitialized.get()) {
+            throw new IllegalStateException(
+                    "BookKeeper primary-WAL capability cannot change after storage initialization");
+        }
+        if (!bookKeeperBinding.compareAndSet(null, binding)) {
+            throw new IllegalStateException(
+                    "BookKeeper primary-WAL capability was already installed");
         }
     }
 
@@ -94,6 +111,9 @@ public final class NereusBrokerCapabilityCoordinator
         properties.put(PROPERTY, VERSION);
         properties.put(NereusCursorProtocolCapability.PROPERTY, NereusCursorProtocolCapability.VERSION);
         properties.put(NereusGenerationProtocolCapability.PROPERTY, NereusGenerationProtocolCapability.VERSION);
+        Optional.ofNullable(bookKeeperBinding.get())
+                .map(NereusBookKeeperPrimaryWalCapability::properties)
+                .ifPresent(properties::putAll);
         return Map.copyOf(properties);
     }
 
@@ -112,6 +132,21 @@ public final class NereusBrokerCapabilityCoordinator
     /** F4 barrier requiring binding, cursor, and generation protocols under one stable broker epoch. */
     public CompletableFuture<Void> requireGenerationClusterReady() {
         return requireGenerationReadiness().thenApply(ignored -> null);
+    }
+
+    /** First-create barrier for BK profiles; Object profiles retain the existing capability path. */
+    public CompletableFuture<Void> requireStorageProfileReady(StorageProfile profile) {
+        StorageProfile exact = java.util.Objects.requireNonNull(profile, "profile").canonical();
+        if (!exact.usesBookKeeperWal()) {
+            return CompletableFuture.completedFuture(null);
+        }
+        BookKeeperPrimaryWalCapabilityBinding binding = bookKeeperBinding.get();
+        if (binding == null) {
+            return CompletableFuture.failedFuture(new IllegalStateException(
+                    "NEREUS_BOOKKEEPER_CAPABILITY_NOT_READY:LOCAL"));
+        }
+        return requireClusterReady(
+                NereusBookKeeperPrimaryWalCapability.requiredProperties(binding, exact));
     }
 
     /**

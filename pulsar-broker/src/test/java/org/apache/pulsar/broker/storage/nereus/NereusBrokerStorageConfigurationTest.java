@@ -48,6 +48,7 @@ public class NereusBrokerStorageConfigurationTest {
                 .isLessThanOrEqualTo(runtime.oxia().maxPendingOperations());
         assertThat(runtime.managedLedger().defaultStorageProfile())
                 .isEqualTo(StorageProfile.OBJECT_WAL_SYNC_OBJECT);
+        assertThat(runtime.bookKeeper()).isEmpty();
         assertThat(runtime.materialization().committedPolicy().minMergeSourceRanges())
                 .isEqualTo(2);
         assertThat(runtime.materialization().maxConcurrentWorkers())
@@ -116,6 +117,33 @@ public class NereusBrokerStorageConfigurationTest {
     }
 
     @Test
+    public void mapsExplicitBookKeeperPrimaryWalConfigurationAndAllThreeProfiles() {
+        ServiceConfiguration broker = validBookKeeperConfiguration();
+        NereusProcessIdentity identity = NereusProcessIdentity.generate(new SecureRandom());
+        NereusBrokerStorageConfiguration checked = new NereusBrokerStorageConfiguration(broker);
+
+        for (StorageProfile profile : new StorageProfile[] {
+            StorageProfile.BOOKKEEPER_WAL_ONLY,
+            StorageProfile.BOOKKEEPER_WAL_ASYNC_OBJECT,
+            StorageProfile.BOOKKEEPER_WAL_SYNC_OBJECT
+        }) {
+            broker.setNereusDefaultStorageProfile(profile.name());
+            var runtime = checked.runtimeConfiguration(identity);
+            assertThat(runtime.managedLedger().defaultStorageProfile()).isEqualTo(profile);
+            assertThat(runtime.bookKeeper()).get().satisfies(bookKeeper -> {
+                assertThat(bookKeeper.deploymentId()).isEqualTo("deployment-1");
+                assertThat(bookKeeper.wal().clusterAlias()).isEqualTo("test-cluster");
+                assertThat(bookKeeper.wal().providerScopeSha256()).isEqualTo("11".repeat(32));
+                assertThat(bookKeeper.wal().ledgerIdPrefixBits()).isEqualTo(12);
+                assertThat(bookKeeper.wal().ledgerIdPrefixValue()).isEqualTo(0x801);
+                assertThat(bookKeeper.wal().configurationBindingSha256().value()).hasSize(64);
+                assertThat(bookKeeper.ledgerGc().enabled()).isFalse();
+                assertThat(bookKeeper.ledgerGc().dryRun()).isTrue();
+            });
+        }
+    }
+
+    @Test
     public void rejectsInvalidCrossConfigBeforeClientConstruction() {
         ServiceConfiguration disabled = validConfiguration();
         disabled.setNereusEnabled(false);
@@ -168,7 +196,24 @@ public class NereusBrokerStorageConfigurationTest {
                         NereusProcessIdentity.generate(
                                 new SecureRandom())))
                 .isInstanceOf(IllegalArgumentException.class)
-                .hasMessageContaining("exact Object-WAL profile");
+                .hasMessageContaining("exact non-legacy profile");
+
+        ServiceConfiguration missingBookKeeperRuntime = validConfiguration();
+        missingBookKeeperRuntime.setNereusDefaultStorageProfile(
+                StorageProfile.BOOKKEEPER_WAL_ONLY.name());
+        assertThatThrownBy(() -> new NereusBrokerStorageConfiguration(
+                        missingBookKeeperRuntime)
+                .runtimeConfiguration(NereusProcessIdentity.generate(new SecureRandom())))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("requires BookKeeper runtime configuration");
+
+        ServiceConfiguration invalidBookKeeperQuorum = validBookKeeperConfiguration();
+        invalidBookKeeperQuorum.setNereusBookKeeperAckQuorumSize(3);
+        assertThatThrownBy(() -> new NereusBrokerStorageConfiguration(
+                        invalidBookKeeperQuorum)
+                .runtimeConfiguration(NereusProcessIdentity.generate(new SecureRandom())))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("ensemble >= write >= ack");
 
         ServiceConfiguration invalidLag = validConfiguration();
         invalidLag.setNereusMaterializationLagRejectRecords(100);
@@ -243,6 +288,17 @@ public class NereusBrokerStorageConfigurationTest {
         broker.setNereusObjectStoreRegion("us-east-1");
         broker.setNereusObjectStoreBucket("nereus-test");
         broker.setNereusObjectStorePrefix("test-cluster");
+        return broker;
+    }
+
+    private static ServiceConfiguration validBookKeeperConfiguration() {
+        ServiceConfiguration broker = validConfiguration();
+        broker.setNereusBookKeeperPrimaryWalEnabled(true);
+        broker.setNereusBookKeeperDeploymentId("deployment-1");
+        broker.setNereusBookKeeperProviderScopeSha256("11".repeat(32));
+        broker.setNereusBookKeeperLedgerIdNamespaceReservationId("reservation-1");
+        broker.setNereusBookKeeperPasswordSecretRef("secret://bookkeeper/password");
+        broker.setNereusBookKeeperPasswordIdentityVersion("v1");
         return broker;
     }
 }

@@ -2844,6 +2844,80 @@ public class ServiceConfiguration implements PulsarConfiguration {
     @FieldContext(category = CATEGORY_STORAGE_ML,
             doc = "Default Nereus storage profile used only when a topic projection is first created")
     private String nereusDefaultStorageProfile = "OBJECT_WAL_SYNC_OBJECT";
+    @FieldContext(category = CATEGORY_STORAGE_ML,
+            doc = "Install the Nereus BookKeeper primary-WAL provider; publication still requires cluster capability")
+    private boolean nereusBookKeeperPrimaryWalEnabled = false;
+    @FieldContext(category = CATEGORY_STORAGE_ML, doc = "Nereus deployment identity owning the reserved BK prefix")
+    private String nereusBookKeeperDeploymentId = "";
+    @FieldContext(category = CATEGORY_STORAGE_ML, doc = "SHA-256 identity of the shared BookKeeper provider scope")
+    private String nereusBookKeeperProviderScopeSha256 = "";
+    @FieldContext(category = CATEGORY_STORAGE_ML, doc = "Reserved positive BookKeeper ledger-id prefix width")
+    private int nereusBookKeeperLedgerIdPrefixBits = 12;
+    @FieldContext(category = CATEGORY_STORAGE_ML, doc = "Reserved positive BookKeeper ledger-id prefix value")
+    private long nereusBookKeeperLedgerIdPrefixValue = 0x801;
+    @FieldContext(category = CATEGORY_STORAGE_ML, doc = "Exact provisioned BookKeeper namespace reservation id")
+    private String nereusBookKeeperLedgerIdNamespaceReservationId = "";
+    @FieldContext(category = CATEGORY_STORAGE_ML, doc = "Nereus BookKeeper ensemble size")
+    private int nereusBookKeeperEnsembleSize = 2;
+    @FieldContext(category = CATEGORY_STORAGE_ML, doc = "Nereus BookKeeper write quorum size")
+    private int nereusBookKeeperWriteQuorumSize = 2;
+    @FieldContext(category = CATEGORY_STORAGE_ML, doc = "Nereus BookKeeper acknowledgement quorum size")
+    private int nereusBookKeeperAckQuorumSize = 2;
+    @FieldContext(category = CATEGORY_STORAGE_ML, doc = "Nereus BookKeeper digest type")
+    private String nereusBookKeeperDigestType = "CRC32C";
+    @FieldContext(category = CATEGORY_STORAGE_ML, doc = "Secret reference for the Nereus BookKeeper ledger password")
+    private String nereusBookKeeperPasswordSecretRef = "";
+    @FieldContext(category = CATEGORY_STORAGE_ML, doc = "Non-secret identity version of the BookKeeper password")
+    private String nereusBookKeeperPasswordIdentityVersion = "";
+    @FieldContext(category = CATEGORY_STORAGE_ML, doc = "Maximum entries in one Nereus BookKeeper ledger")
+    private long nereusBookKeeperMaxEntriesPerLedger = 100000;
+    @FieldContext(category = CATEGORY_STORAGE_ML, doc = "Maximum logical bytes in one Nereus BookKeeper ledger")
+    private long nereusBookKeeperMaxBytesPerLedger = 268435456;
+    @FieldContext(category = CATEGORY_STORAGE_ML, doc = "Maximum append ranges inventoried per Nereus BK ledger")
+    private int nereusBookKeeperMaxAppendRangesPerLedger = 1000;
+    @FieldContext(category = CATEGORY_STORAGE_ML, doc = "Fixed protection slots for each Nereus BK append range")
+    private int nereusBookKeeperProtectionSlotsPerRange = 8;
+    @FieldContext(category = CATEGORY_STORAGE_ML, doc = "Maximum durable reader leases per Nereus BK ledger")
+    private int nereusBookKeeperMaxReaderLeasesPerLedger = 64;
+    @FieldContext(category = CATEGORY_STORAGE_ML, doc = "Maximum fixed uncertain BookKeeper allocation slots")
+    private int nereusBookKeeperMaxUncertainAllocations = 32;
+    @FieldContext(category = CATEGORY_STORAGE_ML, doc = "Maximum Nereus BookKeeper ledger age in seconds")
+    private long nereusBookKeeperMaxLedgerAgeSeconds = 3600;
+    @FieldContext(category = CATEGORY_STORAGE_ML, doc = "Maximum concurrent Nereus BookKeeper writes")
+    private int nereusBookKeeperMaxWritesInFlight = 1;
+    @FieldContext(category = CATEGORY_STORAGE_ML, doc = "Maximum concurrent Nereus BookKeeper reads")
+    private int nereusBookKeeperMaxReadsInFlight = 64;
+    @FieldContext(category = CATEGORY_STORAGE_ML, doc = "Maximum in-flight Nereus BookKeeper read bytes")
+    private long nereusBookKeeperMaxReadBytesInFlight = 134217728;
+    @FieldContext(category = CATEGORY_STORAGE_ML, doc = "Nereus BookKeeper operation timeout in seconds")
+    private long nereusBookKeeperOperationTimeoutSeconds = 30;
+    @FieldContext(category = CATEGORY_STORAGE_ML, doc = "Nereus BookKeeper allocation timeout in seconds")
+    private long nereusBookKeeperAllocationTimeoutSeconds = 20;
+    @FieldContext(category = CATEGORY_STORAGE_ML, doc = "Nereus BookKeeper seal timeout in seconds")
+    private long nereusBookKeeperSealTimeoutSeconds = 30;
+    @FieldContext(category = CATEGORY_STORAGE_ML, doc = "Nereus BookKeeper delete timeout in seconds")
+    private long nereusBookKeeperDeleteTimeoutSeconds = 30;
+    @FieldContext(category = CATEGORY_STORAGE_ML, doc = "Nereus BookKeeper reader lease duration in seconds")
+    private long nereusBookKeeperReaderLeaseSeconds = 120;
+    @FieldContext(category = CATEGORY_STORAGE_ML, doc = "Nereus BookKeeper reader lease renewal in seconds")
+    private long nereusBookKeeperReaderLeaseRenewSeconds = 30;
+    @FieldContext(category = CATEGORY_STORAGE_ML, doc = "Nereus BookKeeper retention scan interval in seconds")
+    private long nereusBookKeeperRetentionScanIntervalSeconds = 60;
+    @FieldContext(category = CATEGORY_STORAGE_ML, doc = "Nereus BookKeeper retention scan page size")
+    private int nereusBookKeeperRetentionScanPageSize = 256;
+    @FieldContext(category = CATEGORY_STORAGE_ML, doc = "Maximum concurrent Nereus BookKeeper ledger deletes")
+    private int nereusBookKeeperMaxConcurrentDeletes = 1;
+    @FieldContext(category = CATEGORY_STORAGE_ML, doc = "Maximum admitted Nereus BookKeeper clock skew in seconds")
+    private long nereusBookKeeperMaxClockSkewSeconds = 5;
+    @FieldContext(category = CATEGORY_STORAGE_ML, doc = "Nereus BookKeeper reader drain grace in seconds")
+    private long nereusBookKeeperGcDrainGraceSeconds = 300;
+    @FieldContext(category = CATEGORY_STORAGE_ML, doc = "Nereus BookKeeper late-create audit grace in seconds")
+    private long nereusBookKeeperLateCreateAuditGraceSeconds = 604800;
+    @FieldContext(category = CATEGORY_STORAGE_ML,
+            doc = "Enable Nereus BookKeeper ledger GC; durable activation proof is additionally required")
+    private boolean nereusBookKeeperGcEnabled = false;
+    @FieldContext(category = CATEGORY_STORAGE_ML, doc = "Run Nereus BookKeeper ledger GC without provider deletes")
+    private boolean nereusBookKeeperGcDryRun = true;
     @FieldContext(category = CATEGORY_STORAGE_ML, doc = "Nereus materialization registry scan page size")
     private int nereusMaterializationRegistryScanPageSize = 256;
     @FieldContext(category = CATEGORY_STORAGE_ML,

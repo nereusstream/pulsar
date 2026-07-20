@@ -19,6 +19,10 @@
 package org.apache.pulsar.broker.storage.nereus;
 
 import com.nereusstream.api.StorageProfile;
+import com.nereusstream.bookkeeper.BookKeeperDigestType;
+import com.nereusstream.bookkeeper.BookKeeperLedgerGcConfiguration;
+import com.nereusstream.bookkeeper.BookKeeperSecretRef;
+import com.nereusstream.bookkeeper.BookKeeperWalConfiguration;
 import com.nereusstream.core.StreamStorageConfig;
 import com.nereusstream.managedledger.NereusManagedLedgerFactoryConfig;
 import com.nereusstream.managedledger.cursor.CursorStorageConfig;
@@ -30,6 +34,7 @@ import com.nereusstream.metadata.oxia.CursorMetadataStoreConfig;
 import com.nereusstream.metadata.oxia.OxiaClientConfiguration;
 import com.nereusstream.metadata.oxia.ProjectionMetadataStoreConfig;
 import com.nereusstream.objectstore.ObjectStoreConfiguration;
+import com.nereusstream.pulsar.NereusBookKeeperRuntimeConfiguration;
 import com.nereusstream.pulsar.NereusProcessIdentity;
 import com.nereusstream.pulsar.NereusRuntimeConfiguration;
 import java.net.URI;
@@ -341,6 +346,7 @@ public final class NereusBrokerStorageConfiguration {
                 seconds(
                         broker.getNereusGcCloseTimeoutSeconds(),
                         "nereusGcCloseTimeoutSeconds"));
+        Optional<NereusBookKeeperRuntimeConfiguration> bookKeeper = bookKeeperConfiguration();
         return new NereusRuntimeConfiguration(
                 oxia,
                 objectStore,
@@ -351,7 +357,8 @@ public final class NereusBrokerStorageConfiguration {
                 cursorStorage,
                 materialization,
                 retention,
-                physicalGc);
+                physicalGc,
+                bookKeeper);
     }
 
     public String runtimeProviderClassName() {
@@ -378,6 +385,88 @@ public final class NereusBrokerStorageConfiguration {
 
     public boolean generationProtocolEnabled() {
         return broker.isNereusGenerationProtocolEnabled();
+    }
+
+    private Optional<NereusBookKeeperRuntimeConfiguration> bookKeeperConfiguration() {
+        if (!broker.isNereusBookKeeperPrimaryWalEnabled()) {
+            return Optional.empty();
+        }
+        BookKeeperWalConfiguration wal = new BookKeeperWalConfiguration(
+                text(broker.getClusterName(), "clusterName"),
+                text(broker.getNereusBookKeeperProviderScopeSha256(),
+                        "nereusBookKeeperProviderScopeSha256"),
+                positive(broker.getNereusBookKeeperLedgerIdPrefixBits(),
+                        "nereusBookKeeperLedgerIdPrefixBits"),
+                nonNegative(broker.getNereusBookKeeperLedgerIdPrefixValue(),
+                        "nereusBookKeeperLedgerIdPrefixValue"),
+                text(broker.getNereusBookKeeperLedgerIdNamespaceReservationId(),
+                        "nereusBookKeeperLedgerIdNamespaceReservationId"),
+                positive(broker.getNereusBookKeeperEnsembleSize(),
+                        "nereusBookKeeperEnsembleSize"),
+                positive(broker.getNereusBookKeeperWriteQuorumSize(),
+                        "nereusBookKeeperWriteQuorumSize"),
+                positive(broker.getNereusBookKeeperAckQuorumSize(),
+                        "nereusBookKeeperAckQuorumSize"),
+                digestType(broker.getNereusBookKeeperDigestType()),
+                new BookKeeperSecretRef(
+                        text(broker.getNereusBookKeeperPasswordSecretRef(),
+                                "nereusBookKeeperPasswordSecretRef"),
+                        text(broker.getNereusBookKeeperPasswordIdentityVersion(),
+                                "nereusBookKeeperPasswordIdentityVersion")),
+                positive(broker.getNereusBookKeeperMaxEntriesPerLedger(),
+                        "nereusBookKeeperMaxEntriesPerLedger"),
+                positive(broker.getNereusBookKeeperMaxBytesPerLedger(),
+                        "nereusBookKeeperMaxBytesPerLedger"),
+                positive(broker.getNereusBookKeeperMaxAppendRangesPerLedger(),
+                        "nereusBookKeeperMaxAppendRangesPerLedger"),
+                positive(broker.getNereusBookKeeperProtectionSlotsPerRange(),
+                        "nereusBookKeeperProtectionSlotsPerRange"),
+                positive(broker.getNereusBookKeeperMaxReaderLeasesPerLedger(),
+                        "nereusBookKeeperMaxReaderLeasesPerLedger"),
+                positive(broker.getNereusBookKeeperMaxUncertainAllocations(),
+                        "nereusBookKeeperMaxUncertainAllocations"),
+                seconds(broker.getNereusBookKeeperMaxLedgerAgeSeconds(),
+                        "nereusBookKeeperMaxLedgerAgeSeconds"),
+                positive(broker.getNereusBookKeeperMaxWritesInFlight(),
+                        "nereusBookKeeperMaxWritesInFlight"),
+                positive(broker.getNereusBookKeeperMaxReadsInFlight(),
+                        "nereusBookKeeperMaxReadsInFlight"),
+                positive(broker.getNereusBookKeeperMaxReadBytesInFlight(),
+                        "nereusBookKeeperMaxReadBytesInFlight"),
+                seconds(broker.getNereusBookKeeperOperationTimeoutSeconds(),
+                        "nereusBookKeeperOperationTimeoutSeconds"),
+                seconds(broker.getNereusBookKeeperAllocationTimeoutSeconds(),
+                        "nereusBookKeeperAllocationTimeoutSeconds"),
+                seconds(broker.getNereusBookKeeperSealTimeoutSeconds(),
+                        "nereusBookKeeperSealTimeoutSeconds"),
+                seconds(broker.getNereusBookKeeperDeleteTimeoutSeconds(),
+                        "nereusBookKeeperDeleteTimeoutSeconds"),
+                seconds(broker.getNereusBookKeeperReaderLeaseSeconds(),
+                        "nereusBookKeeperReaderLeaseSeconds"),
+                seconds(broker.getNereusBookKeeperReaderLeaseRenewSeconds(),
+                        "nereusBookKeeperReaderLeaseRenewSeconds"),
+                seconds(broker.getNereusBookKeeperRetentionScanIntervalSeconds(),
+                        "nereusBookKeeperRetentionScanIntervalSeconds"),
+                positiveAtMost(
+                        broker.getNereusBookKeeperRetentionScanPageSize(),
+                        1024,
+                        "nereusBookKeeperRetentionScanPageSize"));
+        BookKeeperLedgerGcConfiguration gc = new BookKeeperLedgerGcConfiguration(
+                positive(broker.getNereusBookKeeperMaxConcurrentDeletes(),
+                        "nereusBookKeeperMaxConcurrentDeletes"),
+                nonNegativeSeconds(broker.getNereusBookKeeperMaxClockSkewSeconds(),
+                        "nereusBookKeeperMaxClockSkewSeconds"),
+                seconds(broker.getNereusBookKeeperGcDrainGraceSeconds(),
+                        "nereusBookKeeperGcDrainGraceSeconds"),
+                seconds(broker.getNereusBookKeeperLateCreateAuditGraceSeconds(),
+                        "nereusBookKeeperLateCreateAuditGraceSeconds"),
+                broker.isNereusBookKeeperGcEnabled(),
+                broker.isNereusBookKeeperGcDryRun());
+        return Optional.of(new NereusBookKeeperRuntimeConfiguration(
+                text(broker.getNereusBookKeeperDeploymentId(),
+                        "nereusBookKeeperDeploymentId"),
+                wal,
+                gc));
     }
 
     public int generationRegistrationBackfillMaxTopicsPerNamespace() {
@@ -470,13 +559,19 @@ public final class NereusBrokerStorageConfiguration {
                     "nereusDefaultStorageProfile is unknown",
                     failure);
         }
-        if (profile != StorageProfile.OBJECT_WAL_SYNC_OBJECT
-                && profile
-                        != StorageProfile.OBJECT_WAL_ASYNC_OBJECT) {
+        if (profile == StorageProfile.OBJECT_WAL) {
             throw new IllegalArgumentException(
-                    "nereusDefaultStorageProfile must be an exact Object-WAL profile");
+                    "nereusDefaultStorageProfile must use an exact non-legacy profile");
         }
         return profile;
+    }
+
+    private static BookKeeperDigestType digestType(String value) {
+        try {
+            return BookKeeperDigestType.valueOf(text(value, "nereusBookKeeperDigestType"));
+        } catch (IllegalArgumentException failure) {
+            throw new IllegalArgumentException("nereusBookKeeperDigestType is unknown", failure);
+        }
     }
 
     private static Path absolutePath(String value, String name) {

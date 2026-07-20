@@ -129,7 +129,8 @@ public final class NereusManagedLedgerStorage implements ManagedLedgerStorage {
                     metadataStore,
                     bookkeeperClass.getManagedLedgerFactory(),
                     Duration.ofSeconds(conf.getNereusMetadataTimeoutSeconds()),
-                    capabilityCoordinator::requireClusterReady);
+                    capabilityCoordinator::requireClusterReady,
+                    capabilityCoordinator::requireStorageProfileReady);
             NereusRuntimeContext context = new NereusRuntimeContext(
                     eventLoopGroup,
                     openTelemetry,
@@ -139,7 +140,8 @@ public final class NereusManagedLedgerStorage implements ManagedLedgerStorage {
                     checked.generationProtocolEnabled(),
                     secretResolver,
                     classLoader,
-                    Optional.of(borrowedBookKeeperClient));
+                    Optional.of(borrowedBookKeeperClient),
+                    capabilityCoordinator::installBookKeeperPrimaryWalCapability);
             runtime = runtimeProvider.create(runtimeConfiguration, context);
             ManagedLedgerFactoryConfig compatibilityFactoryConfig = new ManagedLedgerFactoryConfig();
             compatibilityFactoryConfig.setMaxCacheSize(0);
