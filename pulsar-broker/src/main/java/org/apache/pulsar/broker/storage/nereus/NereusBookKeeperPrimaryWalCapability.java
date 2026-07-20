@@ -42,7 +42,7 @@ public final class NereusBookKeeperPrimaryWalCapability {
                 PROTOCOL_PROPERTY, Integer.toString(binding.protocolVersion()),
                 CONFIGURATION_PROPERTY, binding.configurationBindingSha256().value(),
                 NAMESPACE_PROPERTY, binding.ledgerIdNamespaceSha256().value(),
-                ACTIVATION_PROPERTY, binding.activationRecordSha256().value(),
+                ACTIVATION_PROPERTY, binding.publicationActivationSha256().value(),
                 REQUIRED_OBJECT_GENERATION_PROPERTY,
                 Integer.toString(binding.requiredObjectGenerationCompletionVersion()));
     }

@@ -19,6 +19,8 @@
 package org.apache.pulsar.broker.storage.nereus;
 
 import com.nereusstream.api.StorageProfile;
+import com.nereusstream.bookkeeper.BookKeeperBrokerReadiness;
+import com.nereusstream.bookkeeper.BookKeeperBrokerReadinessProvider;
 import com.nereusstream.core.capability.GenerationCapabilityReadiness;
 import com.nereusstream.core.capability.GenerationCapabilityReadinessProvider;
 import com.nereusstream.managedledger.cursor.CursorLedgerIdentity;
@@ -46,7 +48,9 @@ import org.apache.pulsar.broker.loadbalance.extensions.data.BrokerLookupData;
 
 /** Publishes and independently verifies the cluster-wide binding, cursor, and generation protocols. */
 public final class NereusBrokerCapabilityCoordinator
-        implements CursorProtocolActivationGuard, GenerationCapabilityReadinessProvider {
+        implements CursorProtocolActivationGuard,
+                GenerationCapabilityReadinessProvider,
+                BookKeeperBrokerReadinessProvider {
     public static final String PROPERTY = "nereus.storage-binding-protocol";
     public static final String VERSION = "1";
 
@@ -55,6 +59,8 @@ public final class NereusBrokerCapabilityCoordinator
     private final AtomicReference<BrokerRegistry> brokerRegistry = new AtomicReference<>();
     private final AtomicLong brokerRegistryRevision = new AtomicLong();
     private final AtomicReference<CachedGenerationReadiness> generationReadiness =
+            new AtomicReference<>();
+    private final AtomicReference<CachedBookKeeperReadiness> bookKeeperReadiness =
             new AtomicReference<>();
     private final AtomicReference<BookKeeperPrimaryWalCapabilityBinding> bookKeeperBinding =
             new AtomicReference<>();
@@ -96,6 +102,7 @@ public final class NereusBrokerCapabilityCoordinator
         registry.addListener((ignored, notification) -> {
             brokerRegistryRevision.incrementAndGet();
             generationReadiness.set(null);
+            bookKeeperReadiness.set(null);
         });
     }
 
@@ -160,7 +167,8 @@ public final class NereusBrokerCapabilityCoordinator
                 NereusCursorProtocolCapability.PROPERTY, NereusCursorProtocolCapability.VERSION,
                 NereusGenerationProtocolCapability.PROPERTY, NereusGenerationProtocolCapability.VERSION);
         CompletableFuture<NereusGenerationCapabilityReadiness> check =
-                requireStableSnapshot(required).thenApply(snapshot -> {
+                requireStableSnapshot(required, "nereus-generation-broker-readiness-v1")
+                        .thenApply(snapshot -> {
                     CachedGenerationReadiness cached =
                             new CachedGenerationReadiness(snapshot.readiness(), snapshot.brokerRegistryRevision());
                     if (brokerRegistryRevision.get() != cached.brokerRegistryRevision()) {
@@ -178,6 +186,71 @@ public final class NereusBrokerCapabilityCoordinator
                 generationReadiness.set(null);
             }
         });
+    }
+
+    @Override
+    public CompletableFuture<BookKeeperBrokerReadiness>
+            requireBookKeeperPrimaryWalReadiness() {
+        BookKeeperPrimaryWalCapabilityBinding binding = bookKeeperBinding.get();
+        if (binding == null) {
+            return CompletableFuture.failedFuture(new IllegalStateException(
+                    "NEREUS_BOOKKEEPER_CAPABILITY_NOT_READY:LOCAL"));
+        }
+        Map<String, String> required =
+                NereusBookKeeperPrimaryWalCapability.requiredProperties(
+                        binding, StorageProfile.BOOKKEEPER_WAL_SYNC_OBJECT);
+        CompletableFuture<BookKeeperBrokerReadiness> check = requireStableSnapshot(
+                        required,
+                        "nereus-bookkeeper-primary-wal-broker-readiness-v1")
+                .thenApply(snapshot -> {
+                    NereusGenerationCapabilityReadiness exact = snapshot.readiness();
+                    BookKeeperBrokerReadiness readiness = new BookKeeperBrokerReadiness(
+                            exact.brokerReadinessEpoch(),
+                            new com.nereusstream.api.Checksum(
+                                    com.nereusstream.api.ChecksumType.SHA256,
+                                    exact.brokerSetSha256()),
+                            exact.persistentBrokerCount());
+                    CachedBookKeeperReadiness cached = new CachedBookKeeperReadiness(
+                            readiness, snapshot.brokerRegistryRevision());
+                    if (brokerRegistryRevision.get() != cached.brokerRegistryRevision()) {
+                        throw new IllegalStateException(
+                                "NEREUS_CLUSTER_CAPABILITY_SNAPSHOT_CHANGED");
+                    }
+                    bookKeeperReadiness.set(cached);
+                    if (brokerRegistryRevision.get() != cached.brokerRegistryRevision()) {
+                        bookKeeperReadiness.compareAndSet(cached, null);
+                        throw new IllegalStateException(
+                                "NEREUS_CLUSTER_CAPABILITY_SNAPSHOT_CHANGED");
+                    }
+                    return readiness;
+                });
+        return check.whenComplete((ignored, error) -> {
+            if (error != null) {
+                bookKeeperReadiness.set(null);
+            }
+        });
+    }
+
+    @Override
+    public Optional<BookKeeperBrokerReadiness>
+            currentBookKeeperPrimaryWalReadiness() {
+        BrokerRegistry registry = brokerRegistry.get();
+        if (!storageInitialized.get()
+                || registry == null
+                || !registry.isStarted()
+                || !registry.isRegistered()) {
+            bookKeeperReadiness.set(null);
+            return Optional.empty();
+        }
+        CachedBookKeeperReadiness cached = bookKeeperReadiness.get();
+        if (cached == null) {
+            return Optional.empty();
+        }
+        if (brokerRegistryRevision.get() != cached.brokerRegistryRevision()) {
+            bookKeeperReadiness.compareAndSet(cached, null);
+            return Optional.empty();
+        }
+        return Optional.of(cached.readiness());
     }
 
     public Optional<NereusGenerationCapabilityReadiness> currentGenerationReadiness() {
@@ -221,11 +294,15 @@ public final class NereusBrokerCapabilityCoordinator
     }
 
     private CompletableFuture<Void> requireClusterReady(Map<String, String> requiredProperties) {
-        return requireStableSnapshot(requiredProperties).thenApply(ignored -> null);
+        return requireStableSnapshot(
+                        requiredProperties,
+                        "nereus-generation-broker-readiness-v1")
+                .thenApply(ignored -> null);
     }
 
     private CompletableFuture<CapabilitySnapshot> requireStableSnapshot(
-            Map<String, String> requiredProperties) {
+            Map<String, String> requiredProperties,
+            String readinessDomain) {
         BrokerRegistry registry = brokerRegistry.get();
         if (!storageInitialized.get() || registry == null) {
             return CompletableFuture.failedFuture(
@@ -237,9 +314,11 @@ public final class NereusBrokerCapabilityCoordinator
         }
         long initialBrokerRegistryRevision = brokerRegistryRevision.get();
         CompletableFuture<CapabilitySnapshot> check = registry.getAvailableBrokerLookupDataAsync()
-                .thenApply(available -> snapshot(available, requiredProperties))
+                .thenApply(available -> snapshot(
+                        available, requiredProperties, readinessDomain))
                 .thenCompose(first -> registry.getAvailableBrokerLookupDataAsync().thenApply(second -> {
-                    CapabilitySnapshot capableSecond = snapshot(second, requiredProperties);
+                    CapabilitySnapshot capableSecond = snapshot(
+                            second, requiredProperties, readinessDomain);
                     if (!first.brokers().keySet().equals(capableSecond.brokers().keySet())) {
                         throw new IllegalStateException("NEREUS_CLUSTER_CAPABILITY_BROKER_SET_CHANGED");
                     }
@@ -260,7 +339,8 @@ public final class NereusBrokerCapabilityCoordinator
 
     private static CapabilitySnapshot snapshot(
             Map<String, BrokerLookupData> available,
-            Map<String, String> requiredProperties) {
+            Map<String, String> requiredProperties,
+            String readinessDomain) {
         java.util.Objects.requireNonNull(available, "available");
         java.util.Objects.requireNonNull(requiredProperties, "requiredProperties");
         Map<String, BrokerLookupData> persistent = new HashMap<>();
@@ -282,14 +362,17 @@ public final class NereusBrokerCapabilityCoordinator
             }
         });
         Map<String, BrokerLookupData> canonical = Map.copyOf(persistent);
-        return new CapabilitySnapshot(canonical, readiness(canonical, requiredProperties));
+        return new CapabilitySnapshot(
+                canonical,
+                readiness(canonical, requiredProperties, readinessDomain));
     }
 
     private static NereusGenerationCapabilityReadiness readiness(
             Map<String, BrokerLookupData> brokers,
-            Map<String, String> requiredProperties) {
+            Map<String, String> requiredProperties,
+            String readinessDomain) {
         MessageDigest digest = sha256();
-        add(digest, "nereus-generation-broker-readiness-v1");
+        add(digest, java.util.Objects.requireNonNull(readinessDomain, "readinessDomain"));
         TreeMap<String, String> required = new TreeMap<>(requiredProperties);
         brokers.entrySet().stream()
                 .sorted(Map.Entry.comparingByKey(Comparator.naturalOrder()))
@@ -309,6 +392,9 @@ public final class NereusBrokerCapabilityCoordinator
                 .order(ByteOrder.BIG_ENDIAN)
                 .getLong()
                 & Long.MAX_VALUE;
+        if (epoch == 0) {
+            epoch = 1;
+        }
         return new NereusGenerationCapabilityReadiness(epoch, sha256, brokers.size());
     }
 
@@ -346,6 +432,11 @@ public final class NereusBrokerCapabilityCoordinator
 
     private record CachedGenerationReadiness(
             NereusGenerationCapabilityReadiness readiness,
+            long brokerRegistryRevision) {
+    }
+
+    private record CachedBookKeeperReadiness(
+            BookKeeperBrokerReadiness readiness,
             long brokerRegistryRevision) {
     }
 }
