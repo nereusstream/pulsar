@@ -110,6 +110,31 @@ public class NereusBookKeeperPrimaryWalCapabilityTest {
                                 + NereusBookKeeperPrimaryWalCapability.REQUIRED_OBJECT_GENERATION_PROPERTY);
     }
 
+    @Test
+    public void objectEnabledBookKeeperProfilesRequireGenerationInTheSameStableSnapshot() {
+        NereusBrokerCapabilityCoordinator coordinator = coordinator();
+        BookKeeperPrimaryWalCapabilityBinding binding = binding("11", "22");
+        BrokerRegistry registry = readyRegistry();
+        coordinator.installBookKeeperPrimaryWalCapability(binding);
+        coordinator.markStorageInitialized();
+        coordinator.attachBrokerRegistry(registry);
+        Map<String, String> properties = new HashMap<>(merge(
+                allBaseCapabilities(),
+                NereusBookKeeperPrimaryWalCapability.properties(binding)));
+        properties.remove(NereusGenerationProtocolCapability.PROPERTY);
+        BrokerLookupData withoutGeneration = lookupData("broker-a", properties);
+        when(registry.getAvailableBrokerLookupDataAsync())
+                .thenReturn(CompletableFuture.completedFuture(Map.of("a", withoutGeneration)));
+
+        coordinator.requireStorageProfileReady(StorageProfile.BOOKKEEPER_WAL_ONLY).join();
+        assertThatThrownBy(() -> coordinator
+                        .requireStorageProfileReady(StorageProfile.BOOKKEEPER_WAL_ASYNC_OBJECT)
+                        .join())
+                .hasRootCauseMessage(
+                        "NEREUS_CLUSTER_CAPABILITY_NOT_READY:a:"
+                                + NereusGenerationProtocolCapability.PROPERTY);
+    }
+
     private static NereusBrokerCapabilityCoordinator coordinator() {
         return new NereusBrokerCapabilityCoordinator(Duration.ofSeconds(5));
     }
