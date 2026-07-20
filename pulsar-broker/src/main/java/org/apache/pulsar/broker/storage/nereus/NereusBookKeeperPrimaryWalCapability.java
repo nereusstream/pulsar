@@ -29,6 +29,7 @@ public final class NereusBookKeeperPrimaryWalCapability {
     public static final String PROTOCOL_PROPERTY = "nereus.bookkeeper-primary-wal-protocol";
     public static final String CONFIGURATION_PROPERTY = "nereus.bookkeeper-primary-wal-config";
     public static final String NAMESPACE_PROPERTY = "nereus.bookkeeper-ledger-namespace";
+    public static final String ACTIVATION_PROPERTY = "nereus.bookkeeper-primary-wal-activation";
     public static final String REQUIRED_OBJECT_GENERATION_PROPERTY =
             "nereus.bookkeeper-required-object-generation";
 
@@ -41,6 +42,7 @@ public final class NereusBookKeeperPrimaryWalCapability {
                 PROTOCOL_PROPERTY, Integer.toString(binding.protocolVersion()),
                 CONFIGURATION_PROPERTY, binding.configurationBindingSha256().value(),
                 NAMESPACE_PROPERTY, binding.ledgerIdNamespaceSha256().value(),
+                ACTIVATION_PROPERTY, binding.activationRecordSha256().value(),
                 REQUIRED_OBJECT_GENERATION_PROPERTY,
                 Integer.toString(binding.requiredObjectGenerationCompletionVersion()));
     }
@@ -76,6 +78,7 @@ public final class NereusBookKeeperPrimaryWalCapability {
                 PROTOCOL_PROPERTY,
                 CONFIGURATION_PROPERTY,
                 NAMESPACE_PROPERTY,
+                ACTIVATION_PROPERTY,
                 REQUIRED_OBJECT_GENERATION_PROPERTY)) {
             if (configuredProperties.containsKey(property)) {
                 throw new IllegalArgumentException(property + " is reserved by the broker");
