@@ -82,6 +82,17 @@ public class NereusBookKeeperPrimaryWalCapabilityTest {
                         .join())
                 .hasRootCauseMessage(
                         "NEREUS_CLUSTER_CAPABILITY_NOT_READY:a:nereus.bookkeeper-ledger-namespace");
+
+        drifted = new HashMap<>(exact);
+        drifted.put(NereusBookKeeperPrimaryWalCapability.ACTIVATION_PROPERTY, "44".repeat(32));
+        when(registry.getAvailableBrokerLookupDataAsync()).thenReturn(
+                CompletableFuture.completedFuture(Map.of("a", lookupData("broker-a", drifted))));
+        assertThatThrownBy(() -> coordinator
+                        .requireStorageProfileReady(StorageProfile.BOOKKEEPER_WAL_ONLY)
+                        .join())
+                .hasRootCauseMessage(
+                        "NEREUS_CLUSTER_CAPABILITY_NOT_READY:a:"
+                                + NereusBookKeeperPrimaryWalCapability.ACTIVATION_PROPERTY);
     }
 
     @Test
@@ -144,6 +155,7 @@ public class NereusBookKeeperPrimaryWalCapabilityTest {
                 1,
                 new Checksum(ChecksumType.SHA256, config.repeat(32)),
                 new Checksum(ChecksumType.SHA256, namespace.repeat(32)),
+                new Checksum(ChecksumType.SHA256, "c".repeat(64)),
                 1);
     }
 
