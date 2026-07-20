@@ -33,6 +33,6 @@ public final class NereusGenerationProtocolCapability {
         if (configuredProperties.containsKey(PROPERTY)) {
             throw new IllegalArgumentException(PROPERTY + " is reserved by the broker");
         }
-        return Map.copyOf(configuredProperties);
+        return NereusBookKeeperPrimaryWalCapability.requireUnreserved(configuredProperties);
     }
 }
