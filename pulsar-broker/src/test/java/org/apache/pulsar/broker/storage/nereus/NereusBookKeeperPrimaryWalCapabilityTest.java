@@ -25,6 +25,7 @@ import static org.mockito.Mockito.when;
 import com.nereusstream.api.Checksum;
 import com.nereusstream.api.ChecksumType;
 import com.nereusstream.api.StorageProfile;
+import com.nereusstream.bookkeeper.BookKeeperBrokerReadiness;
 import com.nereusstream.pulsar.BookKeeperPrimaryWalCapabilityBinding;
 import java.time.Duration;
 import java.util.HashMap;
@@ -144,6 +145,57 @@ public class NereusBookKeeperPrimaryWalCapabilityTest {
                 .hasRootCauseMessage(
                         "NEREUS_CLUSTER_CAPABILITY_NOT_READY:a:"
                                 + NereusGenerationProtocolCapability.PROPERTY);
+    }
+
+    @Test
+    public void deletionReadinessUsesTheStablePublicationBindingAndInvalidatesOnDrift() {
+        NereusBrokerCapabilityCoordinator coordinator = coordinator();
+        BookKeeperPrimaryWalCapabilityBinding binding = binding("11", "22");
+        BrokerRegistry registry = readyRegistry();
+        coordinator.installBookKeeperPrimaryWalCapability(binding);
+        coordinator.markStorageInitialized();
+        coordinator.attachBrokerRegistry(registry);
+        Map<String, String> exact = merge(
+                allBaseCapabilities(),
+                NereusBookKeeperPrimaryWalCapability.properties(binding));
+        BrokerLookupData firstBroker = lookupData("broker-a", exact);
+        BrokerLookupData secondBroker = lookupData("broker-b", exact);
+        Map<String, BrokerLookupData> both = Map.of(
+                "a", firstBroker,
+                "b", secondBroker);
+        when(registry.getAvailableBrokerLookupDataAsync())
+                .thenReturn(CompletableFuture.completedFuture(both));
+
+        BookKeeperBrokerReadiness readiness =
+                coordinator.requireBookKeeperPrimaryWalReadiness().join();
+
+        assertThat(readiness.persistentBrokerCount()).isEqualTo(2);
+        assertThat(readiness.brokerReadinessEpoch()).isPositive();
+        assertThat(readiness.brokerSetSha256().value()).hasSize(64);
+        assertThat(coordinator.currentBookKeeperPrimaryWalReadiness())
+                .contains(readiness);
+
+        when(registry.getAvailableBrokerLookupDataAsync()).thenReturn(
+                CompletableFuture.completedFuture(Map.of("a", firstBroker)),
+                CompletableFuture.completedFuture(both));
+        assertThatThrownBy(() -> coordinator
+                        .requireBookKeeperPrimaryWalReadiness().join())
+                .hasRootCauseMessage("NEREUS_CLUSTER_CAPABILITY_BROKER_SET_CHANGED");
+        assertThat(coordinator.currentBookKeeperPrimaryWalReadiness()).isEmpty();
+
+        Map<String, String> drifted = new HashMap<>(exact);
+        drifted.put(
+                NereusBookKeeperPrimaryWalCapability.ACTIVATION_PROPERTY,
+                "44".repeat(32));
+        when(registry.getAvailableBrokerLookupDataAsync()).thenReturn(
+                CompletableFuture.completedFuture(Map.of(
+                        "a", lookupData("broker-a", drifted))));
+        assertThatThrownBy(() -> coordinator
+                        .requireBookKeeperPrimaryWalReadiness().join())
+                .hasRootCauseMessage(
+                        "NEREUS_CLUSTER_CAPABILITY_NOT_READY:a:"
+                                + NereusBookKeeperPrimaryWalCapability.ACTIVATION_PROPERTY);
+        assertThat(coordinator.currentBookKeeperPrimaryWalReadiness()).isEmpty();
     }
 
     private static NereusBrokerCapabilityCoordinator coordinator() {

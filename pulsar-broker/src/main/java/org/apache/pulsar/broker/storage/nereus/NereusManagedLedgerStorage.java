@@ -141,6 +141,7 @@ public final class NereusManagedLedgerStorage implements ManagedLedgerStorage {
                     secretResolver,
                     classLoader,
                     Optional.of(borrowedBookKeeperClient),
+                    capabilityCoordinator,
                     capabilityCoordinator::installBookKeeperPrimaryWalCapability);
             runtime = runtimeProvider.create(runtimeConfiguration, context);
             ManagedLedgerFactoryConfig compatibilityFactoryConfig = new ManagedLedgerFactoryConfig();
