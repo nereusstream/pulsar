@@ -18,11 +18,23 @@
  */
 package org.apache.pulsar.broker.storage.nereus;
 
+import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatCode;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.when;
+import com.nereusstream.api.StorageProfile;
+import com.nereusstream.api.StreamMetadata;
+import com.nereusstream.managedledger.NereusDurableStorageState;
+import com.nereusstream.managedledger.NereusStorageStateSnapshot;
+import com.nereusstream.managedledger.projection.VirtualLedgerProjection;
+import java.util.ArrayList;
 import java.util.EnumSet;
+import java.util.List;
+import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.atomic.AtomicInteger;
+import org.apache.pulsar.common.naming.TopicName;
 import org.testng.annotations.Test;
 
 public class NereusAdminOperationTest {
@@ -92,5 +104,110 @@ public class NereusAdminOperationTest {
         org.assertj.core.api.Assertions.assertThat(readinessCalls).hasValue(1);
         readiness.complete(new Object());
         enabled.join();
+    }
+
+    @Test
+    public void durableProfileReadinessIsAppliedOnlyToStorageDependentOperations() {
+        List<String> calls = new ArrayList<>();
+
+        NereusManagedLedgerStorage.validateBoundNereusAdminOperation(
+                        NereusAdminOperation.TERMINATE_TOPIC,
+                        true,
+                        StorageProfile.BOOKKEEPER_WAL_ONLY,
+                        () -> {
+                            calls.add("generation");
+                            return CompletableFuture.completedFuture(null);
+                        },
+                        profile -> {
+                            calls.add("profile:" + profile);
+                            return CompletableFuture.completedFuture(null);
+                        })
+                .join();
+        assertThat(calls).containsExactly("profile:BOOKKEEPER_WAL_ONLY");
+
+        calls.clear();
+        NereusManagedLedgerStorage.validateBoundNereusAdminOperation(
+                        NereusAdminOperation.UNLOAD_TOPIC,
+                        true,
+                        StorageProfile.BOOKKEEPER_WAL_ONLY,
+                        () -> {
+                            calls.add("generation");
+                            return CompletableFuture.completedFuture(null);
+                        },
+                        profile -> {
+                            calls.add("profile:" + profile);
+                            return CompletableFuture.completedFuture(null);
+                        })
+                .join();
+        assertThat(calls).isEmpty();
+
+        calls.clear();
+        NereusManagedLedgerStorage.validateBoundNereusAdminOperation(
+                        NereusAdminOperation.TRIM_TOPIC,
+                        true,
+                        StorageProfile.BOOKKEEPER_WAL_ASYNC_OBJECT,
+                        () -> {
+                            calls.add("generation");
+                            return CompletableFuture.completedFuture(null);
+                        },
+                        profile -> {
+                            calls.add("profile:" + profile);
+                            return CompletableFuture.completedFuture(null);
+                        })
+                .join();
+        assertThat(calls).containsExactly(
+                "generation", "profile:BOOKKEEPER_WAL_ASYNC_OBJECT");
+    }
+
+    @Test
+    public void unsupportedOperationsFailBeforeAnyReadinessLookup() {
+        AtomicInteger readinessCalls = new AtomicInteger();
+        CompletableFuture<Void> result =
+                NereusManagedLedgerStorage.validateBoundNereusAdminOperation(
+                        NereusAdminOperation.TRIGGER_COMPACTION,
+                        true,
+                        StorageProfile.BOOKKEEPER_WAL_SYNC_OBJECT,
+                        () -> {
+                            readinessCalls.incrementAndGet();
+                            return CompletableFuture.completedFuture(null);
+                        },
+                        profile -> {
+                            readinessCalls.incrementAndGet();
+                            return CompletableFuture.completedFuture(null);
+                        });
+
+        assertThatThrownBy(result::join)
+                .hasRootCauseMessage(
+                        "NEREUS_UNSUPPORTED_ADMIN_OPERATION:TRIGGER_COMPACTION");
+        org.assertj.core.api.Assertions.assertThat(readinessCalls).hasValue(0);
+    }
+
+    @Test
+    public void durableProfileComesFromExactBindingGenerationAndL0Metadata() {
+        String topic = "persistent://tenant/ns/profile-routing";
+        StorageClassBindingRecord binding = StorageClassBindingRecord.claimed(
+                        TopicName.get(topic).getPersistenceNamingEncoding(),
+                        StorageClassBindingRecord.NEREUS,
+                        7,
+                        1)
+                .transitionTo(StorageClassBindingState.ACTIVE)
+                .withMetadataVersion(2);
+        NereusStorageStateSnapshot snapshot = mock(NereusStorageStateSnapshot.class);
+        VirtualLedgerProjection projection = mock(VirtualLedgerProjection.class);
+        StreamMetadata metadata = mock(StreamMetadata.class);
+        when(snapshot.state()).thenReturn(NereusDurableStorageState.ACTIVE);
+        when(snapshot.projection()).thenReturn(Optional.of(projection));
+        when(snapshot.streamMetadata()).thenReturn(Optional.of(metadata));
+        when(projection.storageClassBindingGeneration()).thenReturn(7L);
+        when(metadata.profile()).thenReturn(StorageProfile.BOOKKEEPER_WAL_SYNC_OBJECT);
+
+        org.assertj.core.api.Assertions.assertThat(
+                        NereusManagedLedgerStorage.requireDurableProfile(binding, snapshot))
+                .isEqualTo(StorageProfile.BOOKKEEPER_WAL_SYNC_OBJECT);
+
+        when(projection.storageClassBindingGeneration()).thenReturn(8L);
+        assertThatThrownBy(() ->
+                        NereusManagedLedgerStorage.requireDurableProfile(binding, snapshot))
+                .hasMessage("Nereus durable profile binding generation mismatch");
     }
 }

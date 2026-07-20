@@ -169,7 +169,14 @@ public class PersistentTopicsBase extends AdminResource {
     private static CompletableFuture<Topic> validateNereusAdminOperation(
             Topic topic, NereusAdminOperation operation) {
         if (topic instanceof PersistentTopic persistentTopic && persistentTopic.isNereusManagedLedger()) {
-            return persistentTopic.validateNereusAdminOperation(operation).thenApply(__ -> topic);
+            if (persistentTopic.getBrokerService().pulsar().getManagedLedgerStorage()
+                    instanceof NereusManagedLedgerStorage nereusStorage) {
+                return nereusStorage.validateBoundAdminOperation(
+                                TopicName.get(persistentTopic.getName()), operation)
+                        .thenApply(__ -> topic);
+            }
+            return persistentTopic.validateNereusAdminOperation(operation)
+                    .thenApply(__ -> topic);
         }
         return CompletableFuture.completedFuture(topic);
     }

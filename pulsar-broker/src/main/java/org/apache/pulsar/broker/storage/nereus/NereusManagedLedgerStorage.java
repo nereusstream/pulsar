@@ -18,6 +18,10 @@
  */
 package org.apache.pulsar.broker.storage.nereus;
 
+import com.nereusstream.api.StorageProfile;
+import com.nereusstream.bookkeeper.BookKeeperLedgerIdNamespaceReservation;
+import com.nereusstream.bookkeeper.BookKeeperProtocolActivation;
+import com.nereusstream.bookkeeper.BookKeeperProtocolActivationUpdate;
 import com.nereusstream.core.capability.GenerationRegistrationBackfillCompletion;
 import com.nereusstream.managedledger.NereusManagedLedgerFactory;
 import com.nereusstream.managedledger.NereusManagedLedgerRuntime;
@@ -44,6 +48,7 @@ import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Function;
 import java.util.function.Supplier;
 import org.apache.bookkeeper.client.api.BookKeeper;
 import org.apache.bookkeeper.mledger.ManagedLedgerConfig;
@@ -245,6 +250,66 @@ public final class NereusManagedLedgerStorage implements ManagedLedgerStorage {
         }
     }
 
+    public CompletableFuture<BookKeeperLedgerIdNamespaceReservation>
+            provisionBookKeeperLedgerIdNamespace(
+                    String operatorEvidenceSha256, Duration timeout) {
+        try {
+            return bookKeeperPrimaryWalAdministration().provisionNamespace(
+                    operatorEvidenceSha256, timeout);
+        } catch (Throwable error) {
+            return CompletableFuture.failedFuture(error);
+        }
+    }
+
+    public CompletableFuture<BookKeeperLedgerIdNamespaceReservation>
+            revokeBookKeeperLedgerIdNamespace(
+                    String revocationEvidenceSha256,
+                    long expectedMetadataVersion,
+                    Duration timeout) {
+        try {
+            return bookKeeperPrimaryWalAdministration().revokeNamespace(
+                    revocationEvidenceSha256,
+                    expectedMetadataVersion,
+                    timeout);
+        } catch (Throwable error) {
+            return CompletableFuture.failedFuture(error);
+        }
+    }
+
+    public CompletableFuture<BookKeeperProtocolActivation>
+            prepareBookKeeperPrimaryWalActivation(
+                    long brokerReadinessEpoch,
+                    String brokerReadinessSha256,
+                    Duration timeout) {
+        try {
+            return bookKeeperPrimaryWalAdministration().prepareActivation(
+                    brokerReadinessEpoch,
+                    brokerReadinessSha256,
+                    timeout);
+        } catch (Throwable error) {
+            return CompletableFuture.failedFuture(error);
+        }
+    }
+
+    public CompletableFuture<BookKeeperProtocolActivation>
+            activateBookKeeperPrimaryWalPublications(
+                    BookKeeperProtocolActivationUpdate update, Duration timeout) {
+        try {
+            return bookKeeperPrimaryWalAdministration().activate(update, timeout);
+        } catch (Throwable error) {
+            return CompletableFuture.failedFuture(error);
+        }
+    }
+
+    public CompletableFuture<Optional<BookKeeperProtocolActivation>>
+            readBookKeeperPrimaryWalActivation(Duration timeout) {
+        try {
+            return bookKeeperPrimaryWalAdministration().readActivation(timeout);
+        } catch (Throwable error) {
+            return CompletableFuture.failedFuture(error);
+        }
+    }
+
     public boolean generationProtocolEnabled() {
         ensureReady();
         return generationProtocolEnabled;
@@ -411,6 +476,15 @@ public final class NereusManagedLedgerStorage implements ManagedLedgerStorage {
 
     public CompletableFuture<Void> validateUnloadedAdminOperation(
             TopicName topicName, NereusAdminOperation operation) {
+        return validateBoundAdminOperation(topicName, operation);
+    }
+
+    /**
+     * Applies one durable-profile path to both loaded and unloaded topics.
+     * The current broker default is deliberately not consulted.
+     */
+    public CompletableFuture<Void> validateBoundAdminOperation(
+            TopicName topicName, NereusAdminOperation operation) {
         final String persistenceName;
         try {
             ensureReady();
@@ -429,10 +503,17 @@ public final class NereusManagedLedgerStorage implements ManagedLedgerStorage {
                     || !StorageClassBindingRecord.NEREUS.equals(current.storageClass())) {
                 return CompletableFuture.completedFuture(null);
             }
-            return validateBoundNereusAdminOperation(
-                    operation,
-                    generationProtocolEnabled,
-                    capabilityCoordinator::requireGenerationReadiness);
+            return nereusFactory.inspectStorageState(persistenceName)
+                    .thenCompose(snapshot -> {
+                        StorageProfile profile = requireDurableProfile(
+                                current, snapshot);
+                        return validateBoundNereusAdminOperation(
+                                operation,
+                                generationProtocolEnabled,
+                                profile,
+                                capabilityCoordinator::requireGenerationReadiness,
+                                capabilityCoordinator::requireStorageProfileReady);
+                    });
         });
     }
 
@@ -461,18 +542,80 @@ public final class NereusManagedLedgerStorage implements ManagedLedgerStorage {
             NereusAdminOperation operation,
             boolean generationProtocolEnabled,
             Supplier<? extends CompletableFuture<?>> readiness) {
+        return validateBoundNereusAdminOperation(
+                operation,
+                generationProtocolEnabled,
+                StorageProfile.OBJECT_WAL_SYNC_OBJECT,
+                readiness,
+                ignored -> CompletableFuture.completedFuture(null));
+    }
+
+    static CompletableFuture<Void> validateBoundNereusAdminOperation(
+            NereusAdminOperation operation,
+            boolean generationProtocolEnabled,
+            StorageProfile durableProfile,
+            Supplier<? extends CompletableFuture<?>> generationReadiness,
+            Function<StorageProfile, ? extends CompletableFuture<?>> profileReadiness) {
         Objects.requireNonNull(operation, "operation");
-        Objects.requireNonNull(readiness, "readiness");
-        if (operation == NereusAdminOperation.TRIM_TOPIC && generationProtocolEnabled) {
-            final CompletableFuture<?> ready;
-            try {
-                ready = Objects.requireNonNull(readiness.get(), "readiness future");
-            } catch (Throwable error) {
-                return CompletableFuture.failedFuture(error);
-            }
-            return ready.thenCompose(ignored -> validateAdminOperation(operation, true));
+        StorageProfile profile = Objects.requireNonNull(
+                durableProfile, "durableProfile").canonical();
+        Objects.requireNonNull(generationReadiness, "generationReadiness");
+        Objects.requireNonNull(profileReadiness, "profileReadiness");
+        CompletableFuture<Void> validated = validateAdminOperation(
+                operation, generationProtocolEnabled);
+        if (operation == NereusAdminOperation.TRIM_TOPIC) {
+            validated = validated.thenCompose(ignored -> invokeReadiness(
+                    generationReadiness, "generation readiness future"));
         }
-        return validateAdminOperation(operation, false);
+        if (operation.requiresStorageProfileReadiness()) {
+            validated = validated.thenCompose(ignored -> invokeReadiness(
+                    () -> profileReadiness.apply(profile),
+                    "storage-profile readiness future"));
+        }
+        return validated;
+    }
+
+    static StorageProfile requireDurableProfile(
+            StorageClassBindingRecord binding,
+            com.nereusstream.managedledger.NereusStorageStateSnapshot snapshot) {
+        StorageClassBindingRecord exactBinding = Objects.requireNonNull(
+                binding, "binding");
+        com.nereusstream.managedledger.NereusStorageStateSnapshot exactSnapshot =
+                Objects.requireNonNull(snapshot, "snapshot");
+        if (!StorageClassBindingRecord.NEREUS.equals(exactBinding.storageClass())
+                || exactBinding.state() == StorageClassBindingState.DELETED) {
+            throw new IllegalArgumentException(
+                    "durable profile requires a live Nereus binding");
+        }
+        if (exactSnapshot.state()
+                == com.nereusstream.managedledger.NereusDurableStorageState.MISSING) {
+            throw new IllegalStateException(
+                    "active Nereus binding has no durable topic projection");
+        }
+        var projection = exactSnapshot.projection().orElseThrow(() ->
+                new IllegalStateException(
+                        "Nereus durable state has no topic projection"));
+        if (projection.storageClassBindingGeneration()
+                != exactBinding.bindingGeneration()) {
+            throw new IllegalStateException(
+                    "Nereus durable profile binding generation mismatch");
+        }
+        return exactSnapshot.streamMetadata().orElseThrow(() ->
+                        new IllegalStateException(
+                                "Nereus durable state has no stream metadata"))
+                .profile()
+                .canonical();
+    }
+
+    private static CompletableFuture<Void> invokeReadiness(
+            Supplier<? extends CompletableFuture<?>> readiness,
+            String name) {
+        try {
+            return Objects.requireNonNull(readiness.get(), name)
+                    .thenApply(ignored -> null);
+        } catch (Throwable error) {
+            return CompletableFuture.failedFuture(error);
+        }
     }
 
     private static CompletableFuture<Void> validateAdminOperation(
