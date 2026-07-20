@@ -36,5 +36,28 @@ public enum NereusAdminOperation {
     TRIM_TOPIC,
     TRUNCATE_TOPIC,
     SET_SHADOW_TOPICS,
-    MIGRATE_TOPIC
+    MIGRATE_TOPIC;
+
+    /** Operations that may read primary bytes or create new storage-visible state. */
+    public boolean requiresStorageProfileReadiness() {
+        return switch (this) {
+            case TERMINATE_TOPIC,
+                    ANALYZE_BACKLOG,
+                    CLEAR_BACKLOG,
+                    SKIP_MESSAGES,
+                    EXPIRE_MESSAGES,
+                    RESET_CURSOR,
+                    TRIM_TOPIC -> true;
+            case DELETE_TOPIC,
+                    UNLOAD_TOPIC,
+                    DELETE_DURABLE_SUBSCRIPTION,
+                    TRIGGER_COMPACTION,
+                    READ_COMPACTION_STATUS,
+                    TRIGGER_OFFLOAD,
+                    READ_OFFLOAD_STATUS,
+                    TRUNCATE_TOPIC,
+                    SET_SHADOW_TOPICS,
+                    MIGRATE_TOPIC -> false;
+        };
+    }
 }

@@ -19,6 +19,8 @@
 package org.apache.pulsar.broker.admin.impl;
 
 import com.google.common.collect.Maps;
+import com.nereusstream.bookkeeper.BookKeeperProtocolActivationUpdate;
+import com.nereusstream.pulsar.BookKeeperDeletionActivationRequest;
 import io.swagger.v3.oas.annotations.Operation;
 import io.swagger.v3.oas.annotations.Parameter;
 import io.swagger.v3.oas.annotations.media.ArraySchema;
@@ -30,6 +32,7 @@ import jakarta.ws.rs.DELETE;
 import jakarta.ws.rs.DefaultValue;
 import jakarta.ws.rs.GET;
 import jakarta.ws.rs.POST;
+import jakarta.ws.rs.PUT;
 import jakarta.ws.rs.Path;
 import jakarta.ws.rs.PathParam;
 import jakarta.ws.rs.QueryParam;
@@ -44,7 +47,9 @@ import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.concurrent.CompletableFuture;
+import java.util.function.Function;
 import java.util.stream.Collectors;
 import org.apache.commons.lang3.StringUtils;
 import org.apache.pulsar.PulsarVersion;
@@ -52,6 +57,7 @@ import org.apache.pulsar.broker.PulsarService.State;
 import org.apache.pulsar.broker.ServiceConfiguration;
 import org.apache.pulsar.broker.admin.AdminResource;
 import org.apache.pulsar.broker.loadbalance.LeaderBroker;
+import org.apache.pulsar.broker.storage.nereus.NereusManagedLedgerStorage;
 import org.apache.pulsar.broker.web.RestException;
 import org.apache.pulsar.common.conf.InternalConfigurationData;
 import org.apache.pulsar.common.policies.data.BrokerInfo;
@@ -68,6 +74,130 @@ public class BrokersBase extends AdminResource {
     // to prevent excessive logging
     private static final long LOG_THREADDUMP_INTERVAL_WHEN_DEADLOCK_DETECTED = 600000L;
     private static volatile long threadDumpLoggedTimestamp;
+
+    @PUT
+    @Path("/bookkeeper-primary-wal/namespace")
+    @Operation(summary = "Provision the isolated BookKeeper ledger-id namespace for Nereus primary WAL")
+    public void provisionBookKeeperPrimaryWalNamespace(
+            NereusBookKeeperPrimaryWalAdminModels.NamespaceProvisionRequest request,
+            @Suspended AsyncResponse asyncResponse) {
+        runBookKeeperPrimaryWalAdmin(
+                asyncResponse,
+                storage -> storage.provisionBookKeeperLedgerIdNamespace(
+                                NereusBookKeeperPrimaryWalAdminModels.required(
+                                        requireRequest(request).operatorEvidenceSha256(),
+                                        "operatorEvidenceSha256"),
+                                NereusBookKeeperPrimaryWalAdminModels.timeout(
+                                        request.timeoutSeconds()))
+                        .thenApply(NereusBookKeeperPrimaryWalAdminModels.NamespaceReservationView::from));
+    }
+
+    @POST
+    @Path("/bookkeeper-primary-wal/namespace/revoke")
+    @Operation(summary = "Revoke the isolated BookKeeper ledger-id namespace for Nereus primary WAL")
+    public void revokeBookKeeperPrimaryWalNamespace(
+            NereusBookKeeperPrimaryWalAdminModels.NamespaceRevokeRequest request,
+            @Suspended AsyncResponse asyncResponse) {
+        runBookKeeperPrimaryWalAdmin(
+                asyncResponse,
+                storage -> storage.revokeBookKeeperLedgerIdNamespace(
+                                NereusBookKeeperPrimaryWalAdminModels.required(
+                                        requireRequest(request).revocationEvidenceSha256(),
+                                        "revocationEvidenceSha256"),
+                                NereusBookKeeperPrimaryWalAdminModels.nonNegative(
+                                        request.expectedMetadataVersion(),
+                                        "expectedMetadataVersion"),
+                                NereusBookKeeperPrimaryWalAdminModels.timeout(
+                                        request.timeoutSeconds()))
+                        .thenApply(NereusBookKeeperPrimaryWalAdminModels.NamespaceReservationView::from));
+    }
+
+    @POST
+    @Path("/bookkeeper-primary-wal/activation/prepare")
+    @Operation(summary = "Prepare BookKeeper primary-WAL publication activation")
+    public void prepareBookKeeperPrimaryWalActivation(
+            NereusBookKeeperPrimaryWalAdminModels.ActivationPrepareRequest request,
+            @Suspended AsyncResponse asyncResponse) {
+        runBookKeeperPrimaryWalAdmin(
+                asyncResponse,
+                storage -> storage.prepareBookKeeperPrimaryWalActivation(
+                                NereusBookKeeperPrimaryWalAdminModels.positive(
+                                        requireRequest(request).brokerReadinessEpoch(),
+                                        "brokerReadinessEpoch"),
+                                NereusBookKeeperPrimaryWalAdminModels.required(
+                                        request.brokerReadinessSha256(),
+                                        "brokerReadinessSha256"),
+                                NereusBookKeeperPrimaryWalAdminModels.timeout(
+                                        request.timeoutSeconds()))
+                        .thenApply(NereusBookKeeperPrimaryWalAdminModels.ActivationView::from));
+    }
+
+    @POST
+    @Path("/bookkeeper-primary-wal/activation/publications")
+    @Operation(summary = "Monotonically activate BookKeeper primary-WAL publication profiles")
+    public void activateBookKeeperPrimaryWalPublications(
+            NereusBookKeeperPrimaryWalAdminModels.PublicationActivationRequest request,
+            @Suspended AsyncResponse asyncResponse) {
+        runBookKeeperPrimaryWalAdmin(asyncResponse, storage -> {
+            NereusBookKeeperPrimaryWalAdminModels.PublicationActivationRequest exact =
+                    requireRequest(request);
+            BookKeeperProtocolActivationUpdate update =
+                    BookKeeperProtocolActivationUpdate.publications(
+                            NereusBookKeeperPrimaryWalAdminModels.positive(
+                                    exact.brokerReadinessEpoch(), "brokerReadinessEpoch"),
+                            NereusBookKeeperPrimaryWalAdminModels.required(
+                                    exact.brokerReadinessSha256(), "brokerReadinessSha256"),
+                            exact.asyncPublicationEnabled(),
+                            exact.syncPublicationEnabled(),
+                            NereusBookKeeperPrimaryWalAdminModels.nonNegative(
+                                    exact.expectedMetadataVersion(), "expectedMetadataVersion"));
+            return storage.activateBookKeeperPrimaryWalPublications(
+                            update,
+                            NereusBookKeeperPrimaryWalAdminModels.timeout(exact.timeoutSeconds()))
+                    .thenApply(NereusBookKeeperPrimaryWalAdminModels.ActivationView::from);
+        });
+    }
+
+    @POST
+    @Path("/bookkeeper-primary-wal/activation/deletion")
+    @Operation(summary = "Activate BookKeeper ledger deletion from broker-produced coverage proofs")
+    public void activateBookKeeperPrimaryWalDeletion(
+            NereusBookKeeperPrimaryWalAdminModels.DeletionActivationRequest request,
+            @Suspended AsyncResponse asyncResponse) {
+        runBookKeeperPrimaryWalAdmin(
+                asyncResponse,
+                storage -> {
+                    NereusBookKeeperPrimaryWalAdminModels.DeletionActivationRequest exact =
+                            requireRequest(request);
+                    return storage.activateBookKeeperLedgerDeletion(
+                                    new BookKeeperDeletionActivationRequest(
+                                            NereusBookKeeperPrimaryWalAdminModels.required(
+                                                    exact.runId(), "runId"),
+                                            NereusBookKeeperPrimaryWalAdminModels.nonNegative(
+                                                    exact.expectedActivationMetadataVersion(),
+                                                    "expectedActivationMetadataVersion"),
+                                            NereusBookKeeperPrimaryWalAdminModels.timeout(
+                                                    exact.timeoutSeconds())))
+                            .thenApply(NereusBookKeeperPrimaryWalAdminModels.DeletionActivationView::from);
+                });
+    }
+
+    @GET
+    @Path("/bookkeeper-primary-wal/activation")
+    @Operation(summary = "Read the authoritative BookKeeper primary-WAL activation")
+    public void getBookKeeperPrimaryWalActivation(
+            @QueryParam("timeoutSeconds") long timeoutSeconds,
+            @Suspended AsyncResponse asyncResponse) {
+        runBookKeeperPrimaryWalAdmin(
+                asyncResponse,
+                storage -> storage.readBookKeeperPrimaryWalActivation(
+                                NereusBookKeeperPrimaryWalAdminModels.timeout(timeoutSeconds))
+                        .thenApply(activation -> activation
+                                .map(NereusBookKeeperPrimaryWalAdminModels.ActivationView::from)
+                                .orElseThrow(() -> new RestException(
+                                        Status.NOT_FOUND,
+                                        "BookKeeper primary-WAL activation does not exist"))));
+    }
 
     @GET
     @Path("/{cluster}")
@@ -538,6 +668,38 @@ public class BrokersBase extends AdminResource {
                                                                     boolean forcedTerminateTopic) {
         pulsar().getBrokerService().unloadNamespaceBundlesGracefully(maxConcurrentUnloadPerSec, forcedTerminateTopic);
         return pulsar().closeAsync(false);
+    }
+
+    private <T> void runBookKeeperPrimaryWalAdmin(
+            AsyncResponse asyncResponse,
+            Function<NereusManagedLedgerStorage, CompletableFuture<T>> operation) {
+        Objects.requireNonNull(asyncResponse, "asyncResponse");
+        Objects.requireNonNull(operation, "operation");
+        validateSuperUserAccessAsync()
+                .thenCompose(ignored -> {
+                    if (!(pulsar().getManagedLedgerStorage()
+                            instanceof NereusManagedLedgerStorage storage)) {
+                        return FutureUtil.failedFuture(new RestException(
+                                Status.PRECONDITION_FAILED,
+                                "Nereus managed-ledger storage is not active on this broker"));
+                    }
+                    return Objects.requireNonNull(
+                            operation.apply(storage),
+                            "BookKeeper primary-WAL admin future");
+                })
+                .thenAccept(asyncResponse::resume)
+                .exceptionally(error -> {
+                    resumeAsyncResponseExceptionally(asyncResponse, error);
+                    return null;
+                });
+    }
+
+    private static <T> T requireRequest(T request) {
+        if (request == null) {
+            throw NereusBookKeeperPrimaryWalAdminModels.invalid(
+                    "request body is required");
+        }
+        return request;
     }
 
     private CompletableFuture<Void> validateBothSuperuserAndBrokerOperation(String cluster, String brokerId,
