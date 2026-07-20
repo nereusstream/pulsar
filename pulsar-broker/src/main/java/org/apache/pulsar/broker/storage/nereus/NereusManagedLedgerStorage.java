@@ -25,6 +25,9 @@ import com.nereusstream.managedledger.generation.ManagedLedgerMaterializationReg
 import com.nereusstream.managedledger.generation.ManagedLedgerPhysicalDeletionActivationRequest;
 import com.nereusstream.managedledger.generation.ManagedLedgerPhysicalDeletionActivationResult;
 import com.nereusstream.objectstore.ObjectStoreSecretResolver;
+import com.nereusstream.pulsar.BookKeeperDeletionActivationRequest;
+import com.nereusstream.pulsar.BookKeeperDeletionActivationResult;
+import com.nereusstream.pulsar.BookKeeperPrimaryWalAdministration;
 import com.nereusstream.pulsar.NereusProcessIdentity;
 import com.nereusstream.pulsar.NereusRuntimeConfiguration;
 import com.nereusstream.pulsar.NereusRuntimeContext;
@@ -67,6 +70,8 @@ public final class NereusManagedLedgerStorage implements ManagedLedgerStorage {
     private final AtomicBoolean closed = new AtomicBoolean();
     private final AtomicReference<NereusGenerationRegistrationBackfill>
             generationRegistrationBackfill = new AtomicReference<>();
+    private final AtomicReference<BookKeeperPrimaryWalAdministration>
+            bookKeeperPrimaryWalAdministration = new AtomicReference<>();
     private ManagedLedgerClientFactory bookkeeperStorage;
     private NereusManagedLedgerFactory nereusFactory;
     private NereusStorageClassBindingStore bindingStore;
@@ -142,7 +147,8 @@ public final class NereusManagedLedgerStorage implements ManagedLedgerStorage {
                     classLoader,
                     Optional.of(borrowedBookKeeperClient),
                     capabilityCoordinator,
-                    capabilityCoordinator::installBookKeeperPrimaryWalCapability);
+                    capabilityCoordinator::installBookKeeperPrimaryWalCapability,
+                    this::installBookKeeperPrimaryWalAdministration);
             runtime = runtimeProvider.create(runtimeConfiguration, context);
             ManagedLedgerFactoryConfig compatibilityFactoryConfig = new ManagedLedgerFactoryConfig();
             compatibilityFactoryConfig.setMaxCacheSize(0);
@@ -216,6 +222,27 @@ public final class NereusManagedLedgerStorage implements ManagedLedgerStorage {
     public NereusBrokerCapabilityCoordinator capabilityCoordinator() {
         ensureReady();
         return capabilityCoordinator;
+    }
+
+    public BookKeeperPrimaryWalAdministration bookKeeperPrimaryWalAdministration() {
+        ensureReady();
+        BookKeeperPrimaryWalAdministration administration =
+                bookKeeperPrimaryWalAdministration.get();
+        if (administration == null) {
+            throw new IllegalStateException(
+                    "BookKeeper primary-WAL administration is not installed");
+        }
+        return administration;
+    }
+
+    public CompletableFuture<BookKeeperDeletionActivationResult>
+            activateBookKeeperLedgerDeletion(
+                    BookKeeperDeletionActivationRequest request) {
+        try {
+            return bookKeeperPrimaryWalAdministration().activateDeletion(request);
+        } catch (Throwable error) {
+            return CompletableFuture.failedFuture(error);
+        }
     }
 
     public boolean generationProtocolEnabled() {
@@ -469,6 +496,7 @@ public final class NereusManagedLedgerStorage implements ManagedLedgerStorage {
         failure = closeResource(bookkeeperStorage, failure);
         failure = closeResource(bindingStore, failure);
         generationRegistrationBackfill.set(null);
+        bookKeeperPrimaryWalAdministration.set(null);
         storageClasses = List.of();
         if (failure != null) {
             throw failure;
@@ -490,6 +518,15 @@ public final class NereusManagedLedgerStorage implements ManagedLedgerStorage {
                     "Nereus generation registration backfill is not attached");
         }
         return backfill;
+    }
+
+    private void installBookKeeperPrimaryWalAdministration(
+            BookKeeperPrimaryWalAdministration administration) {
+        Objects.requireNonNull(administration, "administration");
+        if (!bookKeeperPrimaryWalAdministration.compareAndSet(null, administration)) {
+            throw new IllegalStateException(
+                    "BookKeeper primary-WAL administration is already installed");
+        }
     }
 
     private static IOException closeFactory(NereusManagedLedgerFactory factory, IOException failure) {
