@@ -53,6 +53,17 @@ public final class NereusBookKeeperPrimaryWalCapability {
             return Map.of();
         }
         Map<String, String> required = new HashMap<>(properties(binding));
+        required.put(
+                NereusStorageBindingCapability.PROPERTY,
+                NereusStorageBindingCapability.VERSION);
+        required.put(
+                NereusCursorProtocolCapability.PROPERTY,
+                NereusCursorProtocolCapability.VERSION);
+        if (exact.objectMaterializationEnabled()) {
+            required.put(
+                    NereusGenerationProtocolCapability.PROPERTY,
+                    NereusGenerationProtocolCapability.VERSION);
+        }
         if (exact != StorageProfile.BOOKKEEPER_WAL_SYNC_OBJECT) {
             required.remove(REQUIRED_OBJECT_GENERATION_PROPERTY);
         }
