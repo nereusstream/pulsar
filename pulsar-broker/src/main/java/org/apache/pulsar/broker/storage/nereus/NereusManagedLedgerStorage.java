@@ -140,7 +140,8 @@ public final class NereusManagedLedgerStorage implements ManagedLedgerStorage {
                     bookkeeperClass.getManagedLedgerFactory(),
                     Duration.ofSeconds(conf.getNereusMetadataTimeoutSeconds()),
                     capabilityCoordinator::requireClusterReady,
-                    capabilityCoordinator::requireStorageProfileReady);
+                    capabilityCoordinator::requireStorageProfileReady,
+                    capabilityCoordinator::requireLocalStorageProfileReady);
             NereusRuntimeContext context = new NereusRuntimeContext(
                     eventLoopGroup,
                     openTelemetry,

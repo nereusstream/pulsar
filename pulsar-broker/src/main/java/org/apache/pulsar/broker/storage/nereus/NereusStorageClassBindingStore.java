@@ -52,6 +52,7 @@ public final class NereusStorageClassBindingStore implements AutoCloseable {
     private final Duration timeout;
     private final Supplier<CompletableFuture<Void>> nereusCapabilityCheck;
     private final Function<StorageProfile, CompletableFuture<Void>> storageProfileCapabilityCheck;
+    private final Function<StorageProfile, CompletableFuture<Void>> writableStorageProfileCapabilityCheck;
     private final StorageClassBindingKeyspace keyspace = new StorageClassBindingKeyspace();
     private final StorageClassBindingCodec codec = new StorageClassBindingCodec();
     private final AtomicBoolean closed = new AtomicBoolean();
@@ -66,6 +67,7 @@ public final class NereusStorageClassBindingStore implements AutoCloseable {
                 bookkeeperFactory,
                 timeout,
                 () -> CompletableFuture.completedFuture(null),
+                ignored -> CompletableFuture.completedFuture(null),
                 ignored -> CompletableFuture.completedFuture(null));
     }
 
@@ -79,6 +81,7 @@ public final class NereusStorageClassBindingStore implements AutoCloseable {
                 bookkeeperFactory,
                 timeout,
                 nereusCapabilityCheck,
+                ignored -> CompletableFuture.completedFuture(null),
                 ignored -> CompletableFuture.completedFuture(null));
     }
 
@@ -88,6 +91,22 @@ public final class NereusStorageClassBindingStore implements AutoCloseable {
             Duration timeout,
             Supplier<CompletableFuture<Void>> nereusCapabilityCheck,
             Function<StorageProfile, CompletableFuture<Void>> storageProfileCapabilityCheck) {
+        this(
+                metadataStore,
+                bookkeeperFactory,
+                timeout,
+                nereusCapabilityCheck,
+                storageProfileCapabilityCheck,
+                storageProfileCapabilityCheck);
+    }
+
+    public NereusStorageClassBindingStore(
+            MetadataStoreExtended metadataStore,
+            ManagedLedgerFactory bookkeeperFactory,
+            Duration timeout,
+            Supplier<CompletableFuture<Void>> nereusCapabilityCheck,
+            Function<StorageProfile, CompletableFuture<Void>> storageProfileCapabilityCheck,
+            Function<StorageProfile, CompletableFuture<Void>> writableStorageProfileCapabilityCheck) {
         this.metadataStore = java.util.Objects.requireNonNull(metadataStore, "metadataStore");
         this.bookkeeperFactory = java.util.Objects.requireNonNull(bookkeeperFactory, "bookkeeperFactory");
         this.timeout = java.util.Objects.requireNonNull(timeout, "timeout");
@@ -95,6 +114,8 @@ public final class NereusStorageClassBindingStore implements AutoCloseable {
                 nereusCapabilityCheck, "nereusCapabilityCheck");
         this.storageProfileCapabilityCheck = java.util.Objects.requireNonNull(
                 storageProfileCapabilityCheck, "storageProfileCapabilityCheck");
+        this.writableStorageProfileCapabilityCheck = java.util.Objects.requireNonNull(
+                writableStorageProfileCapabilityCheck, "writableStorageProfileCapabilityCheck");
         if (timeout.isZero() || timeout.isNegative()) {
             throw new IllegalArgumentException("timeout must be positive");
         }
@@ -435,6 +456,22 @@ public final class NereusStorageClassBindingStore implements AutoCloseable {
                     return java.util.Objects.requireNonNull(
                             storageProfileCapabilityCheck.apply(profile),
                             "storageProfileCapabilityCheck result");
+                } catch (Throwable error) {
+                    return CompletableFuture.failedFuture(error);
+                }
+            }
+
+            @Override
+            public CompletableFuture<Void> validateStorageProfileBeforeWritableOpen(
+                    StorageProfile profile) {
+                if (closed.get()) {
+                    return CompletableFuture.failedFuture(
+                            new IllegalStateException("Nereus binding store is closed"));
+                }
+                try {
+                    return java.util.Objects.requireNonNull(
+                            writableStorageProfileCapabilityCheck.apply(profile),
+                            "writableStorageProfileCapabilityCheck result");
                 } catch (Throwable error) {
                     return CompletableFuture.failedFuture(error);
                 }

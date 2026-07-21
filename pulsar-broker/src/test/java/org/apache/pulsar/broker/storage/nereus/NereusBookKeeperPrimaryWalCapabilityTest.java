@@ -97,6 +97,38 @@ public class NereusBookKeeperPrimaryWalCapabilityTest {
     }
 
     @Test
+    public void writableExistingTopicRequiresOnlyTheExactLocalBinding() {
+        NereusBrokerCapabilityCoordinator coordinator = coordinator();
+        BookKeeperPrimaryWalCapabilityBinding binding = binding("11", "22");
+        BrokerRegistry registry = readyRegistry();
+        coordinator.installBookKeeperPrimaryWalCapability(binding);
+        coordinator.markStorageInitialized();
+        coordinator.attachBrokerRegistry(registry);
+        when(registry.getAvailableBrokerLookupDataAsync()).thenReturn(
+                CompletableFuture.completedFuture(Map.of(
+                        "old-broker", lookupData("old-broker", Map.of()))));
+
+        coordinator.requireLocalStorageProfileReady(StorageProfile.BOOKKEEPER_WAL_ONLY).join();
+        coordinator.requireLocalStorageProfileReady(StorageProfile.BOOKKEEPER_WAL_ASYNC_OBJECT).join();
+        coordinator.requireLocalStorageProfileReady(StorageProfile.BOOKKEEPER_WAL_SYNC_OBJECT).join();
+        coordinator.requireLocalStorageProfileReady(StorageProfile.OBJECT_WAL_SYNC_OBJECT).join();
+
+        assertThatThrownBy(() -> coordinator
+                        .requireStorageProfileReady(StorageProfile.BOOKKEEPER_WAL_ONLY)
+                        .join())
+                .hasRootCauseInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("NEREUS_CLUSTER_CAPABILITY_NOT_READY:old-broker:");
+
+        NereusBrokerCapabilityCoordinator incapable = coordinator();
+        incapable.markStorageInitialized();
+        incapable.attachBrokerRegistry(readyRegistry());
+        assertThatThrownBy(() -> incapable
+                        .requireLocalStorageProfileReady(StorageProfile.BOOKKEEPER_WAL_ONLY)
+                        .join())
+                .hasRootCauseMessage("NEREUS_BOOKKEEPER_CAPABILITY_NOT_READY:LOCAL");
+    }
+
+    @Test
     public void syncRequiresTheIndependentRequiredObjectCompletionCapability() {
         NereusBrokerCapabilityCoordinator coordinator = coordinator();
         BookKeeperPrimaryWalCapabilityBinding binding = binding("11", "22");
