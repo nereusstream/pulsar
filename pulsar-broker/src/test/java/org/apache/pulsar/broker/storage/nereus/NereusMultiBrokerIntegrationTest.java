@@ -20,15 +20,23 @@ package org.apache.pulsar.broker.storage.nereus;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import com.nereusstream.api.StorageProfile;
+import com.nereusstream.bookkeeper.BookKeeperProtocolActivation;
+import com.nereusstream.bookkeeper.BookKeeperProtocolActivationUpdate;
 import com.nereusstream.managedledger.NereusManagedLedger;
 import com.nereusstream.managedledger.generation.ManagedLedgerPhysicalDeletionActivationRequest;
+import com.nereusstream.metadata.oxia.SharedOxiaClientRuntime;
 import com.nereusstream.objectstore.ObjectStoreSecretResolver;
 import com.nereusstream.objectstore.S3ObjectKeyMapper;
+import com.nereusstream.pulsar.BookKeeperPrimaryWalAdministration;
+import com.nereusstream.pulsar.NereusProcessIdentity;
+import com.nereusstream.pulsar.NereusRuntimeConfiguration;
 import com.nereusstream.pulsar.Phase4ObjectWalRuntime;
 import com.nereusstream.pulsar.Phase4PhysicalGcRuntime;
 import io.oxia.testcontainers.OxiaContainer;
 import java.net.URI;
 import java.nio.charset.StandardCharsets;
+import java.security.SecureRandom;
+import java.time.Clock;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -87,6 +95,10 @@ public class NereusMultiBrokerIntegrationTest {
     private static final String BOOKKEEPER_TOPIC = "persistent://" + NAMESPACE + "/bookkeeper";
     private static final String BUCKET = "nereus-phase2";
     private static final String OBJECT_PREFIX = "broker-e2e";
+    private static final String BOOKKEEPER_DEPLOYMENT = "nereus-bk-e2e";
+    private static final String BOOKKEEPER_PROVIDER_SCOPE = "11".repeat(32);
+    private static final String BOOKKEEPER_RESERVATION = "nereus-bk-e2e-reservation";
+    private static final String BOOKKEEPER_PASSWORD_REFERENCE = "bookkeeper/password";
     private static final DockerImageName LOCALSTACK_IMAGE =
             DockerImageName.parse("localstack/localstack:4.14.0");
 
@@ -125,11 +137,12 @@ public class NereusMultiBrokerIntegrationTest {
         this.physicalGcEnabled = physicalGcEnabled;
         this.defaultStorageProfile = java.util.Objects.requireNonNull(
                 defaultStorageProfile, "defaultStorageProfile");
-        if (defaultStorageProfile != StorageProfile.OBJECT_WAL_SYNC_OBJECT
-                && defaultStorageProfile
-                        != StorageProfile.OBJECT_WAL_ASYNC_OBJECT) {
-            throw new IllegalArgumentException(
-                    "the broker fixture accepts only exact Object-WAL profiles");
+        if (defaultStorageProfile != defaultStorageProfile.canonical()) {
+            throw new IllegalArgumentException("the broker fixture requires an exact non-legacy profile");
+        }
+        if (defaultStorageProfile.objectMaterializationEnabled()
+                && !generationProtocolEnabled) {
+            throw new IllegalArgumentException("object materialization requires the generation protocol");
         }
     }
 
@@ -154,6 +167,9 @@ public class NereusMultiBrokerIntegrationTest {
             LocalStackSecretResolver.install(localstack.getAccessKey(), localstack.getSecretKey());
 
             bookkeeper = startBookKeeper();
+            if (defaultStorageProfile.usesBookKeeperWal()) {
+                provisionBookKeeperPrimaryWal();
+            }
             startBroker(0);
             PulsarAdmin bootstrap = admins.get(0);
             bootstrap.clusters().createCluster(CLUSTER, ClusterData.builder()
@@ -322,6 +338,34 @@ public class NereusMultiBrokerIntegrationTest {
                 .build();
     }
 
+    private void provisionBookKeeperPrimaryWal() throws Exception {
+        ServiceConfiguration bootstrap = brokerConfiguration();
+        NereusRuntimeConfiguration runtime = new NereusBrokerStorageConfiguration(bootstrap)
+                .runtimeConfiguration(NereusProcessIdentity.generate(new SecureRandom()));
+        try (SharedOxiaClientRuntime shared =
+                SharedOxiaClientRuntime.connect(runtime.oxia(), Clock.systemUTC())) {
+            BookKeeperPrimaryWalAdministration administration =
+                    BookKeeperPrimaryWalAdministration.usingSharedRuntime(
+                            runtime.bookKeeper().orElseThrow(),
+                            runtime.oxia(),
+                            shared,
+                            Clock.systemUTC());
+            administration.provisionNamespace("22".repeat(32), Duration.ofSeconds(30)).join();
+            BookKeeperProtocolActivation prepared = administration
+                    .prepareActivation(1, "33".repeat(32), Duration.ofSeconds(30))
+                    .join();
+            administration.activate(
+                            BookKeeperProtocolActivationUpdate.publications(
+                                    1,
+                                    "33".repeat(32),
+                                    true,
+                                    true,
+                                    prepared.metadataVersion()),
+                            Duration.ofSeconds(30))
+                    .join();
+        }
+    }
+
     void startBroker(int index) throws Exception {
         assertThat(brokers.get(index)).isNull();
         ServiceConfiguration configuration = brokerConfiguration();
@@ -396,6 +440,23 @@ public class NereusMultiBrokerIntegrationTest {
         configuration.setNereusAppendSessionMinCommitRemainingSeconds(1);
         configuration.setNereusDefaultStorageProfile(
                 defaultStorageProfile.name());
+        if (defaultStorageProfile.usesBookKeeperWal()) {
+            configuration.setNereusBookKeeperPrimaryWalEnabled(true);
+            configuration.setNereusBookKeeperDeploymentId(BOOKKEEPER_DEPLOYMENT);
+            configuration.setNereusBookKeeperProviderScopeSha256(BOOKKEEPER_PROVIDER_SCOPE);
+            configuration.setNereusBookKeeperLedgerIdNamespaceReservationId(
+                    BOOKKEEPER_RESERVATION);
+            configuration.setNereusBookKeeperEnsembleSize(1);
+            configuration.setNereusBookKeeperWriteQuorumSize(1);
+            configuration.setNereusBookKeeperAckQuorumSize(1);
+            configuration.setNereusBookKeeperPasswordSecretRef(
+                    BOOKKEEPER_PASSWORD_REFERENCE);
+            configuration.setNereusBookKeeperPasswordIdentityVersion("v1");
+            configuration.setNereusBookKeeperOperationTimeoutSeconds(10);
+            configuration.setNereusBookKeeperAllocationTimeoutSeconds(10);
+            configuration.setNereusBookKeeperSealTimeoutSeconds(10);
+            configuration.setNereusBookKeeperDeleteTimeoutSeconds(10);
+        }
         if (generationProtocolEnabled) {
             configuration.setNereusGenerationProtocolEnabled(true);
             configuration.setNereusGenerationRegistrationBackfillConcurrency(2);
@@ -709,6 +770,9 @@ public class NereusMultiBrokerIntegrationTest {
                                 (NereusManagedLedgerStorage) broker.getManagedLedgerStorage();
                         storage.capabilityCoordinator().requireClusterReady().join();
                         storage.capabilityCoordinator().requireCursorClusterReady().join();
+                        storage.capabilityCoordinator()
+                                .requireStorageProfileReady(defaultStorageProfile)
+                                .join();
                     }
                 });
     }
@@ -907,6 +971,8 @@ public class NereusMultiBrokerIntegrationTest {
     public static final class LocalStackSecretResolver implements ObjectStoreSecretResolver {
         static final String ACCESS_REFERENCE = "localstack/access";
         static final String SECRET_REFERENCE = "localstack/secret";
+        static final String BOOKKEEPER_PASSWORD_REFERENCE =
+                NereusMultiBrokerIntegrationTest.BOOKKEEPER_PASSWORD_REFERENCE;
         private static volatile String accessKey;
         private static volatile String secretKey;
 
@@ -925,6 +991,7 @@ public class NereusMultiBrokerIntegrationTest {
             return switch (secretReference) {
                 case ACCESS_REFERENCE -> Optional.ofNullable(accessKey).map(String::toCharArray);
                 case SECRET_REFERENCE -> Optional.ofNullable(secretKey).map(String::toCharArray);
+                case BOOKKEEPER_PASSWORD_REFERENCE -> Optional.of("nereus-bk-e2e".toCharArray());
                 default -> Optional.empty();
             };
         }

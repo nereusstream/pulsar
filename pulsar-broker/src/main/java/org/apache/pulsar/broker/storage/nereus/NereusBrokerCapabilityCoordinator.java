@@ -157,6 +157,33 @@ public final class NereusBrokerCapabilityCoordinator
     }
 
     /**
+     * Existing-topic writable admission is intentionally local.
+     *
+     * <p>First-create remains an all-broker stable-snapshot barrier. Reusing that barrier here would stop every
+     * capable owner while one broker is rolling or deliberately excluded. The installed binding is immutable for
+     * this process and exists only after the exact local BK runtime, namespace and publication activation verified.
+     */
+    public CompletableFuture<Void> requireLocalStorageProfileReady(StorageProfile profile) {
+        StorageProfile exact = java.util.Objects.requireNonNull(profile, "profile").canonical();
+        if (!exact.usesBookKeeperWal()) {
+            return CompletableFuture.completedFuture(null);
+        }
+        BrokerRegistry registry = brokerRegistry.get();
+        if (!storageInitialized.get()
+                || registry == null
+                || !registry.isStarted()
+                || !registry.isRegistered()) {
+            return CompletableFuture.failedFuture(new IllegalStateException(
+                    "NEREUS_BOOKKEEPER_CAPABILITY_NOT_READY:LOCAL_REGISTRY"));
+        }
+        if (bookKeeperBinding.get() == null) {
+            return CompletableFuture.failedFuture(new IllegalStateException(
+                    "NEREUS_BOOKKEEPER_CAPABILITY_NOT_READY:LOCAL"));
+        }
+        return CompletableFuture.completedFuture(null);
+    }
+
+    /**
      * Returns the deterministic identity of the two stable all-capable persistent broker snapshots.
      *
      * <p>Any failure clears the process-local cached identity. Broker registry notifications also invalidate it.
