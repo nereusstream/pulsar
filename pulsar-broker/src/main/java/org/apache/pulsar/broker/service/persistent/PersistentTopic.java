@@ -5131,7 +5131,7 @@ public class PersistentTopic extends AbstractTopic implements Topic, AddEntryCal
         TopicName topicName = TopicName.get(topic);
         return nereusPolicyUpdateCoordinator.refresh(
                         () -> loadPreparedNereusPolicySnapshot(topicName, 0),
-                        getPoliciesNotifyThread(),
+                        orderedExecutor == null ? Runnable::run : orderedExecutor,
                         snapshot -> {
                             applyNereusPolicySnapshot(snapshot);
                             return FutureUtil.waitForAll(applyUpdatedTopicPolicies(false));
