@@ -64,6 +64,7 @@ import org.apache.pulsar.broker.service.BrokerServiceException.NotAllowedExcepti
 import org.apache.pulsar.broker.storage.BookkeeperManagedLedgerStorageClass;
 import org.apache.pulsar.broker.storage.ManagedLedgerStorage;
 import org.apache.pulsar.broker.storage.ManagedLedgerStorageClass;
+import org.apache.pulsar.common.naming.NamespaceName;
 import org.apache.pulsar.common.naming.TopicName;
 import org.apache.pulsar.common.util.Reflections;
 import org.apache.pulsar.metadata.api.extended.MetadataStoreExtended;
@@ -537,6 +538,84 @@ public final class NereusManagedLedgerStorage implements ManagedLedgerStorage {
                         .filter(current -> StorageClassBindingRecord.NEREUS
                                 .equals(current.storageClass()))
                         .isPresent());
+    }
+
+    /**
+     * Resolves the strongest durable BK profile in a namespace for service-unit ownership filtering.
+     *
+     * <p>The binding selects the storage class only. The exact profile remains owned by the F2 projection/L0
+     * stream and is reloaded here; broker defaults and topic policy are never allowed to reinterpret it.
+     */
+    public CompletableFuture<Optional<StorageProfile>> requiredBookKeeperOwnershipProfile(
+            NamespaceName namespace,
+            int maxEntries,
+            int maxPendingOperations) {
+        try {
+            ensureReady();
+            Objects.requireNonNull(namespace, "namespace");
+            if (maxEntries <= 0 || maxPendingOperations <= 0) {
+                throw new IllegalArgumentException(
+                        "BookKeeper ownership scan limits must be positive");
+            }
+        } catch (RuntimeException error) {
+            return CompletableFuture.failedFuture(error);
+        }
+        return bindingStore.listNonDeletedBindings(
+                        namespace, maxEntries, maxPendingOperations)
+                .thenCompose(bindings -> {
+                    List<StorageClassBindingRecord> activeNereus = bindings.stream()
+                            .filter(binding -> binding.state()
+                                    == StorageClassBindingState.ACTIVE)
+                            .filter(binding -> StorageClassBindingRecord.NEREUS.equals(
+                                    binding.storageClass()))
+                            .toList();
+                    return scanBookKeeperOwnershipProfiles(
+                            activeNereus,
+                            0,
+                            maxPendingOperations,
+                            Optional.empty());
+                });
+    }
+
+    private CompletableFuture<Optional<StorageProfile>> scanBookKeeperOwnershipProfiles(
+            List<StorageClassBindingRecord> bindings,
+            int index,
+            int maxPendingOperations,
+            Optional<StorageProfile> strongest) {
+        if (index >= bindings.size()
+                || strongest.filter(profile -> profile
+                        == StorageProfile.BOOKKEEPER_WAL_SYNC_OBJECT).isPresent()) {
+            return CompletableFuture.completedFuture(strongest);
+        }
+        int end = Math.min(bindings.size(), index + maxPendingOperations);
+        List<CompletableFuture<StorageProfile>> reads = bindings.subList(index, end).stream()
+                .map(binding -> nereusFactory.inspectStorageState(binding.persistenceName())
+                        .thenApply(snapshot -> requireDurableProfile(binding, snapshot)))
+                .toList();
+        return CompletableFuture.allOf(reads.toArray(CompletableFuture[]::new))
+                .thenCompose(ignored -> {
+                    Optional<StorageProfile> next = strongest;
+                    for (CompletableFuture<StorageProfile> read : reads) {
+                        StorageProfile profile = read.join().canonical();
+                        if (profile.usesBookKeeperWal()
+                                && (next.isEmpty()
+                                        || bookKeeperOwnershipRank(profile)
+                                                > bookKeeperOwnershipRank(next.orElseThrow()))) {
+                            next = Optional.of(profile);
+                        }
+                    }
+                    return scanBookKeeperOwnershipProfiles(
+                            bindings, end, maxPendingOperations, next);
+                });
+    }
+
+    private static int bookKeeperOwnershipRank(StorageProfile profile) {
+        return switch (profile.canonical()) {
+            case BOOKKEEPER_WAL_ONLY -> 1;
+            case BOOKKEEPER_WAL_ASYNC_OBJECT -> 2;
+            case BOOKKEEPER_WAL_SYNC_OBJECT -> 3;
+            default -> 0;
+        };
     }
 
     static CompletableFuture<Void> validateBoundNereusAdminOperation(

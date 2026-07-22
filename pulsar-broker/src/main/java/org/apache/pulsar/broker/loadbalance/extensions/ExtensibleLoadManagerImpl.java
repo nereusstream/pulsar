@@ -63,6 +63,7 @@ import org.apache.pulsar.broker.loadbalance.extensions.filter.BrokerIsolationPol
 import org.apache.pulsar.broker.loadbalance.extensions.filter.BrokerLoadManagerClassFilter;
 import org.apache.pulsar.broker.loadbalance.extensions.filter.BrokerMaxTopicCountFilter;
 import org.apache.pulsar.broker.loadbalance.extensions.filter.BrokerVersionFilter;
+import org.apache.pulsar.broker.loadbalance.extensions.filter.NereusBookKeeperOwnershipFilter;
 import org.apache.pulsar.broker.loadbalance.extensions.manager.SplitManager;
 import org.apache.pulsar.broker.loadbalance.extensions.manager.UnloadManager;
 import org.apache.pulsar.broker.loadbalance.extensions.models.AssignCounter;
@@ -90,6 +91,7 @@ import org.apache.pulsar.broker.loadbalance.impl.SimpleResourceAllocationPolicie
 import org.apache.pulsar.broker.namespace.LookupOptions;
 import org.apache.pulsar.broker.namespace.NamespaceEphemeralData;
 import org.apache.pulsar.broker.namespace.NamespaceService;
+import org.apache.pulsar.broker.storage.nereus.NereusManagedLedgerStorage;
 import org.apache.pulsar.client.admin.PulsarAdminException;
 import org.apache.pulsar.common.naming.NamespaceBundle;
 import org.apache.pulsar.common.naming.NamespaceBundleSplitAlgorithm;
@@ -364,6 +366,13 @@ public class ExtensibleLoadManagerImpl implements ExtensibleLoadManager, BrokerS
         }
         try {
             this.brokerRegistry = createBrokerRegistry(pulsar);
+            if (pulsar.getManagedLedgerStorage()
+                    instanceof NereusManagedLedgerStorage nereusStorage) {
+                this.brokerFilterPipeline.add(new NereusBookKeeperOwnershipFilter(
+                        nereusStorage,
+                        conf.getNereusMaxNamespaceBindingScanEntries(),
+                        conf.getNereusMaxBindingPendingOperations()));
+            }
             this.leaderElectionService = new LeaderElectionService(
                     pulsar.getCoordinationService(), pulsar.getBrokerId(),
                     pulsar.getSafeWebServiceAddress(), ELECTION_ROOT,

@@ -104,7 +104,10 @@ public class NereusMultiBrokerIntegrationTest {
 
     private final boolean generationProtocolEnabled;
     private final boolean physicalGcEnabled;
+    private final boolean bookKeeperGcEnabled;
     private final StorageProfile defaultStorageProfile;
+    private final List<StorageProfile> brokerDefaultStorageProfiles;
+    private final List<Boolean> brokerBookKeeperPrimaryWalEnabled;
     private final List<PulsarService> brokers = new ArrayList<>(
             Collections.nCopies(NUM_BROKERS, null));
     private final List<PulsarAdmin> admins = new ArrayList<>(
@@ -122,19 +125,33 @@ public class NereusMultiBrokerIntegrationTest {
         this(
                 physicalGcEnabled,
                 physicalGcEnabled,
-                StorageProfile.OBJECT_WAL_SYNC_OBJECT);
+                StorageProfile.OBJECT_WAL_SYNC_OBJECT,
+                false);
     }
 
     NereusMultiBrokerIntegrationTest(
             boolean generationProtocolEnabled,
             boolean physicalGcEnabled,
             StorageProfile defaultStorageProfile) {
+        this(
+                generationProtocolEnabled,
+                physicalGcEnabled,
+                defaultStorageProfile,
+                false);
+    }
+
+    NereusMultiBrokerIntegrationTest(
+            boolean generationProtocolEnabled,
+            boolean physicalGcEnabled,
+            StorageProfile defaultStorageProfile,
+            boolean bookKeeperGcEnabled) {
         if (physicalGcEnabled && !generationProtocolEnabled) {
             throw new IllegalArgumentException(
                     "physical GC requires the generation protocol");
         }
         this.generationProtocolEnabled = generationProtocolEnabled;
         this.physicalGcEnabled = physicalGcEnabled;
+        this.bookKeeperGcEnabled = bookKeeperGcEnabled;
         this.defaultStorageProfile = java.util.Objects.requireNonNull(
                 defaultStorageProfile, "defaultStorageProfile");
         if (defaultStorageProfile != defaultStorageProfile.canonical()) {
@@ -144,6 +161,11 @@ public class NereusMultiBrokerIntegrationTest {
                 && !generationProtocolEnabled) {
             throw new IllegalArgumentException("object materialization requires the generation protocol");
         }
+        this.brokerDefaultStorageProfiles = new ArrayList<>(
+                Collections.nCopies(NUM_BROKERS, defaultStorageProfile));
+        this.brokerBookKeeperPrimaryWalEnabled = new ArrayList<>(
+                Collections.nCopies(
+                        NUM_BROKERS, defaultStorageProfile.usesBookKeeperWal()));
     }
 
     @BeforeClass(alwaysRun = true)
@@ -339,7 +361,7 @@ public class NereusMultiBrokerIntegrationTest {
     }
 
     private void provisionBookKeeperPrimaryWal() throws Exception {
-        ServiceConfiguration bootstrap = brokerConfiguration();
+        ServiceConfiguration bootstrap = brokerConfiguration(0);
         NereusRuntimeConfiguration runtime = new NereusBrokerStorageConfiguration(bootstrap)
                 .runtimeConfiguration(NereusProcessIdentity.generate(new SecureRandom()));
         try (SharedOxiaClientRuntime shared =
@@ -368,7 +390,7 @@ public class NereusMultiBrokerIntegrationTest {
 
     void startBroker(int index) throws Exception {
         assertThat(brokers.get(index)).isNull();
-        ServiceConfiguration configuration = brokerConfiguration();
+        ServiceConfiguration configuration = brokerConfiguration(index);
         PulsarService broker = new PulsarService(configuration);
         try {
             broker.start();
@@ -383,7 +405,7 @@ public class NereusMultiBrokerIntegrationTest {
         }
     }
 
-    private ServiceConfiguration brokerConfiguration() {
+    private ServiceConfiguration brokerConfiguration(int brokerIndex) {
         ServiceConfiguration configuration = new ServiceConfiguration();
         configuration.setMetadataStoreUrl(metadataStoreUrl);
         configuration.setConfigurationMetadataStoreUrl(metadataStoreUrl);
@@ -438,9 +460,11 @@ public class NereusMultiBrokerIntegrationTest {
         configuration.setNereusAppendSessionTtlSeconds(3);
         configuration.setNereusAppendSessionRenewBeforeSeconds(1);
         configuration.setNereusAppendSessionMinCommitRemainingSeconds(1);
-        configuration.setNereusDefaultStorageProfile(
-                defaultStorageProfile.name());
-        if (defaultStorageProfile.usesBookKeeperWal()) {
+        StorageProfile brokerProfile = brokerDefaultStorageProfiles.get(brokerIndex);
+        boolean bookKeeperPrimaryWalEnabled =
+                brokerBookKeeperPrimaryWalEnabled.get(brokerIndex);
+        configuration.setNereusDefaultStorageProfile(brokerProfile.name());
+        if (bookKeeperPrimaryWalEnabled) {
             configuration.setNereusBookKeeperPrimaryWalEnabled(true);
             configuration.setNereusBookKeeperDeploymentId(BOOKKEEPER_DEPLOYMENT);
             configuration.setNereusBookKeeperProviderScopeSha256(BOOKKEEPER_PROVIDER_SCOPE);
@@ -456,13 +480,18 @@ public class NereusMultiBrokerIntegrationTest {
             configuration.setNereusBookKeeperAllocationTimeoutSeconds(10);
             configuration.setNereusBookKeeperSealTimeoutSeconds(10);
             configuration.setNereusBookKeeperDeleteTimeoutSeconds(10);
+            if (bookKeeperGcEnabled) {
+                configuration.setNereusBookKeeperGcEnabled(true);
+                configuration.setNereusBookKeeperGcDryRun(false);
+                configuration.setNereusBookKeeperRetentionScanIntervalSeconds(3600);
+            }
         }
         if (generationProtocolEnabled) {
             configuration.setNereusGenerationProtocolEnabled(true);
             configuration.setNereusGenerationRegistrationBackfillConcurrency(2);
             configuration.setNereusGenerationRegistrationBackfillTimeoutSeconds(60);
             configuration.setNereusObjectStoreRequestTimeoutSeconds(5);
-            configuration.setNereusAppendTimeoutSeconds(5);
+            configuration.setNereusAppendTimeoutSeconds(15);
             configuration.setNereusAppendRecoveryTimeoutSeconds(10);
             configuration.setNereusAppendRecoveryAttemptTimeoutSeconds(2);
             configuration.setNereusAppendRecoveryBackoffMaxSeconds(1);
@@ -525,6 +554,7 @@ public class NereusMultiBrokerIntegrationTest {
     PulsarClient multiBrokerClient() throws Exception {
         return PulsarClient.builder()
                 .serviceUrl(brokers.stream()
+                        .filter(java.util.Objects::nonNull)
                         .map(PulsarService::getBrokerServiceUrl)
                         .reduce((left, right) -> left + "," + right)
                         .orElseThrow())
@@ -760,6 +790,34 @@ public class NereusMultiBrokerIntegrationTest {
     }
 
     void awaitCapabilityConvergence() {
+        awaitBaseCapabilityConvergence();
+        Awaitility.await().atMost(Duration.ofSeconds(60)).pollInterval(Duration.ofMillis(100))
+                .untilAsserted(() -> {
+                    boolean everyLiveBrokerBookKeeperCapable = true;
+                    for (int index = 0; index < brokers.size(); index++) {
+                        if (brokers.get(index) != null
+                                && !brokerBookKeeperPrimaryWalEnabled.get(index)) {
+                            everyLiveBrokerBookKeeperCapable = false;
+                            break;
+                        }
+                    }
+                    for (PulsarService broker : brokers) {
+                        if (broker == null) {
+                            continue;
+                        }
+                        NereusManagedLedgerStorage storage =
+                                (NereusManagedLedgerStorage) broker.getManagedLedgerStorage();
+                        if (everyLiveBrokerBookKeeperCapable
+                                && defaultStorageProfile.usesBookKeeperWal()) {
+                            storage.capabilityCoordinator()
+                                    .requireStorageProfileReady(defaultStorageProfile)
+                                    .join();
+                        }
+                    }
+                });
+    }
+
+    void awaitBaseCapabilityConvergence() {
         Awaitility.await().atMost(Duration.ofSeconds(60)).pollInterval(Duration.ofMillis(100))
                 .untilAsserted(() -> {
                     for (PulsarService broker : brokers) {
@@ -770,11 +828,24 @@ public class NereusMultiBrokerIntegrationTest {
                                 (NereusManagedLedgerStorage) broker.getManagedLedgerStorage();
                         storage.capabilityCoordinator().requireClusterReady().join();
                         storage.capabilityCoordinator().requireCursorClusterReady().join();
-                        storage.capabilityCoordinator()
-                                .requireStorageProfileReady(defaultStorageProfile)
-                                .join();
                     }
                 });
+    }
+
+    void setBrokerDefaultStorageProfile(int index, StorageProfile profile) {
+        assertThat(brokers.get(index)).isNull();
+        StorageProfile exact = java.util.Objects.requireNonNull(profile, "profile");
+        assertThat(exact.canonical()).isEqualTo(exact);
+        brokerDefaultStorageProfiles.set(index, exact);
+    }
+
+    void setBrokerBookKeeperPrimaryWalEnabled(int index, boolean enabled) {
+        assertThat(brokers.get(index)).isNull();
+        brokerBookKeeperPrimaryWalEnabled.set(index, enabled);
+        if (!enabled && brokerDefaultStorageProfiles.get(index).usesBookKeeperWal()) {
+            brokerDefaultStorageProfiles.set(
+                    index, StorageProfile.OBJECT_WAL_SYNC_OBJECT);
+        }
     }
 
     long objectCount() throws Exception {
@@ -818,13 +889,17 @@ public class NereusMultiBrokerIntegrationTest {
     }
 
     PersistentTopic loadedPersistentTopic(String topicName) {
-        int owner = awaitOwner(admins.stream().filter(java.util.Objects::nonNull).findFirst().orElseThrow(),
-                topicName, null);
         AtomicReference<PersistentTopic> loaded = new AtomicReference<>();
         Awaitility.await().atMost(Duration.ofSeconds(60)).untilAsserted(() -> {
-            PersistentTopic topic = (PersistentTopic) brokers.get(owner).getBrokerService()
-                    .getTopicReference(topicName)
-                    .orElseThrow();
+            List<PersistentTopic> liveReferences = brokers.stream()
+                    .filter(java.util.Objects::nonNull)
+                    .map(PulsarService::getBrokerService)
+                    .map(service -> service.getTopicReference(topicName))
+                    .flatMap(Optional::stream)
+                    .map(PersistentTopic.class::cast)
+                    .toList();
+            assertThat(liveReferences).hasSize(1);
+            PersistentTopic topic = liveReferences.get(0);
             assertThat(topic.getManagedLedger()).isInstanceOf(NereusManagedLedger.class);
             loaded.set(topic);
         });
