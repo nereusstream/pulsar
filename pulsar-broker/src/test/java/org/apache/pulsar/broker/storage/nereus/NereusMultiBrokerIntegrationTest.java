@@ -157,7 +157,9 @@ public class NereusMultiBrokerIntegrationTest {
         if (defaultStorageProfile != defaultStorageProfile.canonical()) {
             throw new IllegalArgumentException("the broker fixture requires an exact non-legacy profile");
         }
-        if (defaultStorageProfile.objectMaterializationEnabled()
+        if ((defaultStorageProfile.asyncObjectMaterialization()
+                        || defaultStorageProfile
+                                == StorageProfile.BOOKKEEPER_WAL_SYNC_OBJECT)
                 && !generationProtocolEnabled) {
             throw new IllegalArgumentException("object materialization requires the generation protocol");
         }
