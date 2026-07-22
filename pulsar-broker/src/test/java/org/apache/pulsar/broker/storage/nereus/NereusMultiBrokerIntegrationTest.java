@@ -30,6 +30,7 @@ import com.nereusstream.objectstore.S3ObjectKeyMapper;
 import com.nereusstream.pulsar.BookKeeperPrimaryWalAdministration;
 import com.nereusstream.pulsar.NereusProcessIdentity;
 import com.nereusstream.pulsar.NereusRuntimeConfiguration;
+import com.nereusstream.pulsar.OwnedRuntimeComponents;
 import com.nereusstream.pulsar.Phase4ObjectWalRuntime;
 import com.nereusstream.pulsar.Phase4PhysicalGcRuntime;
 import io.oxia.testcontainers.OxiaContainer;
@@ -921,9 +922,14 @@ public class NereusMultiBrokerIntegrationTest {
     }
 
     Phase4ObjectWalRuntime materializationRuntime(String topicName) {
-        return (Phase4ObjectWalRuntime) loadedNereusLedger(topicName)
+        AutoCloseable runtime = loadedNereusLedger(topicName)
                 .runtime()
                 .materializationRuntime();
+        if (runtime instanceof Phase4ObjectWalRuntime phase4Runtime) {
+            return phase4Runtime;
+        }
+        return ((OwnedRuntimeComponents) runtime)
+                .requireComponent(Phase4ObjectWalRuntime.class);
     }
 
     Phase4PhysicalGcRuntime physicalGcRuntime(String topicName) {

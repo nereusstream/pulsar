@@ -215,8 +215,7 @@ public class NereusMaterializationContentionMultiBrokerIntegrationTest {
             assertThat(cluster.awaitOwner(cluster.admin(0), topic, broker))
                     .isEqualTo(broker);
             NereusManagedLedger ledger = cluster.loadedNereusLedger(topic);
-            Phase4ObjectWalRuntime runtime = (Phase4ObjectWalRuntime)
-                    ledger.runtime().materializationRuntime();
+            Phase4ObjectWalRuntime runtime = cluster.materializationRuntime(topic);
             result.put(broker, new RuntimeHandle(
                     runtime, ledger.runtime().processRunId()));
         });
