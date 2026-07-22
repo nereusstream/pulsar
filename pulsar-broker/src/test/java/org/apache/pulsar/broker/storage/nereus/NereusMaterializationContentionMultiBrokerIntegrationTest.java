@@ -48,6 +48,7 @@ import org.apache.pulsar.client.api.MessageIdAdv;
 import org.apache.pulsar.client.api.Producer;
 import org.apache.pulsar.client.api.PulsarClient;
 import org.apache.pulsar.client.api.Reader;
+import org.apache.pulsar.common.naming.TopicName;
 import org.apache.pulsar.common.policies.data.PersistencePolicies;
 import org.awaitility.Awaitility;
 import org.testng.annotations.AfterClass;
@@ -59,7 +60,7 @@ import org.testng.annotations.Test;
 public class NereusMaterializationContentionMultiBrokerIntegrationTest {
     private static final String ACTIVATION_RUN =
             "phasefourm6materializationcontention";
-    private static final int MAX_TOPIC_CANDIDATES = 16;
+    private static final int MAX_TOPIC_CANDIDATES = 4_096;
     private static final int WORKLOAD_ENTRIES = 16;
     private static final int WORKLOAD_PAYLOAD_BYTES = 128 * 1024;
 
@@ -170,6 +171,7 @@ public class NereusMaterializationContentionMultiBrokerIntegrationTest {
         Map<Integer, String> anchorByBroker = new LinkedHashMap<>();
         Map<String, List<ExpectedMessage>> expectedByTopic =
                 new LinkedHashMap<>();
+        Map<String, String> topicByBundle = new LinkedHashMap<>();
         try (PulsarClient client = cluster.multiBrokerClient()) {
             for (int candidate = 0;
                     candidate < MAX_TOPIC_CANDIDATES
@@ -177,6 +179,13 @@ public class NereusMaterializationContentionMultiBrokerIntegrationTest {
                     candidate++) {
                 String topic = "persistent://" + cluster.namespace()
                         + "/phase4-m6-worker-contention-" + candidate;
+                String bundle = cluster.broker(0)
+                        .getNamespaceService()
+                        .getBundle(TopicName.get(topic))
+                        .getBundleRange();
+                if (topicByBundle.putIfAbsent(bundle, topic) != null) {
+                    continue;
+                }
                 cluster.admin(0).topicPolicies().setPersistence(
                         topic, nereusPolicy);
                 Awaitility.await().atMost(Duration.ofSeconds(30))
@@ -194,8 +203,9 @@ public class NereusMaterializationContentionMultiBrokerIntegrationTest {
             }
             assertThat(anchorByBroker)
                     .withFailMessage(
-                            "could not place one Nereus topic on each broker: %s",
-                            anchorByBroker)
+                            "could not place one Nereus bundle on each broker: owners=%s, bundles=%s",
+                            anchorByBroker,
+                            topicByBundle)
                     .containsOnlyKeys(0, 1);
             expectedByTopic.forEach((topic, expected) -> append(
                     client,
