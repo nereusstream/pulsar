@@ -18,6 +18,7 @@
  */
 package org.apache.pulsar.broker.storage.nereus;
 
+import com.fasterxml.jackson.databind.JsonNode;
 import com.nereusstream.api.StorageProfile;
 import com.nereusstream.bookkeeper.BookKeeperBrokerReadiness;
 import com.nereusstream.bookkeeper.BookKeeperBrokerReadinessProvider;
@@ -26,15 +27,18 @@ import com.nereusstream.core.capability.GenerationCapabilityReadinessProvider;
 import com.nereusstream.managedledger.cursor.CursorLedgerIdentity;
 import com.nereusstream.managedledger.cursor.CursorProtocolActivationGuard;
 import com.nereusstream.pulsar.BookKeeperPrimaryWalCapabilityBinding;
+import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.time.Duration;
+import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HexFormat;
+import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.TreeMap;
@@ -43,8 +47,11 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
+import org.apache.pulsar.broker.loadbalance.LoadManager;
 import org.apache.pulsar.broker.loadbalance.extensions.BrokerRegistry;
-import org.apache.pulsar.broker.loadbalance.extensions.data.BrokerLookupData;
+import org.apache.pulsar.common.util.ObjectMapperFactory;
+import org.apache.pulsar.metadata.api.MetadataStore;
+import org.apache.pulsar.metadata.api.Notification;
 
 /** Publishes and independently verifies the cluster-wide binding, cursor, and generation protocols. */
 public final class NereusBrokerCapabilityCoordinator
@@ -54,8 +61,10 @@ public final class NereusBrokerCapabilityCoordinator
     public static final String PROPERTY = "nereus.storage-binding-protocol";
     public static final String VERSION = "1";
 
+    private final MetadataStore metadataStore;
     private final Duration operationTimeout;
     private final AtomicBoolean storageInitialized = new AtomicBoolean();
+    private final AtomicReference<String> localBrokerId = new AtomicReference<>();
     private final AtomicReference<BrokerRegistry> brokerRegistry = new AtomicReference<>();
     private final AtomicLong brokerRegistryRevision = new AtomicLong();
     private final AtomicReference<CachedGenerationReadiness> generationReadiness =
@@ -66,9 +75,18 @@ public final class NereusBrokerCapabilityCoordinator
             new AtomicReference<>();
 
     public NereusBrokerCapabilityCoordinator(Duration operationTimeout) {
+        this(null, operationTimeout);
+    }
+
+    public NereusBrokerCapabilityCoordinator(
+            MetadataStore metadataStore, Duration operationTimeout) {
+        this.metadataStore = metadataStore;
         this.operationTimeout = java.util.Objects.requireNonNull(operationTimeout, "operationTimeout");
         if (operationTimeout.isZero() || operationTimeout.isNegative()) {
             throw new IllegalArgumentException("operationTimeout must be positive");
+        }
+        if (metadataStore != null) {
+            metadataStore.registerListener(this::handleMetadataStoreNotification);
         }
     }
 
@@ -91,6 +109,19 @@ public final class NereusBrokerCapabilityCoordinator
         }
     }
 
+    public void attachLocalBroker(String brokerId) {
+        String exact = java.util.Objects.requireNonNull(brokerId, "brokerId");
+        if (exact.isBlank()) {
+            throw new IllegalArgumentException("brokerId cannot be blank");
+        }
+        if (!storageInitialized.get()) {
+            throw new IllegalStateException("Nereus storage is not initialized");
+        }
+        if (!localBrokerId.compareAndSet(null, exact)) {
+            throw new IllegalStateException("Nereus local broker is already attached");
+        }
+    }
+
     public void attachBrokerRegistry(BrokerRegistry registry) {
         java.util.Objects.requireNonNull(registry, "registry");
         if (!storageInitialized.get()) {
@@ -110,9 +141,6 @@ public final class NereusBrokerCapabilityCoordinator
         NereusStorageBindingCapability.requireUnreserved(configured);
         if (!storageInitialized.get()) {
             throw new IllegalStateException("Nereus storage is not initialized");
-        }
-        if (brokerRegistry.get() == null) {
-            throw new IllegalStateException("Nereus broker registry is not attached");
         }
         Map<String, String> properties = new HashMap<>(configured);
         properties.put(PROPERTY, VERSION);
@@ -168,17 +196,43 @@ public final class NereusBrokerCapabilityCoordinator
         if (!exact.usesBookKeeperWal()) {
             return CompletableFuture.completedFuture(null);
         }
+        if (!storageInitialized.get()) {
+            return CompletableFuture.failedFuture(new IllegalStateException(
+                    "NEREUS_BOOKKEEPER_CAPABILITY_NOT_READY:LOCAL_REGISTRY"));
+        }
+        BookKeeperPrimaryWalCapabilityBinding binding = bookKeeperBinding.get();
+        if (binding == null) {
+            return CompletableFuture.failedFuture(new IllegalStateException(
+                    "NEREUS_BOOKKEEPER_CAPABILITY_NOT_READY:LOCAL"));
+        }
+        if (metadataStore != null) {
+            String brokerId = localBrokerId.get();
+            if (brokerId == null) {
+                return CompletableFuture.failedFuture(new IllegalStateException(
+                        "NEREUS_BOOKKEEPER_CAPABILITY_NOT_READY:LOCAL_REGISTRY"));
+            }
+            Map<String, String> required =
+                    NereusBookKeeperPrimaryWalCapability.requiredProperties(binding, exact);
+            return readMetadataBroker(brokerId).thenCompose(registered -> {
+                if (registered.isEmpty()
+                        || !registered.orElseThrow().persistentTopicsEnabled()) {
+                    return CompletableFuture.failedFuture(new IllegalStateException(
+                            "NEREUS_BOOKKEEPER_CAPABILITY_NOT_READY:LOCAL_REGISTRY"));
+                }
+                try {
+                    requireProperties(brokerId, registered.orElseThrow(), required);
+                    return CompletableFuture.completedFuture(null);
+                } catch (Throwable error) {
+                    return CompletableFuture.failedFuture(error);
+                }
+            });
+        }
         BrokerRegistry registry = brokerRegistry.get();
-        if (!storageInitialized.get()
-                || registry == null
+        if (registry == null
                 || !registry.isStarted()
                 || !registry.isRegistered()) {
             return CompletableFuture.failedFuture(new IllegalStateException(
                     "NEREUS_BOOKKEEPER_CAPABILITY_NOT_READY:LOCAL_REGISTRY"));
-        }
-        if (bookKeeperBinding.get() == null) {
-            return CompletableFuture.failedFuture(new IllegalStateException(
-                    "NEREUS_BOOKKEEPER_CAPABILITY_NOT_READY:LOCAL"));
         }
         return CompletableFuture.completedFuture(null);
     }
@@ -258,14 +312,39 @@ public final class NereusBrokerCapabilityCoordinator
         });
     }
 
+    /**
+     * Verifies that a publication mutation is bound to the strongest readiness
+     * identity this broker can currently publish.
+     *
+     * <p>Before the first durable activation, brokers cannot advertise the
+     * BookKeeper binding, so the generation-capable broker set is the bootstrap
+     * authority. After a restart has installed the durable binding, callers must
+     * use the stronger BookKeeper primary-WAL readiness identity.
+     */
+    public CompletableFuture<Void> requireBookKeeperPublicationReadiness(
+            long brokerReadinessEpoch, String brokerReadinessSha256) {
+        java.util.Objects.requireNonNull(
+                brokerReadinessSha256, "brokerReadinessSha256");
+        if (bookKeeperBinding.get() == null) {
+            return requireGenerationReadiness().thenAccept(readiness ->
+                    requireExactReadiness(
+                            brokerReadinessEpoch,
+                            brokerReadinessSha256,
+                            readiness.brokerReadinessEpoch(),
+                            readiness.brokerSetSha256()));
+        }
+        return requireBookKeeperPrimaryWalReadiness().thenAccept(readiness ->
+                requireExactReadiness(
+                        brokerReadinessEpoch,
+                        brokerReadinessSha256,
+                        readiness.brokerReadinessEpoch(),
+                        readiness.brokerSetSha256().value()));
+    }
+
     @Override
     public Optional<BookKeeperBrokerReadiness>
             currentBookKeeperPrimaryWalReadiness() {
-        BrokerRegistry registry = brokerRegistry.get();
-        if (!storageInitialized.get()
-                || registry == null
-                || !registry.isStarted()
-                || !registry.isRegistered()) {
+        if (!localSourceAttached()) {
             bookKeeperReadiness.set(null);
             return Optional.empty();
         }
@@ -281,11 +360,7 @@ public final class NereusBrokerCapabilityCoordinator
     }
 
     public Optional<NereusGenerationCapabilityReadiness> currentGenerationReadiness() {
-        BrokerRegistry registry = brokerRegistry.get();
-        if (!storageInitialized.get()
-                || registry == null
-                || !registry.isStarted()
-                || !registry.isRegistered()) {
+        if (!localSourceAttached()) {
             generationReadiness.set(null);
             return Optional.empty();
         }
@@ -330,29 +405,34 @@ public final class NereusBrokerCapabilityCoordinator
     private CompletableFuture<CapabilitySnapshot> requireStableSnapshot(
             Map<String, String> requiredProperties,
             String readinessDomain) {
-        BrokerRegistry registry = brokerRegistry.get();
-        if (!storageInitialized.get() || registry == null) {
+        if (!storageInitialized.get()) {
             return CompletableFuture.failedFuture(
                     new IllegalStateException("NEREUS_CLUSTER_CAPABILITY_NOT_READY:LOCAL"));
         }
-        if (!registry.isStarted() || !registry.isRegistered()) {
+        if (!localSourceAttached()) {
             return CompletableFuture.failedFuture(
                     new IllegalStateException("NEREUS_CLUSTER_CAPABILITY_NOT_READY:LOCAL_REGISTRY"));
         }
         long initialBrokerRegistryRevision = brokerRegistryRevision.get();
-        CompletableFuture<CapabilitySnapshot> check = registry.getAvailableBrokerLookupDataAsync()
+        CompletableFuture<CapabilitySnapshot> check = availableBrokerData()
                 .thenApply(available -> snapshot(
-                        available, requiredProperties, readinessDomain))
-                .thenCompose(first -> registry.getAvailableBrokerLookupDataAsync().thenApply(second -> {
+                        available,
+                        requiredProperties,
+                        readinessDomain,
+                        localBrokerId.get()))
+                .thenCompose(first -> availableBrokerData().thenApply(second -> {
                     CapabilitySnapshot capableSecond = snapshot(
-                            second, requiredProperties, readinessDomain);
+                            second,
+                            requiredProperties,
+                            readinessDomain,
+                            localBrokerId.get());
                     if (!first.brokers().keySet().equals(capableSecond.brokers().keySet())) {
                         throw new IllegalStateException("NEREUS_CLUSTER_CAPABILITY_BROKER_SET_CHANGED");
                     }
                     if (!first.readiness().equals(capableSecond.readiness())) {
                         throw new IllegalStateException("NEREUS_CLUSTER_CAPABILITY_SNAPSHOT_CHANGED");
                     }
-                    if (!registry.isStarted() || !registry.isRegistered()) {
+                    if (!localSourceAttached()) {
                         throw new IllegalStateException(
                                 "NEREUS_CLUSTER_CAPABILITY_NOT_READY:LOCAL_REGISTRY");
                     }
@@ -365,12 +445,13 @@ public final class NereusBrokerCapabilityCoordinator
     }
 
     private static CapabilitySnapshot snapshot(
-            Map<String, BrokerLookupData> available,
+            Map<String, BrokerCapabilityData> available,
             Map<String, String> requiredProperties,
-            String readinessDomain) {
+            String readinessDomain,
+            String requiredLocalBrokerId) {
         java.util.Objects.requireNonNull(available, "available");
         java.util.Objects.requireNonNull(requiredProperties, "requiredProperties");
-        Map<String, BrokerLookupData> persistent = new HashMap<>();
+        Map<String, BrokerCapabilityData> persistent = new HashMap<>();
         available.forEach((brokerId, data) -> {
             if (data != null && data.persistentTopicsEnabled()) {
                 persistent.put(brokerId, data);
@@ -379,23 +460,48 @@ public final class NereusBrokerCapabilityCoordinator
         if (persistent.isEmpty()) {
             throw new IllegalStateException("NEREUS_CLUSTER_CAPABILITY_NOT_READY:EMPTY");
         }
-        persistent.forEach((brokerId, data) -> {
-            for (Map.Entry<String, String> required : requiredProperties.entrySet()) {
-                if (data.properties() == null
-                        || !required.getValue().equals(data.properties().get(required.getKey()))) {
-                    throw new IllegalStateException(
-                            "NEREUS_CLUSTER_CAPABILITY_NOT_READY:" + brokerId + ":" + required.getKey());
-                }
-            }
-        });
-        Map<String, BrokerLookupData> canonical = Map.copyOf(persistent);
+        if (requiredLocalBrokerId != null
+                && !persistent.containsKey(requiredLocalBrokerId)) {
+            throw new IllegalStateException(
+                    "NEREUS_CLUSTER_CAPABILITY_NOT_READY:LOCAL_REGISTRY");
+        }
+        persistent.forEach((brokerId, data) ->
+                requireProperties(brokerId, data, requiredProperties));
+        Map<String, BrokerCapabilityData> canonical = Map.copyOf(persistent);
         return new CapabilitySnapshot(
                 canonical,
                 readiness(canonical, requiredProperties, readinessDomain));
     }
 
+    private static void requireProperties(
+            String brokerId,
+            BrokerCapabilityData data,
+            Map<String, String> requiredProperties) {
+        for (Map.Entry<String, String> required : requiredProperties.entrySet()) {
+            if (!required.getValue().equals(
+                    data.properties().get(required.getKey()))) {
+                throw new IllegalStateException(
+                        "NEREUS_CLUSTER_CAPABILITY_NOT_READY:"
+                                + brokerId
+                                + ":"
+                                + required.getKey());
+            }
+        }
+    }
+
+    private static void requireExactReadiness(
+            long requestedEpoch,
+            String requestedSha256,
+            long currentEpoch,
+            String currentSha256) {
+        if (requestedEpoch != currentEpoch || !requestedSha256.equals(currentSha256)) {
+            throw new IllegalStateException(
+                    "NEREUS_BOOKKEEPER_PUBLICATION_READINESS_STALE");
+        }
+    }
+
     private static NereusGenerationCapabilityReadiness readiness(
-            Map<String, BrokerLookupData> brokers,
+            Map<String, BrokerCapabilityData> brokers,
             Map<String, String> requiredProperties,
             String readinessDomain) {
         MessageDigest digest = sha256();
@@ -404,7 +510,7 @@ public final class NereusBrokerCapabilityCoordinator
         brokers.entrySet().stream()
                 .sorted(Map.Entry.comparingByKey(Comparator.naturalOrder()))
                 .forEach(entry -> {
-                    BrokerLookupData data = entry.getValue();
+                    BrokerCapabilityData data = entry.getValue();
                     add(digest, entry.getKey());
                     add(digest, data.brokerId());
                     add(digest, Long.toString(data.startTimestamp()));
@@ -425,6 +531,148 @@ public final class NereusBrokerCapabilityCoordinator
         return new NereusGenerationCapabilityReadiness(epoch, sha256, brokers.size());
     }
 
+    private boolean localSourceAttached() {
+        if (!storageInitialized.get()) {
+            return false;
+        }
+        if (metadataStore != null) {
+            return localBrokerId.get() != null;
+        }
+        BrokerRegistry registry = brokerRegistry.get();
+        return registry != null && registry.isStarted() && registry.isRegistered();
+    }
+
+    private CompletableFuture<Map<String, BrokerCapabilityData>> availableBrokerData() {
+        if (metadataStore != null) {
+            return readMetadataBrokers();
+        }
+        BrokerRegistry registry = brokerRegistry.get();
+        if (registry == null) {
+            return CompletableFuture.failedFuture(new IllegalStateException(
+                    "NEREUS_CLUSTER_CAPABILITY_NOT_READY:LOCAL_REGISTRY"));
+        }
+        return registry.getAvailableBrokerLookupDataAsync().thenApply(available -> {
+            Map<String, BrokerCapabilityData> converted = new HashMap<>();
+            available.forEach((brokerId, data) -> {
+                if (data != null) {
+                    converted.put(
+                            brokerId,
+                            new BrokerCapabilityData(
+                                    data.brokerId(),
+                                    data.persistentTopicsEnabled(),
+                                    data.startTimestamp(),
+                                    data.properties() == null
+                                            ? Map.of()
+                                            : Map.copyOf(data.properties())));
+                }
+            });
+            return Map.copyOf(converted);
+        });
+    }
+
+    private CompletableFuture<Map<String, BrokerCapabilityData>> readMetadataBrokers() {
+        return metadataStore.sync(LoadManager.LOADBALANCE_BROKERS_ROOT)
+                .thenCompose(ignored -> metadataStore.getChildren(
+                        LoadManager.LOADBALANCE_BROKERS_ROOT))
+                .thenCompose(children -> {
+                    List<CompletableFuture<Optional<Map.Entry<String, BrokerCapabilityData>>>>
+                            reads = new ArrayList<>(children.size());
+                    for (String brokerId : children) {
+                        reads.add(readMetadataBroker(brokerId)
+                                .thenApply(value -> value.map(
+                                        data -> Map.entry(brokerId, data))));
+                    }
+                    return CompletableFuture.allOf(
+                                    reads.toArray(CompletableFuture[]::new))
+                            .thenApply(ignored -> {
+                                Map<String, BrokerCapabilityData> available =
+                                        new HashMap<>();
+                                for (CompletableFuture<
+                                        Optional<Map.Entry<String, BrokerCapabilityData>>>
+                                        read : reads) {
+                                    read.join().ifPresent(entry ->
+                                            available.put(
+                                                    entry.getKey(),
+                                                    entry.getValue()));
+                                }
+                                return Map.copyOf(available);
+                            });
+                });
+    }
+
+    private CompletableFuture<Optional<BrokerCapabilityData>> readMetadataBroker(
+            String brokerId) {
+        String path = LoadManager.LOADBALANCE_BROKERS_ROOT + "/" + brokerId;
+        return metadataStore.sync(path)
+                .thenCompose(ignored -> metadataStore.get(path))
+                .thenApply(result -> result.map(value ->
+                        decodeBrokerData(brokerId, value.getValue())));
+    }
+
+    private static BrokerCapabilityData decodeBrokerData(
+            String pathBrokerId, byte[] value) {
+        try {
+            JsonNode root = ObjectMapperFactory.getMapper()
+                    .getObjectMapper()
+                    .readTree(value);
+            String brokerId = requiredText(root, "brokerId");
+            if (!pathBrokerId.equals(brokerId)) {
+                throw new IllegalStateException(
+                        "broker lookup key does not match brokerId");
+            }
+            JsonNode persistent = root.get("persistentTopicsEnabled");
+            JsonNode started = root.get("startTimestamp");
+            if (persistent == null
+                    || !persistent.isBoolean()
+                    || started == null
+                    || !started.canConvertToLong()
+                    || started.longValue() <= 0) {
+                throw new IllegalStateException(
+                        "broker lookup record lacks persistent/start identity");
+            }
+            Map<String, String> properties = new HashMap<>();
+            JsonNode configured = root.get("properties");
+            if (configured != null && configured.isObject()) {
+                configured.fields().forEachRemaining(entry -> {
+                    if (!entry.getValue().isTextual()) {
+                        throw new IllegalStateException(
+                                "broker lookup property is not textual: "
+                                        + entry.getKey());
+                    }
+                    properties.put(entry.getKey(), entry.getValue().textValue());
+                });
+            }
+            return new BrokerCapabilityData(
+                    brokerId,
+                    persistent.booleanValue(),
+                    started.longValue(),
+                    Map.copyOf(properties));
+        } catch (IOException | RuntimeException error) {
+            throw new IllegalStateException(
+                    "NEREUS_CLUSTER_CAPABILITY_INVALID:" + pathBrokerId,
+                    error);
+        }
+    }
+
+    private static String requiredText(JsonNode root, String field) {
+        JsonNode value = root.get(field);
+        if (value == null || !value.isTextual() || value.textValue().isBlank()) {
+            throw new IllegalStateException(
+                    "broker lookup record lacks " + field);
+        }
+        return value.textValue();
+    }
+
+    private void handleMetadataStoreNotification(Notification notification) {
+        String path = notification.getPath();
+        String root = LoadManager.LOADBALANCE_BROKERS_ROOT;
+        if (path.equals(root) || path.startsWith(root + "/")) {
+            brokerRegistryRevision.incrementAndGet();
+            generationReadiness.set(null);
+            bookKeeperReadiness.set(null);
+        }
+    }
+
     private static void add(MessageDigest digest, String value) {
         byte[] bytes = value.getBytes(StandardCharsets.UTF_8);
         digest.update(ByteBuffer.allocate(Integer.BYTES)
@@ -443,11 +691,11 @@ public final class NereusBrokerCapabilityCoordinator
     }
 
     private record CapabilitySnapshot(
-            Map<String, BrokerLookupData> brokers,
+            Map<String, BrokerCapabilityData> brokers,
             NereusGenerationCapabilityReadiness readiness,
             long brokerRegistryRevision) {
         private CapabilitySnapshot(
-                Map<String, BrokerLookupData> brokers,
+                Map<String, BrokerCapabilityData> brokers,
                 NereusGenerationCapabilityReadiness readiness) {
             this(brokers, readiness, -1);
         }
@@ -455,6 +703,13 @@ public final class NereusBrokerCapabilityCoordinator
         private CapabilitySnapshot withBrokerRegistryRevision(long revision) {
             return new CapabilitySnapshot(brokers, readiness, revision);
         }
+    }
+
+    private record BrokerCapabilityData(
+            String brokerId,
+            boolean persistentTopicsEnabled,
+            long startTimestamp,
+            Map<String, String> properties) {
     }
 
     private record CachedGenerationReadiness(

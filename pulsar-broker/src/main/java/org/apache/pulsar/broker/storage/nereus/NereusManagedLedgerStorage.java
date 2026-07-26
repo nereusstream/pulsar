@@ -116,6 +116,7 @@ public final class NereusManagedLedgerStorage implements ManagedLedgerStorage {
             generationProtocolEnabled =
                     checked.generationProtocolEnabled();
             capabilityCoordinator = new NereusBrokerCapabilityCoordinator(
+                    metadataStore,
                     Duration.ofSeconds(conf.getNereusMetadataTimeoutSeconds()));
             NereusProcessIdentity identity = NereusProcessIdentity.generate(new SecureRandom());
             NereusRuntimeConfiguration runtimeConfiguration = checked.runtimeConfiguration(identity);
@@ -284,10 +285,15 @@ public final class NereusManagedLedgerStorage implements ManagedLedgerStorage {
                     String brokerReadinessSha256,
                     Duration timeout) {
         try {
-            return bookKeeperPrimaryWalAdministration().prepareActivation(
-                    brokerReadinessEpoch,
-                    brokerReadinessSha256,
-                    timeout);
+            BookKeeperPrimaryWalAdministration administration =
+                    bookKeeperPrimaryWalAdministration();
+            return capabilityCoordinator
+                    .requireBookKeeperPublicationReadiness(
+                            brokerReadinessEpoch, brokerReadinessSha256)
+                    .thenCompose(ignored -> administration.prepareActivation(
+                            brokerReadinessEpoch,
+                            brokerReadinessSha256,
+                            timeout));
         } catch (Throwable error) {
             return CompletableFuture.failedFuture(error);
         }
@@ -297,7 +303,15 @@ public final class NereusManagedLedgerStorage implements ManagedLedgerStorage {
             activateBookKeeperPrimaryWalPublications(
                     BookKeeperProtocolActivationUpdate update, Duration timeout) {
         try {
-            return bookKeeperPrimaryWalAdministration().activate(update, timeout);
+            BookKeeperProtocolActivationUpdate exact =
+                    Objects.requireNonNull(update, "update");
+            BookKeeperPrimaryWalAdministration administration =
+                    bookKeeperPrimaryWalAdministration();
+            return capabilityCoordinator
+                    .requireBookKeeperPublicationReadiness(
+                            exact.brokerReadinessEpoch(),
+                            exact.brokerReadinessSha256())
+                    .thenCompose(ignored -> administration.activate(exact, timeout));
         } catch (Throwable error) {
             return CompletableFuture.failedFuture(error);
         }

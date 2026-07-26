@@ -144,6 +144,21 @@ public class NereusBrokerStorageConfigurationTest {
     }
 
     @Test
+    public void acceptsModularAndExtensibleLoadManagers() {
+        for (String loadManagerClassName : new String[] {
+            ModularLoadManagerImpl.class.getName(),
+            ExtensibleLoadManagerImpl.class.getName()
+        }) {
+            ServiceConfiguration broker = validConfiguration();
+            broker.setLoadManagerClassName(loadManagerClassName);
+
+            assertThat(new NereusBrokerStorageConfiguration(broker)
+                            .runtimeConfiguration(NereusProcessIdentity.generate(new SecureRandom())))
+                    .isNotNull();
+        }
+    }
+
+    @Test
     public void rejectsInvalidCrossConfigBeforeClientConstruction() {
         ServiceConfiguration disabled = validConfiguration();
         disabled.setNereusEnabled(false);
@@ -158,13 +173,6 @@ public class NereusBrokerStorageConfigurationTest {
                 .runtimeConfiguration(NereusProcessIdentity.generate(new SecureRandom())))
                 .isInstanceOf(IllegalArgumentException.class)
                 .hasMessageContaining("enablePersistentTopics");
-
-        ServiceConfiguration legacyLoadManager = validConfiguration();
-        legacyLoadManager.setLoadManagerClassName(ModularLoadManagerImpl.class.getName());
-        assertThatThrownBy(() -> new NereusBrokerStorageConfiguration(legacyLoadManager)
-                .runtimeConfiguration(NereusProcessIdentity.generate(new SecureRandom())))
-                .isInstanceOf(IllegalArgumentException.class)
-                .hasMessageContaining("ExtensibleLoadManagerImpl");
 
         ServiceConfiguration undersizedCache = validConfiguration();
         undersizedCache.setNereusMaxCachedStreams(9_999);

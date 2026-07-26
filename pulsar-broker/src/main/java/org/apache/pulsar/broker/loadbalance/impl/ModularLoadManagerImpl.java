@@ -64,6 +64,8 @@ import org.apache.pulsar.broker.loadbalance.extensions.models.TopKBundles;
 import org.apache.pulsar.broker.loadbalance.impl.LoadManagerShared.BrokerTopicLoadingPredicate;
 import org.apache.pulsar.broker.resources.PulsarResources;
 import org.apache.pulsar.broker.stats.prometheus.metrics.Summary;
+import org.apache.pulsar.broker.storage.nereus.NereusManagedLedgerStorage;
+import org.apache.pulsar.broker.storage.nereus.NereusStorageBindingCapability;
 import org.apache.pulsar.client.admin.PulsarAdminException;
 import org.apache.pulsar.client.util.ExecutorProvider;
 import org.apache.pulsar.common.naming.NamespaceBundle;
@@ -992,11 +994,21 @@ public class ModularLoadManagerImpl implements ModularLoadManager {
         try {
             // At this point, the ports will be updated with the real port number that the server was assigned
             Map<String, String> protocolData = pulsar.getProtocolDataToAdvertise();
+            Map<String, String> lookupProperties;
+            if (pulsar.getManagedLedgerStorage()
+                    instanceof NereusManagedLedgerStorage nereusStorage) {
+                lookupProperties = nereusStorage.capabilityCoordinator()
+                        .decorateLookupProperties(pulsar.getConfig().lookupProperties());
+            } else {
+                lookupProperties = NereusStorageBindingCapability.requireUnreserved(
+                        pulsar.getConfig().lookupProperties());
+            }
 
             lastData = new LocalBrokerData(pulsar.getBrokerId(), pulsar.getWebServiceAddress(),
                     pulsar.getWebServiceAddressTls(), pulsar.getBrokerServiceUrl(), pulsar.getBrokerServiceUrlTls(),
                     pulsar.getAdvertisedListeners());
             lastData.setProtocols(protocolData);
+            lastData.setProperties(lookupProperties);
             // configure broker-topic mode
             lastData.setPersistentTopicsEnabled(pulsar.getConfiguration().isEnablePersistentTopics());
             lastData.setNonPersistentTopicsEnabled(pulsar.getConfiguration().isEnableNonPersistentTopics());
@@ -1005,6 +1017,7 @@ public class ModularLoadManagerImpl implements ModularLoadManager {
                     pulsar.getWebServiceAddressTls(), pulsar.getBrokerServiceUrl(), pulsar.getBrokerServiceUrlTls(),
                     pulsar.getAdvertisedListeners());
             localData.setProtocols(protocolData);
+            localData.setProperties(lookupProperties);
             localData.setBrokerVersionString(pulsar.getBrokerVersion());
             // configure broker-topic mode
             localData.setPersistentTopicsEnabled(pulsar.getConfiguration().isEnablePersistentTopics());

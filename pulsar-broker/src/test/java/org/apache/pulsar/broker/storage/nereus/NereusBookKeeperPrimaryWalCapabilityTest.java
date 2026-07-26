@@ -230,6 +230,65 @@ public class NereusBookKeeperPrimaryWalCapabilityTest {
         assertThat(coordinator.currentBookKeeperPrimaryWalReadiness()).isEmpty();
     }
 
+    @Test
+    public void publicationMutationUsesGenerationReadinessBeforeBindingInstallation() {
+        NereusBrokerCapabilityCoordinator coordinator = coordinator();
+        BrokerRegistry registry = readyRegistry();
+        coordinator.markStorageInitialized();
+        coordinator.attachBrokerRegistry(registry);
+        when(registry.getAvailableBrokerLookupDataAsync())
+                .thenReturn(CompletableFuture.completedFuture(Map.of(
+                        "a", lookupData("broker-a", allBaseCapabilities()))));
+        NereusGenerationCapabilityReadiness readiness =
+                coordinator.requireGenerationReadiness().join();
+
+        coordinator.requireBookKeeperPublicationReadiness(
+                        readiness.brokerReadinessEpoch(),
+                        readiness.brokerSetSha256())
+                .join();
+        assertThatThrownBy(() -> coordinator
+                        .requireBookKeeperPublicationReadiness(
+                                readiness.brokerReadinessEpoch(),
+                                "ff".repeat(32))
+                        .join())
+                .hasRootCauseMessage(
+                        "NEREUS_BOOKKEEPER_PUBLICATION_READINESS_STALE");
+    }
+
+    @Test
+    public void publicationMutationRequiresStrongReadinessAfterBindingInstallation() {
+        NereusBrokerCapabilityCoordinator coordinator = coordinator();
+        BookKeeperPrimaryWalCapabilityBinding binding = binding("11", "22");
+        BrokerRegistry registry = readyRegistry();
+        coordinator.installBookKeeperPrimaryWalCapability(binding);
+        coordinator.markStorageInitialized();
+        coordinator.attachBrokerRegistry(registry);
+        Map<String, String> capabilities = merge(
+                allBaseCapabilities(),
+                NereusBookKeeperPrimaryWalCapability.properties(binding));
+        when(registry.getAvailableBrokerLookupDataAsync())
+                .thenReturn(CompletableFuture.completedFuture(Map.of(
+                        "a", lookupData("broker-a", capabilities))));
+        NereusGenerationCapabilityReadiness generation =
+                coordinator.requireGenerationReadiness().join();
+        BookKeeperBrokerReadiness bookKeeper =
+                coordinator.requireBookKeeperPrimaryWalReadiness().join();
+
+        assertThat(generation.brokerSetSha256())
+                .isNotEqualTo(bookKeeper.brokerSetSha256().value());
+        coordinator.requireBookKeeperPublicationReadiness(
+                        bookKeeper.brokerReadinessEpoch(),
+                        bookKeeper.brokerSetSha256().value())
+                .join();
+        assertThatThrownBy(() -> coordinator
+                        .requireBookKeeperPublicationReadiness(
+                                generation.brokerReadinessEpoch(),
+                                generation.brokerSetSha256())
+                        .join())
+                .hasRootCauseMessage(
+                        "NEREUS_BOOKKEEPER_PUBLICATION_READINESS_STALE");
+    }
+
     private static NereusBrokerCapabilityCoordinator coordinator() {
         return new NereusBrokerCapabilityCoordinator(Duration.ofSeconds(5));
     }

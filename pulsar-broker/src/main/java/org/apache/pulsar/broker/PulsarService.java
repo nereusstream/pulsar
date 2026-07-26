@@ -131,6 +131,7 @@ import org.apache.pulsar.broker.stats.prometheus.PulsarPrometheusMetricsServlet;
 import org.apache.pulsar.broker.storage.BookkeeperManagedLedgerStorageClass;
 import org.apache.pulsar.broker.storage.ManagedLedgerStorage;
 import org.apache.pulsar.broker.storage.ManagedLedgerStorageClass;
+import org.apache.pulsar.broker.storage.nereus.NereusManagedLedgerStorage;
 import org.apache.pulsar.broker.transaction.buffer.TransactionBufferProvider;
 import org.apache.pulsar.broker.transaction.buffer.impl.TransactionBufferClientImpl;
 import org.apache.pulsar.broker.transaction.coordinator.v5.TransactionCoordinatorV5;
@@ -995,6 +996,13 @@ public class PulsarService implements AutoCloseable, ShutdownService {
             // the broker id is used in the load manager to identify the broker
             // it should not be used for making connections to the broker
             this.brokerId = createBrokerId();
+            if (managedLedgerStorage instanceof NereusManagedLedgerStorage nereusStorage) {
+                nereusStorage.capabilityCoordinator().attachLocalBroker(getBrokerId());
+                nereusStorage.attachGenerationRegistrationBackfill(
+                        pulsarResources.getTenantResources(),
+                        pulsarResources.getNamespaceResources(),
+                        pulsarResources.getTopicResources());
+            }
 
             if (this.compactionServiceFactory == null) {
                 this.compactionServiceFactory = loadCompactionServiceFactory();

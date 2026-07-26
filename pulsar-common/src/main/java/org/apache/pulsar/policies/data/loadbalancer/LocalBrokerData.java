@@ -88,6 +88,8 @@ public class LocalBrokerData implements LoadManagerReport {
 
     // the external protocol data advertised by protocol handlers.
     private Map<String, String> protocols;
+    // Broker lookup properties shared with the extensible load-manager format.
+    private Map<String, String> properties;
     //
     private Map<String, AdvertisedListener> advertisedListeners;
 
@@ -128,6 +130,7 @@ public class LocalBrokerData implements LoadManagerReport {
         lastBundleGains = new HashSet<>();
         lastBundleLosses = new HashSet<>();
         protocols = new HashMap<>();
+        properties = new HashMap<>();
         this.advertisedListeners = Collections.unmodifiableMap(new HashMap<>(advertisedListeners));
     }
 
@@ -524,6 +527,14 @@ public class LocalBrokerData implements LoadManagerReport {
     @Override
     public Optional<String> getProtocol(String protocol) {
         return Optional.ofNullable(protocols.get(protocol));
+    }
+
+    public void setProperties(Map<String, String> properties) {
+        this.properties = new HashMap<>(Objects.requireNonNull(properties, "properties"));
+    }
+
+    public Map<String, String> getProperties() {
+        return Collections.unmodifiableMap(properties);
     }
 
     public Map<String, AdvertisedListener> getAdvertisedListeners() {

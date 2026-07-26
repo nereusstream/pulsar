@@ -32,16 +32,13 @@ import org.testng.annotations.Test;
 
 public class NereusStorageBindingCapabilityTest {
     @Test
-    public void publishesCapabilityOnlyAfterStorageAndRegistryAreReady() {
+    public void publishesCapabilityAfterStorageIsReadyIndependentlyOfLoadManager() {
         NereusBrokerCapabilityCoordinator coordinator = coordinator();
         BrokerRegistry registry = readyRegistry();
 
         assertThatThrownBy(() -> coordinator.decorateLookupProperties(Map.of()))
                 .hasMessage("Nereus storage is not initialized");
         coordinator.markStorageInitialized();
-        assertThatThrownBy(() -> coordinator.decorateLookupProperties(Map.of()))
-                .hasMessage("Nereus broker registry is not attached");
-        coordinator.attachBrokerRegistry(registry);
         Map<String, String> properties = coordinator.decorateLookupProperties(Map.of("existing", "value"));
 
         assertThat(properties).containsEntry("existing", "value");
@@ -51,6 +48,7 @@ public class NereusStorageBindingCapabilityTest {
                 NereusCursorProtocolCapability.PROPERTY, NereusCursorProtocolCapability.VERSION);
         assertThat(properties).containsEntry(
                 NereusGenerationProtocolCapability.PROPERTY, NereusGenerationProtocolCapability.VERSION);
+        coordinator.attachBrokerRegistry(registry);
         assertThatThrownBy(() -> coordinator.attachBrokerRegistry(registry))
                 .hasMessage("Nereus broker registry is already attached");
     }

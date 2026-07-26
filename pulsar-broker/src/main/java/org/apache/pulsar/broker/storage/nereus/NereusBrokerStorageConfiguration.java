@@ -42,7 +42,6 @@ import java.nio.file.Path;
 import java.time.Duration;
 import java.util.Optional;
 import org.apache.pulsar.broker.ServiceConfiguration;
-import org.apache.pulsar.broker.loadbalance.extensions.ExtensibleLoadManagerImpl;
 import org.apache.pulsar.common.protocol.Commands;
 
 /** Checked one-time mapping from broker fields into product-owned immutable configuration. */
@@ -478,18 +477,6 @@ public final class NereusBrokerStorageConfiguration {
     private void requireBrokerIntegration() {
         if (!broker.isEnablePersistentTopics()) {
             throw new IllegalArgumentException("enablePersistentTopics must be true for Nereus hybrid storage");
-        }
-        String className = text(broker.getLoadManagerClassName(), "loadManagerClassName");
-        Class<?> loadManagerClass;
-        try {
-            loadManagerClass = Class.forName(
-                    className, false, Thread.currentThread().getContextClassLoader());
-        } catch (ClassNotFoundException error) {
-            throw new IllegalArgumentException("configured loadManagerClassName cannot be loaded", error);
-        }
-        if (!ExtensibleLoadManagerImpl.class.isAssignableFrom(loadManagerClass)) {
-            throw new IllegalArgumentException(
-                    "Nereus hybrid storage requires ExtensibleLoadManagerImpl");
         }
     }
 

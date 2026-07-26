@@ -107,6 +107,7 @@ public class NereusMultiBrokerIntegrationTest {
     private final boolean physicalGcEnabled;
     private final boolean bookKeeperGcEnabled;
     private final StorageProfile defaultStorageProfile;
+    private final String loadManagerClassName;
     private final List<StorageProfile> brokerDefaultStorageProfiles;
     private final List<Boolean> brokerBookKeeperPrimaryWalEnabled;
     private final List<PulsarService> brokers = new ArrayList<>(
@@ -146,6 +147,20 @@ public class NereusMultiBrokerIntegrationTest {
             boolean physicalGcEnabled,
             StorageProfile defaultStorageProfile,
             boolean bookKeeperGcEnabled) {
+        this(
+                generationProtocolEnabled,
+                physicalGcEnabled,
+                defaultStorageProfile,
+                bookKeeperGcEnabled,
+                ExtensibleLoadManagerImpl.class.getName());
+    }
+
+    NereusMultiBrokerIntegrationTest(
+            boolean generationProtocolEnabled,
+            boolean physicalGcEnabled,
+            StorageProfile defaultStorageProfile,
+            boolean bookKeeperGcEnabled,
+            String loadManagerClassName) {
         if (physicalGcEnabled && !generationProtocolEnabled) {
             throw new IllegalArgumentException(
                     "physical GC requires the generation protocol");
@@ -155,6 +170,12 @@ public class NereusMultiBrokerIntegrationTest {
         this.bookKeeperGcEnabled = bookKeeperGcEnabled;
         this.defaultStorageProfile = java.util.Objects.requireNonNull(
                 defaultStorageProfile, "defaultStorageProfile");
+        this.loadManagerClassName = java.util.Objects.requireNonNull(
+                loadManagerClassName, "loadManagerClassName");
+        if (loadManagerClassName.isBlank()) {
+            throw new IllegalArgumentException(
+                    "loadManagerClassName cannot be blank");
+        }
         if (defaultStorageProfile != defaultStorageProfile.canonical()) {
             throw new IllegalArgumentException("the broker fixture requires an exact non-legacy profile");
         }
@@ -444,7 +465,7 @@ public class NereusMultiBrokerIntegrationTest {
         configuration.setTopicOrderedExecutorThreadNum(4);
         configuration.setLoadBalancerEnabled(true);
         configuration.setLoadBalancerSheddingEnabled(false);
-        configuration.setLoadManagerClassName(ExtensibleLoadManagerImpl.class.getName());
+        configuration.setLoadManagerClassName(loadManagerClassName);
 
         configuration.setManagedLedgerStorageClassName(NereusManagedLedgerStorage.class.getName());
         configuration.setNereusEnabled(true);

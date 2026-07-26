@@ -81,7 +81,7 @@ public class BrokersBase extends AdminResource {
     public void provisionBookKeeperPrimaryWalNamespace(
             NereusBookKeeperPrimaryWalAdminModels.NamespaceProvisionRequest request,
             @Suspended AsyncResponse asyncResponse) {
-        runBookKeeperPrimaryWalAdmin(
+        runNereusManagedLedgerAdmin(
                 asyncResponse,
                 storage -> storage.provisionBookKeeperLedgerIdNamespace(
                                 NereusBookKeeperPrimaryWalAdminModels.required(
@@ -98,7 +98,7 @@ public class BrokersBase extends AdminResource {
     public void revokeBookKeeperPrimaryWalNamespace(
             NereusBookKeeperPrimaryWalAdminModels.NamespaceRevokeRequest request,
             @Suspended AsyncResponse asyncResponse) {
-        runBookKeeperPrimaryWalAdmin(
+        runNereusManagedLedgerAdmin(
                 asyncResponse,
                 storage -> storage.revokeBookKeeperLedgerIdNamespace(
                                 NereusBookKeeperPrimaryWalAdminModels.required(
@@ -118,7 +118,7 @@ public class BrokersBase extends AdminResource {
     public void prepareBookKeeperPrimaryWalActivation(
             NereusBookKeeperPrimaryWalAdminModels.ActivationPrepareRequest request,
             @Suspended AsyncResponse asyncResponse) {
-        runBookKeeperPrimaryWalAdmin(
+        runNereusManagedLedgerAdmin(
                 asyncResponse,
                 storage -> storage.prepareBookKeeperPrimaryWalActivation(
                                 NereusBookKeeperPrimaryWalAdminModels.positive(
@@ -138,7 +138,7 @@ public class BrokersBase extends AdminResource {
     public void activateBookKeeperPrimaryWalPublications(
             NereusBookKeeperPrimaryWalAdminModels.PublicationActivationRequest request,
             @Suspended AsyncResponse asyncResponse) {
-        runBookKeeperPrimaryWalAdmin(asyncResponse, storage -> {
+        runNereusManagedLedgerAdmin(asyncResponse, storage -> {
             NereusBookKeeperPrimaryWalAdminModels.PublicationActivationRequest exact =
                     requireRequest(request);
             BookKeeperProtocolActivationUpdate update =
@@ -164,7 +164,7 @@ public class BrokersBase extends AdminResource {
     public void activateBookKeeperPrimaryWalDeletion(
             NereusBookKeeperPrimaryWalAdminModels.DeletionActivationRequest request,
             @Suspended AsyncResponse asyncResponse) {
-        runBookKeeperPrimaryWalAdmin(
+        runNereusManagedLedgerAdmin(
                 asyncResponse,
                 storage -> {
                     NereusBookKeeperPrimaryWalAdminModels.DeletionActivationRequest exact =
@@ -188,7 +188,7 @@ public class BrokersBase extends AdminResource {
     public void getBookKeeperPrimaryWalActivation(
             @QueryParam("timeoutSeconds") long timeoutSeconds,
             @Suspended AsyncResponse asyncResponse) {
-        runBookKeeperPrimaryWalAdmin(
+        runNereusManagedLedgerAdmin(
                 asyncResponse,
                 storage -> storage.readBookKeeperPrimaryWalActivation(
                                 NereusBookKeeperPrimaryWalAdminModels.timeout(timeoutSeconds))
@@ -197,6 +197,44 @@ public class BrokersBase extends AdminResource {
                                 .orElseThrow(() -> new RestException(
                                         Status.NOT_FOUND,
                                         "BookKeeper primary-WAL activation does not exist"))));
+    }
+
+    @GET
+    @Path("/bookkeeper-primary-wal/readiness")
+    @Operation(summary = "Read the stable BookKeeper primary-WAL capable broker set")
+    public void getBookKeeperPrimaryWalReadiness(
+            @Suspended AsyncResponse asyncResponse) {
+        runNereusManagedLedgerAdmin(
+                asyncResponse,
+                storage -> storage.capabilityCoordinator()
+                        .requireBookKeeperPrimaryWalReadiness()
+                        .thenApply(NereusGenerationProtocolAdminModels.ReadinessView::from));
+    }
+
+    @GET
+    @Path("/generation-protocol/readiness")
+    @Operation(summary = "Read the stable Nereus generation-protocol capable broker set")
+    public void getNereusGenerationProtocolReadiness(
+            @Suspended AsyncResponse asyncResponse) {
+        runNereusManagedLedgerAdmin(
+                asyncResponse,
+                storage -> storage.capabilityCoordinator()
+                        .requireGenerationReadiness()
+                        .thenApply(NereusGenerationProtocolAdminModels.ReadinessView::from));
+    }
+
+    @POST
+    @Path("/generation-protocol/registration-backfill")
+    @Operation(summary = "Run generation registration backfill and activate generation publication")
+    public void runNereusGenerationRegistrationBackfill(
+            NereusGenerationProtocolAdminModels.RegistrationBackfillRequest request,
+            @Suspended AsyncResponse asyncResponse) {
+        runNereusManagedLedgerAdmin(
+                asyncResponse,
+                storage -> storage.runGenerationRegistrationBackfill(
+                                requireRequest(request).runId())
+                        .thenApply(
+                                NereusGenerationProtocolAdminModels.RegistrationBackfillView::from));
     }
 
     @GET
@@ -670,7 +708,7 @@ public class BrokersBase extends AdminResource {
         return pulsar().closeAsync(false);
     }
 
-    private <T> void runBookKeeperPrimaryWalAdmin(
+    private <T> void runNereusManagedLedgerAdmin(
             AsyncResponse asyncResponse,
             Function<NereusManagedLedgerStorage, CompletableFuture<T>> operation) {
         Objects.requireNonNull(asyncResponse, "asyncResponse");
@@ -685,7 +723,7 @@ public class BrokersBase extends AdminResource {
                     }
                     return Objects.requireNonNull(
                             operation.apply(storage),
-                            "BookKeeper primary-WAL admin future");
+                            "Nereus managed-ledger admin future");
                 })
                 .thenAccept(asyncResponse::resume)
                 .exceptionally(error -> {
