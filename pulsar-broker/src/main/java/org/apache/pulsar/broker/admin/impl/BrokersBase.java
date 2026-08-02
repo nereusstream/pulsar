@@ -20,7 +20,7 @@ package org.apache.pulsar.broker.admin.impl;
 
 import com.google.common.collect.Maps;
 import com.nereusstream.bookkeeper.BookKeeperProtocolActivationUpdate;
-import com.nereusstream.pulsar.BookKeeperDeletionActivationRequest;
+import com.nereusstream.bookkeeper.BookKeeperDeletionActivationRequest;
 import io.swagger.v3.oas.annotations.Operation;
 import io.swagger.v3.oas.annotations.Parameter;
 import io.swagger.v3.oas.annotations.media.ArraySchema;

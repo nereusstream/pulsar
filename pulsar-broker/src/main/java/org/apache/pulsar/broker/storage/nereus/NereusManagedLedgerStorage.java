@@ -29,8 +29,8 @@ import com.nereusstream.managedledger.generation.ManagedLedgerMaterializationReg
 import com.nereusstream.managedledger.generation.ManagedLedgerPhysicalDeletionActivationRequest;
 import com.nereusstream.managedledger.generation.ManagedLedgerPhysicalDeletionActivationResult;
 import com.nereusstream.objectstore.ObjectStoreSecretResolver;
-import com.nereusstream.pulsar.BookKeeperDeletionActivationRequest;
-import com.nereusstream.pulsar.BookKeeperDeletionActivationResult;
+import com.nereusstream.bookkeeper.BookKeeperDeletionActivationRequest;
+import com.nereusstream.bookkeeper.BookKeeperDeletionActivationResult;
 import com.nereusstream.pulsar.BookKeeperPrimaryWalAdministration;
 import com.nereusstream.pulsar.NereusProcessIdentity;
 import com.nereusstream.pulsar.NereusRuntimeConfiguration;
