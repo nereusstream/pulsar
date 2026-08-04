@@ -182,8 +182,7 @@ public final class NereusTopicFeatureResolver {
                 broker.getProperties());
         return merged != null && (StringUtils.isNotBlank(merged.getManagedLedgerOffloadDriver())
                 || nonNegative(merged.getManagedLedgerOffloadThresholdInBytes())
-                || nonNegative(merged.getManagedLedgerOffloadThresholdInSeconds())
-                || nonNegative(merged.getManagedLedgerOffloadDeletionLagInMillis()));
+                || nonNegative(merged.getManagedLedgerOffloadThresholdInSeconds()));
     }
 
     private static BacklogQuota quota(Map<String, ? extends BacklogQuota> quotas, BacklogQuotaType type) {

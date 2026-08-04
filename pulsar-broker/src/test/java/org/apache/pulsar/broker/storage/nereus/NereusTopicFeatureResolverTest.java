@@ -70,6 +70,30 @@ public class NereusTopicFeatureResolverTest {
     }
 
     @Test
+    public void ignoresBrokerDeletionLagWithoutOffloadDriverOrThreshold() {
+        ServiceConfiguration broker = new ServiceConfiguration();
+        broker.setClusterName("local");
+        broker.getProperties().setProperty("managedLedgerOffloadDeletionLagMs", "14400000");
+
+        NereusResolvedTopicFeatures features = NereusTopicFeatureResolver.resolve(
+                broker, new Policies(), Optional.empty(), Optional.empty(), USER_TOPIC);
+
+        assertThat(features.pulsarOffloadEnabled()).isFalse();
+    }
+
+    @Test
+    public void resolvesConfiguredOffloadDriverAsUnsupported() {
+        ServiceConfiguration broker = new ServiceConfiguration();
+        broker.setClusterName("local");
+        broker.getProperties().setProperty("managedLedgerOffloadDriver", "aws-s3");
+
+        NereusResolvedTopicFeatures features = NereusTopicFeatureResolver.resolve(
+                broker, new Policies(), Optional.empty(), Optional.empty(), USER_TOPIC);
+
+        assertThat(features.pulsarOffloadEnabled()).isTrue();
+    }
+
+    @Test
     public void openContextRejectsRetentionProjectionThatDoesNotMatchExactPulsarFacts() {
         assertThatThrownBy(() -> new NereusTopicOpenContext(
                 new ManagedLedgerConfig(),
