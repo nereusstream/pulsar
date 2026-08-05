@@ -389,11 +389,14 @@ public class OxiaMetadataStore extends AbstractMetadataStore {
      */
     private static Set<DeleteOption> deleteOptions(Set<Option> opts, Optional<Long> expectedVersion) {
         String partitionKey = OptionsHelper.partitionKey(opts);
-        if (partitionKey == null && expectedVersion.isEmpty()) {
+        if (partitionKey == null && expectedVersion.filter(version -> version >= 0).isEmpty()) {
             return Set.of();
         }
         Set<DeleteOption> result = new HashSet<>();
-        expectedVersion.ifPresent(v -> result.add(DeleteOption.IfVersionIdEquals(v)));
+        // MetadataStore uses -1 as the unconditional-operation sentinel, matching ZooKeeper's
+        // delete semantics. Oxia version IDs are non-negative and reject that sentinel.
+        expectedVersion.filter(version -> version >= 0)
+                .ifPresent(version -> result.add(DeleteOption.IfVersionIdEquals(version)));
         if (partitionKey != null) {
             result.add(DeleteOption.PartitionKey(partitionKey));
         }
