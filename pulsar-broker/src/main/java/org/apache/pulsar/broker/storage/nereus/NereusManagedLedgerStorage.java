@@ -19,6 +19,8 @@
 package org.apache.pulsar.broker.storage.nereus;
 
 import com.nereusstream.api.StorageProfile;
+import com.nereusstream.bookkeeper.BookKeeperDeletionActivationRequest;
+import com.nereusstream.bookkeeper.BookKeeperDeletionActivationResult;
 import com.nereusstream.bookkeeper.BookKeeperLedgerIdNamespaceReservation;
 import com.nereusstream.bookkeeper.BookKeeperProtocolActivation;
 import com.nereusstream.bookkeeper.BookKeeperProtocolActivationUpdate;
@@ -29,8 +31,6 @@ import com.nereusstream.managedledger.generation.ManagedLedgerMaterializationReg
 import com.nereusstream.managedledger.generation.ManagedLedgerPhysicalDeletionActivationRequest;
 import com.nereusstream.managedledger.generation.ManagedLedgerPhysicalDeletionActivationResult;
 import com.nereusstream.objectstore.ObjectStoreSecretResolver;
-import com.nereusstream.bookkeeper.BookKeeperDeletionActivationRequest;
-import com.nereusstream.bookkeeper.BookKeeperDeletionActivationResult;
 import com.nereusstream.pulsar.BookKeeperPrimaryWalAdministration;
 import com.nereusstream.pulsar.NereusProcessIdentity;
 import com.nereusstream.pulsar.NereusRuntimeConfiguration;

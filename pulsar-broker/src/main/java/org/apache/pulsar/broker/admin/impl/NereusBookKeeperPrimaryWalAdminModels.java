@@ -18,10 +18,10 @@
  */
 package org.apache.pulsar.broker.admin.impl;
 
+import com.nereusstream.bookkeeper.BookKeeperDeletionActivationResult;
 import com.nereusstream.bookkeeper.BookKeeperLedgerIdNamespaceReservation;
 import com.nereusstream.bookkeeper.BookKeeperProtocolActivation;
 import com.nereusstream.bookkeeper.BookKeeperProtocolActivationValue;
-import com.nereusstream.bookkeeper.BookKeeperDeletionActivationResult;
 import java.time.Duration;
 import java.util.Objects;
 import org.apache.pulsar.broker.web.RestException;
