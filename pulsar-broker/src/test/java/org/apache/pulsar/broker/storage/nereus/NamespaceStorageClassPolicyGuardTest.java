@@ -18,6 +18,7 @@
  */
 package org.apache.pulsar.broker.storage.nereus;
 
+import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyLong;
@@ -54,6 +55,7 @@ import org.testng.annotations.Test;
 public class NamespaceStorageClassPolicyGuardTest {
     private static final NamespaceName NAMESPACE = NamespaceName.get("tenant/ns");
     private static final TopicName TOPIC = TopicName.get("persistent://tenant/ns/topic");
+    private static final TopicName SECOND_TOPIC = TopicName.get("persistent://tenant/ns/second-topic");
 
     private NamespaceResources namespaceResources;
     private TopicResources topicResources;
@@ -118,6 +120,27 @@ public class NamespaceStorageClassPolicyGuardTest {
 
         verify(bindingStore).validateStorageClassOpenPermit(bindingPermit);
         verify(lock).release();
+    }
+
+    @Test
+    public void serializesFirstCreateAcquisitionsWithinBroker() {
+        when(namespaceResources.refreshAndGetPoliciesWithVersion(NAMESPACE))
+                .thenAnswer(ignored -> CompletableFuture.completedFuture(
+                        policy(StorageClassBindingRecord.BOOKKEEPER, 4)));
+
+        NamespaceStorageClassPermit first = guard.acquireFirstCreate(
+                NAMESPACE, TOPIC, StorageClassBindingRecord.NEREUS).join();
+        CompletableFuture<NamespaceStorageClassPermit> secondFuture = guard.acquireFirstCreate(
+                NAMESPACE, SECOND_TOPIC, StorageClassBindingRecord.NEREUS);
+
+        assertThat(secondFuture).isNotDone();
+
+        first.closeAsync().join();
+        NamespaceStorageClassPermit second = secondFuture.join();
+        second.closeAsync().join();
+
+        verify(lockManager, times(2)).acquireLock(any(), any());
+        verify(lock, times(2)).release();
     }
 
     @Test

@@ -25,6 +25,7 @@ import java.util.List;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
@@ -51,6 +52,7 @@ public final class NamespaceStorageClassPolicyGuard implements AutoCloseable {
     private static final String LOCK_DOMAIN = "pulsar-storage-policy-lock-v1\0";
     private static final long INITIAL_RETRY_MILLIS = 10;
     private static final long MAX_RETRY_MILLIS = 500;
+    private static final CompletableFuture<Void> COMPLETED_LOCAL_TAIL = CompletableFuture.completedFuture(null);
 
     private final LockManager<NamespaceStorageClassLockData> lockManager;
     private final NamespaceResources namespaceResources;
@@ -64,6 +66,7 @@ public final class NamespaceStorageClassPolicyGuard implements AutoCloseable {
     private final int maxBindingScanEntries;
     private final int maxBindingPendingOperations;
     private final AtomicBoolean closed = new AtomicBoolean();
+    private final ConcurrentHashMap<NamespaceName, CompletableFuture<Void>> localLockTails = new ConcurrentHashMap<>();
 
     public NamespaceStorageClassPolicyGuard(
             CoordinationService coordinationService,
@@ -268,13 +271,12 @@ public final class NamespaceStorageClassPolicyGuard implements AutoCloseable {
         });
     }
 
-    private CompletableFuture<ResourceLock<NamespaceStorageClassLockData>> acquireLock(
+    private CompletableFuture<NamespaceLock> acquireLock(
             NamespaceName namespace, long deadlineNanos) {
         if (closed.get()) {
             return CompletableFuture.failedFuture(
                     new IllegalStateException("namespace storage-class policy guard is closed"));
         }
-        CompletableFuture<ResourceLock<NamespaceStorageClassLockData>> result = new CompletableFuture<>();
         String brokerId;
         try {
             brokerId = java.util.Objects.requireNonNull(brokerIdSupplier.get(), "brokerId");
@@ -286,12 +288,15 @@ public final class NamespaceStorageClassPolicyGuard implements AutoCloseable {
         }
         NamespaceStorageClassLockData data = new NamespaceStorageClassLockData(
                 brokerId, UUID.randomUUID().toString(), System.currentTimeMillis());
+        LocalPermit localPermit = reserveLocalPermit(namespace);
         long remainingNanos = deadlineNanos - System.nanoTime();
         if (remainingNanos <= 0) {
+            localPermit.release();
             return CompletableFuture.failedFuture(
                     new TimeoutException("Nereus namespace storage-policy operation timed out"));
         }
-        ScheduledFuture<?> timeoutTask;
+        final CompletableFuture<NamespaceLock> result = new CompletableFuture<>();
+        final ScheduledFuture<?> timeoutTask;
         try {
             timeoutTask = scheduler.schedule(
                     () -> result.completeExceptionally(
@@ -299,11 +304,37 @@ public final class NamespaceStorageClassPolicyGuard implements AutoCloseable {
                     remainingNanos,
                     TimeUnit.NANOSECONDS);
         } catch (Throwable error) {
+            localPermit.release();
             return CompletableFuture.failedFuture(error);
         }
-        result.whenComplete((ignored, error) -> timeoutTask.cancel(false));
-        acquireLock(namespace, data, deadlineNanos, INITIAL_RETRY_MILLIS, result);
+        result.whenComplete((ignored, error) -> {
+            timeoutTask.cancel(false);
+            if (error != null) {
+                localPermit.release();
+            }
+        });
+        localPermit.predecessor.whenComplete((ignored, error) -> {
+            if (error != null) {
+                result.completeExceptionally(unwrap(error));
+            } else if (result.isDone()) {
+                localPermit.release();
+            } else {
+                acquireDistributedLock(
+                        namespace, data, deadlineNanos, INITIAL_RETRY_MILLIS, result, localPermit);
+            }
+        });
         return result;
+    }
+
+    private LocalPermit reserveLocalPermit(NamespaceName namespace) {
+        CompletableFuture<Void> completion = new CompletableFuture<>();
+        java.util.concurrent.atomic.AtomicReference<CompletableFuture<Void>> predecessor =
+                new java.util.concurrent.atomic.AtomicReference<>();
+        localLockTails.compute(namespace, (ignored, current) -> {
+            predecessor.set(current == null ? COMPLETED_LOCAL_TAIL : current);
+            return completion;
+        });
+        return new LocalPermit(namespace, predecessor.get(), completion);
     }
 
     private long deadlineNanos() {
@@ -345,19 +376,35 @@ public final class NamespaceStorageClassPolicyGuard implements AutoCloseable {
         }
     }
 
-    private void acquireLock(
+    private void acquireDistributedLock(
             NamespaceName namespace,
             NamespaceStorageClassLockData data,
             long deadlineNanos,
             long retryMillis,
-            CompletableFuture<ResourceLock<NamespaceStorageClassLockData>> result) {
+            CompletableFuture<NamespaceLock> result,
+            LocalPermit localPermit) {
         if (result.isDone()) {
+            localPermit.release();
             return;
         }
-        lockManager.acquireLock(lockPath(namespace), data).whenComplete((lock, error) -> {
+        CompletableFuture<ResourceLock<NamespaceStorageClassLockData>> acquisition;
+        try {
+            acquisition = java.util.Objects.requireNonNull(
+                    lockManager.acquireLock(lockPath(namespace), data), "lock acquisition result");
+        } catch (Throwable error) {
+            result.completeExceptionally(error);
+            return;
+        }
+        acquisition.whenComplete((lock, error) -> {
             if (error == null) {
-                if (!result.complete(lock)) {
-                    lock.release();
+                try {
+                    NamespaceLock namespaceLock = new NamespaceLock(
+                            java.util.Objects.requireNonNull(lock, "resource lock"), localPermit);
+                    if (!result.complete(namespaceLock)) {
+                        namespaceLock.release();
+                    }
+                } catch (Throwable acquireError) {
+                    result.completeExceptionally(acquireError);
                 }
                 return;
             }
@@ -371,12 +418,13 @@ public final class NamespaceStorageClassPolicyGuard implements AutoCloseable {
                     Math.max(1, TimeUnit.NANOSECONDS.toMillis(remainingNanos)));
             try {
                 scheduler.schedule(
-                        () -> acquireLock(
+                        () -> acquireDistributedLock(
                                 namespace,
                                 data,
                                 deadlineNanos,
                                 Math.min(MAX_RETRY_MILLIS, retryMillis * 2),
-                                result),
+                                result,
+                                localPermit),
                         delayMillis,
                         TimeUnit.MILLISECONDS);
             } catch (Throwable scheduleError) {
@@ -385,8 +433,68 @@ public final class NamespaceStorageClassPolicyGuard implements AutoCloseable {
         });
     }
 
+    private final class LocalPermit {
+        private final NamespaceName namespace;
+        private final CompletableFuture<Void> predecessor;
+        private final CompletableFuture<Void> completion;
+        private final AtomicBoolean released = new AtomicBoolean();
+
+        private LocalPermit(
+                NamespaceName namespace,
+                CompletableFuture<Void> predecessor,
+                CompletableFuture<Void> completion) {
+            this.namespace = namespace;
+            this.predecessor = predecessor;
+            this.completion = completion;
+        }
+
+        private void release() {
+            if (!released.compareAndSet(false, true)) {
+                return;
+            }
+            localLockTails.compute(namespace, (ignored, current) -> current == completion ? null : current);
+            completion.complete(null);
+        }
+    }
+
+    private final class NamespaceLock {
+        private final ResourceLock<NamespaceStorageClassLockData> resourceLock;
+        private final LocalPermit localPermit;
+        private final AtomicBoolean released = new AtomicBoolean();
+
+        private NamespaceLock(
+                ResourceLock<NamespaceStorageClassLockData> resourceLock, LocalPermit localPermit) {
+            this.resourceLock = resourceLock;
+            this.localPermit = localPermit;
+        }
+
+        private boolean isExpired() {
+            return resourceLock.getLockExpiredFuture().isDone();
+        }
+
+        private CompletableFuture<Void> release() {
+            if (!released.compareAndSet(false, true)) {
+                return CompletableFuture.completedFuture(null);
+            }
+            final CompletableFuture<Void> release;
+            try {
+                release = java.util.Objects.requireNonNull(resourceLock.release(), "resource lock release result");
+            } catch (Throwable error) {
+                localPermit.release();
+                return CompletableFuture.failedFuture(error);
+            }
+            return release.handle((ignored, error) -> {
+                localPermit.release();
+                if (error != null) {
+                    throw new CompletionException(unwrap(error));
+                }
+                return (Void) null;
+            });
+        }
+    }
+
     private CompletableFuture<NamespaceStorageClassPermit> failAndRelease(
-            ResourceLock<NamespaceStorageClassLockData> lock, Throwable error) {
+            NamespaceLock lock, Throwable error) {
         return lock.release().handle((ignored, releaseError) -> {
             if (releaseError != null) {
                 error.addSuppressed(unwrap(releaseError));
@@ -395,8 +503,7 @@ public final class NamespaceStorageClassPolicyGuard implements AutoCloseable {
         });
     }
 
-    private static CompletableFuture<Void> releaseWithResult(
-            ResourceLock<NamespaceStorageClassLockData> lock, Throwable operationError) {
+    private CompletableFuture<Void> releaseWithResult(NamespaceLock lock, Throwable operationError) {
         return lock.release().handle((ignored, releaseError) -> {
             if (operationError != null) {
                 Throwable cause = unwrap(operationError);
@@ -476,7 +583,7 @@ public final class NamespaceStorageClassPolicyGuard implements AutoCloseable {
         private final String selectedStorageClass;
         private final long namespacePolicyVersion;
         private final long deadlineNanos;
-        private final ResourceLock<NamespaceStorageClassLockData> lock;
+        private final NamespaceLock lock;
         private final AtomicBoolean closed = new AtomicBoolean();
 
         private Permit(
@@ -485,7 +592,7 @@ public final class NamespaceStorageClassPolicyGuard implements AutoCloseable {
                 String selectedStorageClass,
                 long namespacePolicyVersion,
                 long deadlineNanos,
-                ResourceLock<NamespaceStorageClassLockData> lock) {
+                NamespaceLock lock) {
             this.namespace = namespace;
             this.topic = topic;
             this.selectedStorageClass = selectedStorageClass;
@@ -512,7 +619,7 @@ public final class NamespaceStorageClassPolicyGuard implements AutoCloseable {
         @Override
         public CompletableFuture<Void> validateBeforeFactoryOpen(StorageClassOpenPermit bindingPermit) {
             java.util.Objects.requireNonNull(bindingPermit, "bindingPermit");
-            if (closed.get() || lock.getLockExpiredFuture().isDone()) {
+            if (closed.get() || lock.isExpired()) {
                 return CompletableFuture.failedFuture(
                         new IllegalStateException("NEREUS_NAMESPACE_STORAGE_POLICY_LOCK_LOST"));
             }
