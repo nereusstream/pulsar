@@ -28,6 +28,7 @@ import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import java.util.Map;
 import java.util.Optional;
+import org.apache.pulsar.broker.storage.nereus.v2.NereusOwnershipId;
 import org.apache.pulsar.common.util.ObjectMapperFactory;
 import org.testng.annotations.Test;
 
@@ -78,6 +79,12 @@ public class ServiceUnitStateDataTest {
         String json = mapper.writeValueAsString(src);
         ServiceUnitStateData dst = mapper.readValue(json, ServiceUnitStateData.class);
         assertEquals(dst, src);
+
+        ServiceUnitStateData qualified = new ServiceUnitStateData(
+                Owned, "A", null, null, false, 1, 2,
+                new NereusOwnershipId("11111111111111111111111111111111"),
+                new NereusOwnershipId("22222222222222222222222222222222"));
+        assertEquals(mapper.readValue(mapper.writeValueAsString(qualified), ServiceUnitStateData.class), qualified);
     }
 
     @Test

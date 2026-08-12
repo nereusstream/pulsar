@@ -22,6 +22,7 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import org.apache.commons.lang3.StringUtils;
+import org.apache.pulsar.broker.storage.nereus.v2.NereusOwnershipId;
 
 /**
  * Defines data for the service unit state changes.
@@ -30,13 +31,37 @@ import org.apache.commons.lang3.StringUtils;
 
 public record ServiceUnitStateData(
         ServiceUnitState state, String dstBroker, String sourceBroker,
-        Map<String, Optional<String>> splitServiceUnitToDestBroker, boolean force, long timestamp, long versionId) {
+        Map<String, Optional<String>> splitServiceUnitToDestBroker, boolean force, long timestamp, long versionId,
+        String brokerIncarnationId, String acquisitionId) {
 
     public ServiceUnitStateData {
         Objects.requireNonNull(state);
         if (state != ServiceUnitState.Free && StringUtils.isBlank(dstBroker) && StringUtils.isBlank(sourceBroker)) {
             throw new IllegalArgumentException("Empty broker");
         }
+        if ((brokerIncarnationId == null) != (acquisitionId == null)) {
+            throw new IllegalArgumentException("broker incarnation and acquisition identities must appear together");
+        }
+        if (brokerIncarnationId != null) {
+            new NereusOwnershipId(brokerIncarnationId);
+            new NereusOwnershipId(acquisitionId);
+        }
+    }
+
+    public ServiceUnitStateData(ServiceUnitState state, String dstBroker, String sourceBroker,
+                                Map<String, Optional<String>> splitServiceUnitToDestBroker, boolean force,
+                                long timestamp, long versionId) {
+        this(state, dstBroker, sourceBroker, splitServiceUnitToDestBroker, force, timestamp, versionId,
+                (String) null, (String) null);
+    }
+
+    public ServiceUnitStateData(ServiceUnitState state, String dstBroker, String sourceBroker,
+                                Map<String, Optional<String>> splitServiceUnitToDestBroker, boolean force,
+                                long timestamp, long versionId, NereusOwnershipId brokerIncarnationId,
+                                NereusOwnershipId acquisitionId) {
+        this(state, dstBroker, sourceBroker, splitServiceUnitToDestBroker, force, timestamp, versionId,
+                Objects.requireNonNull(brokerIncarnationId, "brokerIncarnationId").value(),
+                Objects.requireNonNull(acquisitionId, "acquisitionId").value());
     }
 
     public ServiceUnitStateData(ServiceUnitState state, String dstBroker, String sourceBroker,
@@ -74,5 +99,9 @@ public record ServiceUnitStateData(
 
     public static ServiceUnitState state(ServiceUnitStateData data) {
         return data == null ? ServiceUnitState.Init : data.state();
+    }
+
+    public boolean hasNereusOwnershipIdentity() {
+        return brokerIncarnationId != null;
     }
 }
