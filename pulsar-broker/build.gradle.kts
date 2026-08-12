@@ -38,6 +38,7 @@ dependencies {
     api(project(":pulsar-opentelemetry"))
     implementation(libs.nereus.domain.n1)
     implementation(libs.nereus.metadata.spi.n1)
+    implementation(libs.nereus.metadata.oxia.p1)
     implementation(project(":pulsar-client-messagecrypto-bc"))
     api(project(":pulsar-functions:pulsar-functions-worker"))
     implementation(project(":pulsar-docs-tools")) {

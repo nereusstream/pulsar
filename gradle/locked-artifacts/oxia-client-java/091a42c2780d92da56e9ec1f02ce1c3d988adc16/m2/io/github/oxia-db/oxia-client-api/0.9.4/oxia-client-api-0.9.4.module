@@ -1,0 +1,218 @@
+{
+  "formatVersion": "1.1",
+  "component": {
+    "group": "io.github.oxia-db",
+    "module": "oxia-client-api",
+    "version": "0.9.4",
+    "attributes": {
+      "org.gradle.status": "release"
+    }
+  },
+  "createdBy": {
+    "gradle": {
+      "version": "9.4.0"
+    }
+  },
+  "variants": [
+    {
+      "name": "apiElements",
+      "attributes": {
+        "org.gradle.category": "library",
+        "org.gradle.dependency.bundling": "external",
+        "org.gradle.jvm.version": 17,
+        "org.gradle.libraryelements": "jar",
+        "org.gradle.usage": "java-api"
+      },
+      "dependencies": [
+        {
+          "group": "io.opentelemetry",
+          "module": "opentelemetry-api"
+        }
+      ],
+      "files": [
+        {
+          "name": "oxia-client-api-0.9.4.jar",
+          "url": "oxia-client-api-0.9.4.jar",
+          "size": 38597,
+          "sha512": "4920d1954b094f75ec69d17468698b2d6278fca4dbc40dd78c1d29b655d7a91a61f3987a81208b5d58446c903dc74395b4e4b9427012cd189329567c98329521",
+          "sha256": "fa2a973c19eafa83c7f2efb8d727d744b5405fb13e5a6adb9a92225f672455bf",
+          "sha1": "df56cb3ef7efde72de7c3353e9bc3d2ced32bbe3",
+          "md5": "082f85936194c7881fee3dcad61a27f9"
+        }
+      ]
+    },
+    {
+      "name": "runtimeElements",
+      "attributes": {
+        "org.gradle.category": "library",
+        "org.gradle.dependency.bundling": "external",
+        "org.gradle.jvm.version": 17,
+        "org.gradle.libraryelements": "jar",
+        "org.gradle.usage": "java-runtime"
+      },
+      "dependencies": [
+        {
+          "group": "io.github.merlimat.slog",
+          "module": "slog",
+          "version": {
+            "requires": "0.9.5"
+          }
+        },
+        {
+          "group": "io.grpc",
+          "module": "grpc-bom",
+          "version": {
+            "requires": "1.75.0"
+          },
+          "attributes": {
+            "org.gradle.category": "platform"
+          }
+        },
+        {
+          "group": "io.opentelemetry",
+          "module": "opentelemetry-bom",
+          "version": {
+            "requires": "1.63.0"
+          },
+          "attributes": {
+            "org.gradle.category": "platform"
+          }
+        },
+        {
+          "group": "io.opentelemetry",
+          "module": "opentelemetry-bom-alpha",
+          "version": {
+            "requires": "1.63.0-alpha"
+          },
+          "attributes": {
+            "org.gradle.category": "platform"
+          }
+        },
+        {
+          "group": "org.junit",
+          "module": "junit-bom",
+          "version": {
+            "requires": "5.11.3"
+          },
+          "attributes": {
+            "org.gradle.category": "platform"
+          }
+        },
+        {
+          "group": "io.opentelemetry",
+          "module": "opentelemetry-api"
+        }
+      ],
+      "dependencyConstraints": [
+        {
+          "group": "com.google.guava",
+          "module": "guava",
+          "version": {
+            "requires": "33.5.0-jre"
+          }
+        },
+        {
+          "group": "io.opentelemetry.semconv",
+          "module": "opentelemetry-semconv",
+          "version": {
+            "requires": "1.37.0"
+          }
+        },
+        {
+          "group": "net.bytebuddy",
+          "module": "byte-buddy",
+          "version": {
+            "requires": "1.15.10"
+          }
+        },
+        {
+          "group": "net.bytebuddy",
+          "module": "byte-buddy-agent",
+          "version": {
+            "requires": "1.15.10"
+          }
+        },
+        {
+          "group": "org.apache.commons",
+          "module": "commons-compress",
+          "version": {
+            "requires": "1.26.0"
+          }
+        },
+        {
+          "group": "org.apache.commons",
+          "module": "commons-lang3",
+          "version": {
+            "requires": "3.19.0"
+          }
+        },
+        {
+          "group": "com.google.protobuf",
+          "module": "protobuf-java",
+          "version": {
+            "requires": "4.34.0"
+          }
+        },
+        {
+          "group": "com.fasterxml.jackson.core",
+          "module": "jackson-databind",
+          "version": {
+            "requires": "2.21.1"
+          }
+        },
+        {
+          "group": "com.fasterxml.jackson.core",
+          "module": "jackson-core",
+          "version": {
+            "requires": "2.21.1"
+          }
+        },
+        {
+          "group": "org.apache.logging.log4j",
+          "module": "log4j-core",
+          "version": {
+            "requires": "2.26.0"
+          }
+        },
+        {
+          "group": "org.bouncycastle",
+          "module": "bcpkix-jdk18on",
+          "version": {
+            "requires": "1.84"
+          }
+        }
+      ],
+      "files": [
+        {
+          "name": "oxia-client-api-0.9.4.jar",
+          "url": "oxia-client-api-0.9.4.jar",
+          "size": 38597,
+          "sha512": "4920d1954b094f75ec69d17468698b2d6278fca4dbc40dd78c1d29b655d7a91a61f3987a81208b5d58446c903dc74395b4e4b9427012cd189329567c98329521",
+          "sha256": "fa2a973c19eafa83c7f2efb8d727d744b5405fb13e5a6adb9a92225f672455bf",
+          "sha1": "df56cb3ef7efde72de7c3353e9bc3d2ced32bbe3",
+          "md5": "082f85936194c7881fee3dcad61a27f9"
+        }
+      ]
+    },
+    {
+      "name": "sourcesElements",
+      "attributes": {
+        "org.gradle.category": "documentation",
+        "org.gradle.dependency.bundling": "external",
+        "org.gradle.docstype": "sources",
+        "org.gradle.usage": "java-runtime"
+      },
+      "files": [
+        {
+          "name": "oxia-client-api-0.9.4-sources.jar",
+          "url": "oxia-client-api-0.9.4-sources.jar",
+          "size": 47855,
+          "sha512": "8c36c1936ff764a5f1fe922156ce7e6c7a328b177976694d0c3e91d035b44bcc6703abb62bf6f7ded4a9c29bd5685a10fbba851042a9fb3278ce10c85a722c5f",
+          "sha256": "1a1e1d1125827c19b0733db84911ff7dbdd93aedb481880f1b85510640e8e6bb",
+          "sha1": "0bd02aedd0d53f33034348e5dc3dbe54b675aec7",
+          "md5": "8f3a5324cd82dede13b1c7a98ecdb760"
+        }
+      ]
+    }
+  ]
+}
