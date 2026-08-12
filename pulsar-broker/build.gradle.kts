@@ -36,6 +36,8 @@ dependencies {
     implementation(project(":pulsar-transaction:pulsar-transaction-common"))
     api(project(":pulsar-transaction:pulsar-transaction-coordinator"))
     api(project(":pulsar-opentelemetry"))
+    implementation(libs.nereus.domain.n1)
+    implementation(libs.nereus.metadata.spi.n1)
     implementation(project(":pulsar-client-messagecrypto-bc"))
     api(project(":pulsar-functions:pulsar-functions-worker"))
     implementation(project(":pulsar-docs-tools")) {

@@ -26,8 +26,22 @@ pluginManagement {
 }
 
 dependencyResolutionManagement {
+    val nereusN1SourceCommit = "330aaec349c51fb2ace52b1085e8a9e5a60b5e3e"
+    val nereusN1Version = "0.2.0-n1.$nereusN1SourceCommit"
+    val nereusN1Repository = file("gradle/locked-artifacts/nereus-n1/$nereusN1SourceCommit/m2")
+    require(nereusN1Repository.isDirectory) {
+        "Missing immutable Nereus N1 repository $nereusN1Repository"
+    }
     @Suppress("UnstableApiUsage")
     repositories {
+        maven {
+            name = "nereusN1"
+            url = uri(nereusN1Repository)
+            content {
+                includeVersion("com.nereusstream", "nereus-domain", nereusN1Version)
+                includeVersion("com.nereusstream", "nereus-metadata-spi", nereusN1Version)
+            }
+        }
         mavenCentral()
         maven {
             url = uri("https://packages.confluent.io/maven/")
