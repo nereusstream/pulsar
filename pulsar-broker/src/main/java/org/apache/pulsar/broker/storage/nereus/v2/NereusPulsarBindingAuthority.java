@@ -22,6 +22,7 @@ import com.nereusstream.domain.bytes.Sha256Digest;
 import com.nereusstream.domain.identity.StorageEpochId;
 import com.nereusstream.domain.identity.TopicBindingId;
 import com.nereusstream.domain.protocol.PulsarTopicIncarnationIdentity;
+import com.nereusstream.metadata.spi.model.MetadataVersion;
 import java.util.Objects;
 
 /** Exact ACTIVE selector/aggregate projection consumed by the native P1 cache installer. */
@@ -29,18 +30,17 @@ public record NereusPulsarBindingAuthority(
         PulsarTopicIncarnationIdentity incarnation,
         TopicBindingId bindingId,
         StorageEpochId storageEpochId,
-        long selectorBackendVersion,
-        long aggregateBackendVersion,
+        MetadataVersion selectorBackendVersion,
+        MetadataVersion aggregateBackendVersion,
         Sha256Digest selectorDigest,
         Sha256Digest aggregateDigest) {
     public NereusPulsarBindingAuthority {
         Objects.requireNonNull(incarnation, "incarnation");
         Objects.requireNonNull(bindingId, "bindingId");
         Objects.requireNonNull(storageEpochId, "storageEpochId");
+        Objects.requireNonNull(selectorBackendVersion, "selectorBackendVersion");
+        Objects.requireNonNull(aggregateBackendVersion, "aggregateBackendVersion");
         Objects.requireNonNull(selectorDigest, "selectorDigest");
         Objects.requireNonNull(aggregateDigest, "aggregateDigest");
-        if (selectorBackendVersion < 0 || aggregateBackendVersion < 0) {
-            throw new IllegalArgumentException("authority backend versions must be non-negative");
-        }
     }
 }
