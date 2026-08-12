@@ -28,6 +28,7 @@ import com.nereusstream.domain.protocol.PulsarBindingGeneration;
 import com.nereusstream.domain.protocol.PulsarPersistenceName;
 import com.nereusstream.domain.protocol.PulsarTopicIncarnationIdentity;
 import com.nereusstream.domain.protocol.PulsarTopicName;
+import com.nereusstream.metadata.spi.model.MetadataVersion;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayDeque;
 import java.util.Optional;
@@ -173,8 +174,8 @@ public class NereusPulsarAuthorityInstallerTest {
                 incarnation,
                 new TopicBindingId(Sha256Digest.copyOf(binding)),
                 new StorageEpochId(Sha256Digest.copyOf(epoch)),
-                3,
-                4,
+                new MetadataVersion(CanonicalBytes.copyOf(new byte[] {3})),
+                new MetadataVersion(CanonicalBytes.copyOf(new byte[] {4})),
                 Sha256Digest.copyOf(binding),
                 Sha256Digest.copyOf(epoch));
     }
