@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+    xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+    xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <!-- do_not_remove: published-with-gradle-metadata -->
+  <modelVersion>4.0.0</modelVersion>
+  <groupId>com.nereusstream</groupId>
+  <artifactId>nereus-metadata-oxia-p1</artifactId>
+  <version>0.2.0-p1.23064b3be10169d0fe1bb6f23abd7f2bded4bbd5</version>
+  <name>nereus-metadata-oxia-p1</name>
+  <description>Source-qualified Nereus V2 P1 Oxia capability artifact</description>
+  <url>https://nereusstream.com</url>
+  <licenses>
+    <license>
+      <name>Apache License, Version 2.0</name>
+      <url>https://www.apache.org/licenses/LICENSE-2.0</url>
+    </license>
+  </licenses>
+  <scm>
+    <connection>scm:git:https://github.com/nereusstream/nereus.git</connection>
+    <url>https://github.com/nereusstream/nereus</url>
+  </scm>
+  <dependencies>
+    <dependency>
+      <groupId>com.nereusstream</groupId>
+      <artifactId>nereus-domain</artifactId>
+      <version>0.2.0-n1.330aaec349c51fb2ace52b1085e8a9e5a60b5e3e</version>
+      <scope>compile</scope>
+    </dependency>
+    <dependency>
+      <groupId>com.nereusstream</groupId>
+      <artifactId>nereus-metadata-spi</artifactId>
+      <version>0.2.0-n1.330aaec349c51fb2ace52b1085e8a9e5a60b5e3e</version>
+      <scope>compile</scope>
+    </dependency>
+    <dependency>
+      <groupId>io.github.oxia-db</groupId>
+      <artifactId>oxia-client</artifactId>
+      <version>0.9.4</version>
+      <scope>compile</scope>
+    </dependency>
+  </dependencies>
+</project>

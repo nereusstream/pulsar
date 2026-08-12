@@ -1,0 +1,293 @@
+{
+  "formatVersion": "1.1",
+  "component": {
+    "group": "io.github.oxia-db",
+    "module": "oxia-client",
+    "version": "0.9.4",
+    "attributes": {
+      "org.gradle.status": "release"
+    }
+  },
+  "createdBy": {
+    "gradle": {
+      "version": "9.4.0"
+    }
+  },
+  "variants": [
+    {
+      "name": "apiElements",
+      "attributes": {
+        "org.gradle.category": "library",
+        "org.gradle.dependency.bundling": "external",
+        "org.gradle.jvm.version": 17,
+        "org.gradle.libraryelements": "jar",
+        "org.gradle.usage": "java-api"
+      },
+      "dependencies": [
+        {
+          "group": "io.github.oxia-db",
+          "module": "oxia-client-api",
+          "version": {
+            "requires": "0.9.4"
+          }
+        }
+      ],
+      "files": [
+        {
+          "name": "oxia-client-0.9.4.jar",
+          "url": "oxia-client-0.9.4.jar",
+          "size": 385309,
+          "sha512": "a3ccf46ab8b8773dfe24df2af078d9e740be188bd7de51d8d2673ada39ec870a12f313ea07cfdcb7cf3a7a4bf15fe490aacb830900c5fd809ef63c5549d49cc1",
+          "sha256": "0ca719e6d11bd2ee2c2e7e94b42c6843e60f776bea12f7b5814cff9928e2e4c5",
+          "sha1": "3e946bda83fbefab2da794ecdf3b3ada070d8f20",
+          "md5": "a2455d380980b0e80f7b1b27e650d69c"
+        }
+      ]
+    },
+    {
+      "name": "runtimeElements",
+      "attributes": {
+        "org.gradle.category": "library",
+        "org.gradle.dependency.bundling": "external",
+        "org.gradle.jvm.version": 17,
+        "org.gradle.libraryelements": "jar",
+        "org.gradle.usage": "java-runtime"
+      },
+      "dependencies": [
+        {
+          "group": "io.github.merlimat.slog",
+          "module": "slog",
+          "version": {
+            "requires": "0.9.5"
+          }
+        },
+        {
+          "group": "io.grpc",
+          "module": "grpc-bom",
+          "version": {
+            "requires": "1.75.0"
+          },
+          "attributes": {
+            "org.gradle.category": "platform"
+          }
+        },
+        {
+          "group": "io.opentelemetry",
+          "module": "opentelemetry-bom",
+          "version": {
+            "requires": "1.63.0"
+          },
+          "attributes": {
+            "org.gradle.category": "platform"
+          }
+        },
+        {
+          "group": "io.opentelemetry",
+          "module": "opentelemetry-bom-alpha",
+          "version": {
+            "requires": "1.63.0-alpha"
+          },
+          "attributes": {
+            "org.gradle.category": "platform"
+          }
+        },
+        {
+          "group": "org.junit",
+          "module": "junit-bom",
+          "version": {
+            "requires": "5.11.3"
+          },
+          "attributes": {
+            "org.gradle.category": "platform"
+          }
+        },
+        {
+          "group": "com.github.ben-manes.caffeine",
+          "module": "caffeine",
+          "version": {
+            "requires": "3.1.4"
+          }
+        },
+        {
+          "group": "dev.failsafe",
+          "module": "failsafe",
+          "version": {
+            "requires": "3.3.2"
+          }
+        },
+        {
+          "group": "io.netty",
+          "module": "netty-buffer",
+          "version": {
+            "requires": "4.1.131.Final"
+          }
+        },
+        {
+          "group": "io.grpc",
+          "module": "grpc-netty-shaded"
+        },
+        {
+          "group": "io.grpc",
+          "module": "grpc-protobuf"
+        },
+        {
+          "group": "io.grpc",
+          "module": "grpc-services"
+        },
+        {
+          "group": "io.grpc",
+          "module": "grpc-stub"
+        },
+        {
+          "group": "io.opentelemetry",
+          "module": "opentelemetry-api"
+        },
+        {
+          "group": "jakarta.annotation",
+          "module": "jakarta.annotation-api",
+          "version": {
+            "requires": "1.3.5"
+          }
+        },
+        {
+          "group": "com.google.protobuf",
+          "module": "protobuf-java",
+          "version": {
+            "requires": "4.34.0"
+          }
+        },
+        {
+          "group": "com.google.api.grpc",
+          "module": "proto-google-common-protos",
+          "version": {
+            "requires": "2.59.2"
+          }
+        },
+        {
+          "group": "net.openhft",
+          "module": "zero-allocation-hashing",
+          "version": {
+            "requires": "0.16"
+          }
+        },
+        {
+          "group": "io.github.oxia-db",
+          "module": "oxia-client-api",
+          "version": {
+            "requires": "0.9.4"
+          }
+        }
+      ],
+      "dependencyConstraints": [
+        {
+          "group": "com.google.guava",
+          "module": "guava",
+          "version": {
+            "requires": "33.5.0-jre"
+          }
+        },
+        {
+          "group": "io.opentelemetry.semconv",
+          "module": "opentelemetry-semconv",
+          "version": {
+            "requires": "1.37.0"
+          }
+        },
+        {
+          "group": "net.bytebuddy",
+          "module": "byte-buddy",
+          "version": {
+            "requires": "1.15.10"
+          }
+        },
+        {
+          "group": "net.bytebuddy",
+          "module": "byte-buddy-agent",
+          "version": {
+            "requires": "1.15.10"
+          }
+        },
+        {
+          "group": "org.apache.commons",
+          "module": "commons-compress",
+          "version": {
+            "requires": "1.26.0"
+          }
+        },
+        {
+          "group": "org.apache.commons",
+          "module": "commons-lang3",
+          "version": {
+            "requires": "3.19.0"
+          }
+        },
+        {
+          "group": "com.google.protobuf",
+          "module": "protobuf-java",
+          "version": {
+            "requires": "4.34.0"
+          }
+        },
+        {
+          "group": "com.fasterxml.jackson.core",
+          "module": "jackson-databind",
+          "version": {
+            "requires": "2.21.1"
+          }
+        },
+        {
+          "group": "com.fasterxml.jackson.core",
+          "module": "jackson-core",
+          "version": {
+            "requires": "2.21.1"
+          }
+        },
+        {
+          "group": "org.apache.logging.log4j",
+          "module": "log4j-core",
+          "version": {
+            "requires": "2.26.0"
+          }
+        },
+        {
+          "group": "org.bouncycastle",
+          "module": "bcpkix-jdk18on",
+          "version": {
+            "requires": "1.84"
+          }
+        }
+      ],
+      "files": [
+        {
+          "name": "oxia-client-0.9.4.jar",
+          "url": "oxia-client-0.9.4.jar",
+          "size": 385309,
+          "sha512": "a3ccf46ab8b8773dfe24df2af078d9e740be188bd7de51d8d2673ada39ec870a12f313ea07cfdcb7cf3a7a4bf15fe490aacb830900c5fd809ef63c5549d49cc1",
+          "sha256": "0ca719e6d11bd2ee2c2e7e94b42c6843e60f776bea12f7b5814cff9928e2e4c5",
+          "sha1": "3e946bda83fbefab2da794ecdf3b3ada070d8f20",
+          "md5": "a2455d380980b0e80f7b1b27e650d69c"
+        }
+      ]
+    },
+    {
+      "name": "sourcesElements",
+      "attributes": {
+        "org.gradle.category": "documentation",
+        "org.gradle.dependency.bundling": "external",
+        "org.gradle.docstype": "sources",
+        "org.gradle.usage": "java-runtime"
+      },
+      "files": [
+        {
+          "name": "oxia-client-0.9.4-sources.jar",
+          "url": "oxia-client-0.9.4-sources.jar",
+          "size": 215856,
+          "sha512": "28ef737e488d73f94d76b274b93a422117a8232cd6e78c12f89528d4c85373e0482e01a15ba37d273be3f620de8f67f5664b310b07e29745e1a4fef2a0ca3f8a",
+          "sha256": "9dbfd9e9fafadc5415f1f6d53b0972f8acd3de5c8c957d4f96642e5e42e74a01",
+          "sha1": "414522924c51a74d92ac0375e6e031417e17341b",
+          "md5": "68d978333b49c05a80e6c8a9fd555162"
+        }
+      ]
+    }
+  ]
+}

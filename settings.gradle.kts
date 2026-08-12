@@ -32,6 +32,18 @@ dependencyResolutionManagement {
     require(nereusN1Repository.isDirectory) {
         "Missing immutable Nereus N1 repository $nereusN1Repository"
     }
+    val nereusP1SourceCommit = "23064b3be10169d0fe1bb6f23abd7f2bded4bbd5"
+    val nereusP1Version = "0.2.0-p1.$nereusP1SourceCommit"
+    val nereusP1Repository = file("gradle/locked-artifacts/nereus-p1/$nereusP1SourceCommit/m2")
+    require(nereusP1Repository.isDirectory) {
+        "Missing immutable Nereus P1 repository $nereusP1Repository"
+    }
+    val oxiaClientSourceCommit = "091a42c2780d92da56e9ec1f02ce1c3d988adc16"
+    val oxiaClientVersion = "0.9.4"
+    val oxiaClientRepository = file("gradle/locked-artifacts/oxia-client-java/$oxiaClientSourceCommit/m2")
+    require(oxiaClientRepository.isDirectory) {
+        "Missing immutable Oxia client repository $oxiaClientRepository"
+    }
     @Suppress("UnstableApiUsage")
     repositories {
         maven {
@@ -40,6 +52,29 @@ dependencyResolutionManagement {
             content {
                 includeVersion("com.nereusstream", "nereus-domain", nereusN1Version)
                 includeVersion("com.nereusstream", "nereus-metadata-spi", nereusN1Version)
+            }
+        }
+        exclusiveContent {
+            forRepository {
+                maven {
+                    name = "nereusP1"
+                    url = uri(nereusP1Repository)
+                }
+            }
+            filter {
+                includeVersion("com.nereusstream", "nereus-metadata-oxia-p1", nereusP1Version)
+            }
+        }
+        exclusiveContent {
+            forRepository {
+                maven {
+                    name = "oxiaClientO1"
+                    url = uri(oxiaClientRepository)
+                }
+            }
+            filter {
+                includeVersion("io.github.oxia-db", "oxia-client", oxiaClientVersion)
+                includeVersion("io.github.oxia-db", "oxia-client-api", oxiaClientVersion)
             }
         }
         mavenCentral()
