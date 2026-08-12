@@ -27,6 +27,7 @@ import com.google.common.annotations.VisibleForTesting;
 import java.util.Objects;
 import java.util.function.BiConsumer;
 import lombok.Setter;
+import org.apache.pulsar.broker.storage.nereus.v2.NereusOwnershipTransitionValidator;
 import org.apache.pulsar.client.api.Schema;
 import org.apache.pulsar.common.topics.TopicCompactionStrategy;
 
@@ -86,6 +87,10 @@ public class ServiceUnitStateDataConflictResolver implements TopicCompactionStra
             if (storageType == MetadataStore) {
                 return to.versionId() != 1;
             }
+        }
+
+        if (NereusOwnershipTransitionValidator.shouldReject(from, to)) {
+            return true;
         }
 
         if (to.force()) {

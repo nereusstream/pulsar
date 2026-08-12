@@ -29,6 +29,7 @@ import static org.apache.pulsar.broker.loadbalance.extensions.channel.ServiceUni
 import static org.apache.pulsar.broker.loadbalance.extensions.channel.ServiceUnitState.StorageType.SystemTopic;
 import static org.testng.Assert.assertFalse;
 import static org.testng.Assert.assertTrue;
+import org.apache.pulsar.broker.storage.nereus.v2.NereusOwnershipId;
 import org.testng.annotations.Test;
 
 @Test(groups = "broker")
@@ -128,6 +129,20 @@ public class ServiceUnitStateDataConflictResolverTest {
         assertTrue(strategy.shouldKeepLeft(
                 new ServiceUnitStateData(Init, dst, 1),
                 new ServiceUnitStateData(Init, dst, true, 1)));
+    }
+
+    @Test
+    public void testForceCannotBypassNereusOwnershipIdentity() {
+        NereusOwnershipId broker = new NereusOwnershipId("11111111111111111111111111111111");
+        NereusOwnershipId acquisition = new NereusOwnershipId("22222222222222222222222222222222");
+        NereusOwnershipId differentAcquisition =
+                new NereusOwnershipId("33333333333333333333333333333333");
+        ServiceUnitStateData owned = new ServiceUnitStateData(
+                Owned, dst, null, null, false, 1, 1, broker, acquisition);
+        ServiceUnitStateData mismatchedForcedRelease = new ServiceUnitStateData(
+                Releasing, null, dst, null, true, 2, 2, broker, differentAcquisition);
+
+        assertTrue(strategy.shouldKeepLeft(owned, mismatchedForcedRelease));
     }
 
     @Test
