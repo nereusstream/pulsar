@@ -35,6 +35,7 @@ import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.LongConsumer;
 import org.testng.annotations.BeforeMethod;
 import org.testng.annotations.Test;
 
@@ -97,6 +98,38 @@ public class NereusPulsarAuthorityInstallerTest {
         first.close();
 
         assertThat(fence.captureValidOrNull()).isSameAs(successor.word());
+    }
+
+    @Test
+    public void staleInvalidationCallbackCannotInvalidateSuccessorSequence() {
+        installer.install(SERVICE_UNIT, INCARNATION).toCompletableFuture().join();
+        LongConsumer staleCallback = bindings.invalidation;
+        bindings.invalidate();
+        witnesses.add(witness("33333333333333333333333333333333", 8));
+        witnesses.add(witness("33333333333333333333333333333333", 8));
+        var successor = installer.install(SERVICE_UNIT, INCARNATION).toCompletableFuture().join();
+
+        staleCallback.accept(bindings.epoch + 1);
+
+        assertThat(fence.captureValidOrNull()).isSameAs(successor.word());
+    }
+
+    @Test
+    public void exhaustedSequenceRemainsPermanentlyInvalid() {
+        var exhausted = new NereusPulsarActiveFence(
+                new NereusPulsarActiveFence.InvalidWord(Long.MAX_VALUE, 7));
+
+        assertThat(exhausted.invalidate(8))
+                .isEqualTo(new NereusPulsarActiveFence.InvalidWord(Long.MAX_VALUE, 8));
+        assertThat(exhausted.invalidateIfSequenceCurrent(Long.MAX_VALUE, 9)).isTrue();
+        var expected = (NereusPulsarActiveFence.InvalidWord) exhausted.current();
+        assertThat(exhausted.tryInstall(
+                        expected,
+                        witness("33333333333333333333333333333333", 8),
+                        authority(),
+                        new NereusContinuityPermit(1, 9)))
+                .isNull();
+        assertThat(exhausted.captureValidOrNull()).isNull();
     }
 
     @Test
@@ -181,7 +214,7 @@ public class NereusPulsarAuthorityInstallerTest {
     }
 
     private final class FakeBindingProvider implements NereusPulsarBindingAuthorityProvider {
-        private Runnable invalidation;
+        private LongConsumer invalidation;
         private boolean current = true;
         private boolean invalidateDuringRead;
         private boolean invalidateAfterCurrentCheck;
@@ -190,7 +223,7 @@ public class NereusPulsarAuthorityInstallerTest {
         private final AtomicBoolean closed = new AtomicBoolean();
 
         @Override
-        public AutoCloseable armInvalidation(PulsarTopicIncarnationIdentity incarnation, Runnable callback) {
+        public AutoCloseable armInvalidation(PulsarTopicIncarnationIdentity incarnation, LongConsumer callback) {
             invalidation = callback;
             return () -> closed.set(true);
         }
@@ -211,11 +244,6 @@ public class NereusPulsarAuthorityInstallerTest {
         }
 
         @Override
-        public long currentInvalidationEpoch() {
-            return epoch;
-        }
-
-        @Override
         public CompletionStage<Optional<NereusPulsarBindingAuthority>> readActive(
                 PulsarTopicIncarnationIdentity incarnation) {
             if (invalidateDuringRead) {
@@ -226,7 +254,7 @@ public class NereusPulsarAuthorityInstallerTest {
 
         private void invalidate() {
             epoch++;
-            invalidation.run();
+            invalidation.accept(epoch);
         }
     }
 }

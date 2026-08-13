@@ -54,6 +54,8 @@ import java.nio.charset.StandardCharsets;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.LongConsumer;
 import org.testng.annotations.BeforeMethod;
 import org.testng.annotations.Test;
 
@@ -147,17 +149,20 @@ public class OxiaNereusPulsarBindingAuthorityProviderTest {
     @Test
     public void bridgesInvalidationAndExactContinuityPermit() throws Exception {
         AtomicBoolean invalidated = new AtomicBoolean();
-        AutoCloseable registration = provider.armInvalidation(INCARNATION, () -> invalidated.set(true));
+        AtomicLong invalidationEpoch = new AtomicLong();
+        AutoCloseable registration = provider.armInvalidation(INCARNATION, epoch -> {
+            invalidationEpoch.set(epoch);
+            invalidated.set(true);
+        });
         NereusContinuityPermit permit = provider.captureContinuityPermitOrNull();
 
         assertThat(permit).isEqualTo(new NereusContinuityPermit(3, 11));
         assertThat(provider.isCurrent(permit)).isTrue();
-        assertThat(provider.currentInvalidationEpoch()).isEqualTo(11);
 
         continuity.invalidate();
         assertThat(invalidated).isTrue();
+        assertThat(invalidationEpoch).hasValue(12);
         assertThat(provider.isCurrent(permit)).isFalse();
-        assertThat(provider.currentInvalidationEpoch()).isEqualTo(12);
         registration.close();
     }
 
@@ -213,13 +218,13 @@ public class OxiaNereusPulsarBindingAuthorityProviderTest {
     private static final class FakeContinuity
             implements OxiaNereusPulsarBindingAuthorityProvider.ContinuityBridge {
         private long epoch = 11;
-        private Runnable invalidation = () -> {};
+        private LongConsumer invalidation = ignored -> {};
 
         @Override
-        public AutoCloseable arm(PulsarTopicIncarnationIdentity incarnation, Runnable callback) {
+        public AutoCloseable arm(PulsarTopicIncarnationIdentity incarnation, LongConsumer callback) {
             assertThat(incarnation).isEqualTo(INCARNATION);
             invalidation = callback;
-            return () -> invalidation = () -> {};
+            return () -> invalidation = ignored -> {};
         }
 
         @Override
@@ -232,14 +237,9 @@ public class OxiaNereusPulsarBindingAuthorityProviderTest {
             return permit.equals(new NereusContinuityPermit(3, epoch));
         }
 
-        @Override
-        public long currentInvalidationEpoch() {
-            return epoch;
-        }
-
         private void invalidate() {
             epoch++;
-            invalidation.run();
+            invalidation.accept(epoch);
         }
     }
 }

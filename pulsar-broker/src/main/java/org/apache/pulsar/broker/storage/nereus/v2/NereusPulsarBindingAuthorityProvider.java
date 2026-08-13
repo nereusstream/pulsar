@@ -21,16 +21,15 @@ package org.apache.pulsar.broker.storage.nereus.v2;
 import com.nereusstream.domain.protocol.PulsarTopicIncarnationIdentity;
 import java.util.Optional;
 import java.util.concurrent.CompletionStage;
+import java.util.function.LongConsumer;
 
 /** Narrow bridge implemented by the exact P1 Nereus adapter, never by a generic metadata store. */
 public interface NereusPulsarBindingAuthorityProvider {
-    AutoCloseable armInvalidation(PulsarTopicIncarnationIdentity incarnation, Runnable invalidation);
+    AutoCloseable armInvalidation(PulsarTopicIncarnationIdentity incarnation, LongConsumer invalidation);
 
     NereusContinuityPermit captureContinuityPermitOrNull();
 
     boolean isCurrent(NereusContinuityPermit permit);
-
-    long currentInvalidationEpoch();
 
     CompletionStage<Optional<NereusPulsarBindingAuthority>> readActive(
             PulsarTopicIncarnationIdentity incarnation);

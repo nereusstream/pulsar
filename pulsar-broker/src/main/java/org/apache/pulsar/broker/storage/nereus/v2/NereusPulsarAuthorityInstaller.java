@@ -70,7 +70,8 @@ public final class NereusPulsarAuthorityInstaller {
         try {
             registration = bindingProvider.armInvalidation(
                     expectedIncarnation,
-                    () -> fence.invalidate(bindingProvider.currentInvalidationEpoch()));
+                    invalidationEpoch ->
+                            fence.invalidateIfSequenceCurrent(expectedInvalid.sequence(), invalidationEpoch));
         } catch (RuntimeException failure) {
             return CompletableFuture.failedFuture(failure);
         }

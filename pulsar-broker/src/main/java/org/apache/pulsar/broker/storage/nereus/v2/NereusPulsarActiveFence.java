@@ -52,7 +52,15 @@ public final class NereusPulsarActiveFence {
         }
     }
 
-    private final AtomicReference<Word> word = new AtomicReference<>(new InvalidWord(0, 0));
+    private final AtomicReference<Word> word;
+
+    public NereusPulsarActiveFence() {
+        this(new InvalidWord(0, 0));
+    }
+
+    NereusPulsarActiveFence(InvalidWord initial) {
+        word = new AtomicReference<>(Objects.requireNonNull(initial, "initial"));
+    }
 
     public Word current() {
         return word.get();
@@ -61,13 +69,23 @@ public final class NereusPulsarActiveFence {
     public InvalidWord invalidate(long continuityEpoch) {
         while (true) {
             Word current = word.get();
-            if (current.sequence() == Long.MAX_VALUE) {
-                throw new IllegalStateException("P1 local fence sequence exhausted");
-            }
-            InvalidWord invalid = new InvalidWord(
-                    current.sequence() + 1, Math.max(continuityEpoch, current.continuityEpoch()));
+            InvalidWord invalid = invalidAfter(current, continuityEpoch);
             if (word.compareAndSet(current, invalid)) {
                 return invalid;
+            }
+        }
+    }
+
+    /** Invalidates only words in the installation sequence that armed this callback. */
+    public boolean invalidateIfSequenceCurrent(long expectedSequence, long continuityEpoch) {
+        requireNonNegative(expectedSequence, continuityEpoch);
+        while (true) {
+            Word current = word.get();
+            if (current.sequence() != expectedSequence) {
+                return false;
+            }
+            if (word.compareAndSet(current, invalidAfter(current, continuityEpoch))) {
+                return true;
             }
         }
     }
@@ -75,12 +93,7 @@ public final class NereusPulsarActiveFence {
     /** Invalidates only the exact installation owned by the caller; stale close handles cannot fence a successor. */
     public boolean invalidateIfCurrent(ValidWord expected) {
         Objects.requireNonNull(expected, "expected");
-        if (expected.sequence() == Long.MAX_VALUE) {
-            throw new IllegalStateException("P1 local fence sequence exhausted");
-        }
-        return word.compareAndSet(
-                expected,
-                new InvalidWord(expected.sequence() + 1, expected.continuityEpoch()));
+        return word.compareAndSet(expected, invalidAfter(expected, expected.continuityEpoch()));
     }
 
     public ValidWord tryInstall(
@@ -89,7 +102,8 @@ public final class NereusPulsarActiveFence {
             NereusPulsarBindingAuthority binding,
             NereusContinuityPermit continuityPermit) {
         Objects.requireNonNull(expected, "expected");
-        if (continuityPermit.invalidationEpoch() < expected.continuityEpoch()) {
+        if (expected.sequence() == Long.MAX_VALUE
+                || continuityPermit.invalidationEpoch() < expected.continuityEpoch()) {
             return null;
         }
         ValidWord candidate = new ValidWord(
@@ -106,6 +120,11 @@ public final class NereusPulsarActiveFence {
     /** Reference equality is the complete success-completion fence check. */
     public boolean isCurrent(ValidWord expected) {
         return word.get() == expected;
+    }
+
+    private static InvalidWord invalidAfter(Word current, long continuityEpoch) {
+        long nextSequence = current.sequence() == Long.MAX_VALUE ? Long.MAX_VALUE : current.sequence() + 1;
+        return new InvalidWord(nextSequence, Math.max(continuityEpoch, current.continuityEpoch()));
     }
 
     private static void requireNonNegative(long sequence, long continuityEpoch) {

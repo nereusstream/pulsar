@@ -32,18 +32,18 @@ import java.util.Objects;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
+import java.util.function.LongConsumer;
 
 /** Exact P1 bridge from the source-qualified Oxia capability to the native ACTIVE installer. */
 public final class OxiaNereusPulsarBindingAuthorityProvider
         implements NereusPulsarBindingAuthorityProvider {
     interface ContinuityBridge {
-        AutoCloseable arm(PulsarTopicIncarnationIdentity incarnation, Runnable invalidation);
+        AutoCloseable arm(PulsarTopicIncarnationIdentity incarnation, LongConsumer invalidation);
 
         NereusContinuityPermit captureOrNull();
 
         boolean isCurrent(NereusContinuityPermit permit);
 
-        long currentInvalidationEpoch();
     }
 
     private final PulsarTopicGenerationSelectorStore selectorStore;
@@ -68,7 +68,7 @@ public final class OxiaNereusPulsarBindingAuthorityProvider
 
     @Override
     public AutoCloseable armInvalidation(
-            PulsarTopicIncarnationIdentity incarnation, Runnable invalidation) {
+            PulsarTopicIncarnationIdentity incarnation, LongConsumer invalidation) {
         return continuity.arm(incarnation, invalidation);
     }
 
@@ -80,11 +80,6 @@ public final class OxiaNereusPulsarBindingAuthorityProvider
     @Override
     public boolean isCurrent(NereusContinuityPermit permit) {
         return continuity.isCurrent(permit);
-    }
-
-    @Override
-    public long currentInvalidationEpoch() {
-        return continuity.currentInvalidationEpoch();
     }
 
     @Override
@@ -148,7 +143,7 @@ public final class OxiaNereusPulsarBindingAuthorityProvider
 
         @Override
         public AutoCloseable arm(
-                PulsarTopicIncarnationIdentity incarnation, Runnable invalidation) {
+                PulsarTopicIncarnationIdentity incarnation, LongConsumer invalidation) {
             return store.registerPulsarAuthorityInvalidation(incarnation, invalidation);
         }
 
@@ -164,11 +159,6 @@ public final class OxiaNereusPulsarBindingAuthorityProvider
         public boolean isCurrent(NereusContinuityPermit permit) {
             return store.isCurrent(new InstallPermit(
                     permit.clientGeneration(), permit.invalidationEpoch()));
-        }
-
-        @Override
-        public long currentInvalidationEpoch() {
-            return store.currentInvalidationEpoch();
         }
     }
 }
