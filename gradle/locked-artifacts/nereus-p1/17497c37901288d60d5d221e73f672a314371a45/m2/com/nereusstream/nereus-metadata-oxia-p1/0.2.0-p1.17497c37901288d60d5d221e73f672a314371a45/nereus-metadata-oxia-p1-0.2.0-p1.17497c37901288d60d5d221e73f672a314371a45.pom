@@ -6,7 +6,7 @@
   <modelVersion>4.0.0</modelVersion>
   <groupId>com.nereusstream</groupId>
   <artifactId>nereus-metadata-oxia-p1</artifactId>
-  <version>0.2.0-p1.23064b3be10169d0fe1bb6f23abd7f2bded4bbd5</version>
+  <version>0.2.0-p1.17497c37901288d60d5d221e73f672a314371a45</version>
   <name>nereus-metadata-oxia-p1</name>
   <description>Source-qualified Nereus V2 P1 Oxia capability artifact</description>
   <url>https://nereusstream.com</url>

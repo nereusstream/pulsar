@@ -32,7 +32,7 @@ dependencyResolutionManagement {
     require(nereusN1Repository.isDirectory) {
         "Missing immutable Nereus N1 repository $nereusN1Repository"
     }
-    val nereusP1SourceCommit = "23064b3be10169d0fe1bb6f23abd7f2bded4bbd5"
+    val nereusP1SourceCommit = "17497c37901288d60d5d221e73f672a314371a45"
     val nereusP1Version = "0.2.0-p1.$nereusP1SourceCommit"
     val nereusP1Repository = file("gradle/locked-artifacts/nereus-p1/$nereusP1SourceCommit/m2")
     require(nereusP1Repository.isDirectory) {
