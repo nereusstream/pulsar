@@ -52,6 +52,7 @@ import org.apache.pulsar.client.api.RegexSubscriptionMode;
 import org.apache.pulsar.client.api.SubscriptionInitialPosition;
 import org.apache.pulsar.client.api.SubscriptionMode;
 import org.apache.pulsar.client.api.SubscriptionType;
+import org.apache.pulsar.client.api.TopicResourceGuard;
 
 @Data
 @NoArgsConstructor
@@ -77,6 +78,9 @@ public class ConsumerConfigurationData<T> implements Serializable, Cloneable {
             description = "Subscription name"
     )
     private String subscriptionName;
+
+    @JsonIgnore
+    private TopicResourceGuard topicResourceGuard;
 
     @Schema(
             name = "subscriptionType",

@@ -57,6 +57,7 @@ import org.apache.pulsar.client.api.SubscriptionInitialPosition;
 import org.apache.pulsar.client.api.SubscriptionMode;
 import org.apache.pulsar.client.api.SubscriptionType;
 import org.apache.pulsar.client.api.TopicConsumerBuilder;
+import org.apache.pulsar.client.api.TopicResourceGuard;
 import org.apache.pulsar.client.impl.conf.ConfigurationDataUtils;
 import org.apache.pulsar.client.impl.conf.ConsumerConfigurationData;
 import org.apache.pulsar.client.impl.conf.TopicConsumerConfigurationData;
@@ -101,6 +102,13 @@ public class ConsumerBuilderImpl<T> implements ConsumerBuilder<T> {
     }
 
     @Override
+    public ConsumerBuilder<T> resourceGuard(final TopicResourceGuard guard) {
+        conf.setTopicResourceGuard(java.util.Objects.requireNonNull(guard, "guard"));
+        conf.setReceiverQueueSize(Math.min(conf.getReceiverQueueSize(), 1));
+        return this;
+    }
+
+    @Override
     public Consumer<T> subscribe() throws PulsarClientException {
         try {
             return FutureUtil.getAndCleanupOnInterrupt(subscribeAsync(), Consumer::closeAsync);
@@ -139,6 +147,12 @@ public class ConsumerBuilderImpl<T> implements ConsumerBuilder<T> {
         if (conf.getTopicNames().isEmpty() && conf.getTopicsPattern() == null) {
             return FutureUtil
                     .failedFuture(new InvalidConfigurationException("Topic name must be set on the consumer builder"));
+        }
+
+        if (conf.getTopicResourceGuard() != null
+                && (conf.getTopicsPattern() != null || conf.getTopicNames().size() != 1)) {
+            return FutureUtil.failedFuture(new InvalidConfigurationException(
+                    "A guarded consumer requires exactly one physical topic"));
         }
 
         if (StringUtils.isBlank(conf.getSubscriptionName())) {

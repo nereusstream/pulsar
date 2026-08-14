@@ -76,7 +76,15 @@ public class PulsarCommandSenderImpl implements PulsarCommandSender {
 
     @Override
     public void sendSuccessResponse(long requestId) {
-        BaseCommand command = Commands.newSuccessCommand(requestId);
+        sendSuccessResponse(requestId, Optional.empty(), 0);
+    }
+
+    @Override
+    public void sendSuccessResponse(long requestId,
+                                    Optional<org.apache.pulsar.client.api.TopicResourceGuardAttestation>
+                                            guardAttestation,
+                                    long connectionGeneration) {
+        BaseCommand command = Commands.newSuccessCommand(requestId, guardAttestation, connectionGeneration);
         safeIntercept(command, cnx);
         ByteBuf outBuf = Commands.serializeWithSize(command);
         writeAndFlush(outBuf);

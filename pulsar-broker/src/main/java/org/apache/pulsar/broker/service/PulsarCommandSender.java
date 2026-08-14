@@ -43,6 +43,16 @@ public interface PulsarCommandSender {
 
     void sendSuccessResponse(long requestId);
 
+    default void sendSuccessResponse(long requestId,
+                                     Optional<org.apache.pulsar.client.api.TopicResourceGuardAttestation>
+                                             guardAttestation,
+                                     long connectionGeneration) {
+        if (guardAttestation.isPresent() || connectionGeneration != 0) {
+            throw new UnsupportedOperationException("guarded consumer success is not supported by this sender");
+        }
+        sendSuccessResponse(requestId);
+    }
+
     void sendErrorResponse(long requestId, ServerError error, String message);
 
     void sendProducerSuccessResponse(long requestId, String producerName, SchemaVersion schemaVersion);

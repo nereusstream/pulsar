@@ -92,6 +92,7 @@ import org.apache.pulsar.common.api.proto.CommandScalableTopicUpdate;
 import org.apache.pulsar.common.api.proto.CommandSeek;
 import org.apache.pulsar.common.api.proto.CommandSend;
 import org.apache.pulsar.common.api.proto.CommandSubscribe;
+import org.apache.pulsar.common.api.proto.CommandSuccess;
 import org.apache.pulsar.common.api.proto.CommandSubscribe.InitialPosition;
 import org.apache.pulsar.common.api.proto.CommandSubscribe.SubType;
 import org.apache.pulsar.common.api.proto.CommandTcClientConnectResponse;
@@ -388,9 +389,20 @@ public class Commands {
     }
 
     public static BaseCommand newSuccessCommand(long requestId) {
+        return newSuccessCommand(requestId, Optional.empty(), 0);
+    }
+
+    public static BaseCommand newSuccessCommand(long requestId,
+                                                Optional<org.apache.pulsar.client.api.TopicResourceGuardAttestation>
+                                                        guardAttestation,
+                                                long connectionGeneration) {
         BaseCommand cmd = localCmd(Type.SUCCESS);
-        cmd.setSuccess()
+        CommandSuccess success = cmd.setSuccess()
                 .setRequestId(requestId);
+        guardAttestation.ifPresent(attestation -> setTopicResourceGuardAttestation(success, attestation));
+        if (connectionGeneration != 0) {
+            success.setConnectionGeneration(connectionGeneration);
+        }
         return cmd;
     }
 
@@ -680,6 +692,19 @@ public class Commands {
                InitialPosition subscriptionInitialPosition, long startMessageRollbackDurationInSec,
                SchemaInfo schemaInfo, boolean createTopicIfDoesNotExist, KeySharedPolicy keySharedPolicy,
                Map<String, String> subscriptionProperties, long consumerEpoch) {
+        return newSubscribe(topic, subscription, consumerId, requestId, subType, priorityLevel, consumerName,
+                isDurable, startMessageId, metadata, readCompacted, isReplicated, subscriptionInitialPosition,
+                startMessageRollbackDurationInSec, schemaInfo, createTopicIfDoesNotExist, keySharedPolicy,
+                subscriptionProperties, consumerEpoch, null);
+    }
+
+    public static ByteBuf newSubscribe(String topic, String subscription, long consumerId, long requestId,
+               SubType subType, int priorityLevel, String consumerName, boolean isDurable, MessageIdData startMessageId,
+               Map<String, String> metadata, boolean readCompacted, Boolean isReplicated,
+               InitialPosition subscriptionInitialPosition, long startMessageRollbackDurationInSec,
+               SchemaInfo schemaInfo, boolean createTopicIfDoesNotExist, KeySharedPolicy keySharedPolicy,
+               Map<String, String> subscriptionProperties, long consumerEpoch,
+               org.apache.pulsar.client.api.TopicResourceGuard resourceGuard) {
         BaseCommand cmd = localCmd(Type.SUBSCRIBE);
         CommandSubscribe subscribe = cmd.setSubscribe()
                 .setTopic(topic)
@@ -694,6 +719,9 @@ public class Commands {
                 .setInitialPosition(subscriptionInitialPosition)
                 .setForceTopicCreation(createTopicIfDoesNotExist)
                 .setConsumerEpoch(consumerEpoch);
+        if (resourceGuard != null) {
+            setTopicResourceGuard(subscribe, resourceGuard);
+        }
         if (isReplicated != null) {
             subscribe.setReplicateSubscriptionState(isReplicated);
         }
@@ -2526,7 +2554,28 @@ public class Commands {
                 .setTopicCreationTimestamp(guard.topicCreationTimestamp());
     }
 
+    private static void setTopicResourceGuard(CommandSubscribe subscribe,
+                                              org.apache.pulsar.client.api.TopicResourceGuard guard) {
+        subscribe.setResourceGuard()
+                .setGuardVersion(guard.guardVersion())
+                .setAuthenticatedClusterId(guard.authenticatedClusterId())
+                .setResourceIncarnation(guard.resourceIncarnation())
+                .setTopicCreationTimestamp(guard.topicCreationTimestamp());
+    }
+
     private static void setTopicResourceGuardAttestation(CommandProducerSuccess success,
+                                                          org.apache.pulsar.client.api.TopicResourceGuardAttestation
+                                                                  attestation) {
+        success.setResourceGuardAttestation()
+                .setGuardVersion(attestation.guardVersion())
+                .setAuthenticatedClusterId(attestation.authenticatedClusterId())
+                .setResourceIncarnation(attestation.resourceIncarnation())
+                .setTopicCreationTimestamp(attestation.topicCreationTimestamp())
+                .setPhysicalTopic(attestation.physicalTopic())
+                .setPartition(attestation.partition());
+    }
+
+    private static void setTopicResourceGuardAttestation(CommandSuccess success,
                                                           org.apache.pulsar.client.api.TopicResourceGuardAttestation
                                                                   attestation) {
         success.setResourceGuardAttestation()

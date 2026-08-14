@@ -51,6 +51,8 @@ public class SubscriptionOption {
     private Optional<Map<String, String>> subscriptionProperties;
     private long consumerEpoch;
     private SchemaType schemaType;
+    private ValidatedTopicResourceGuard resourceGuard;
+    private long guardedSourceConnectionGeneration;
 
     public static Optional<Map<String, String>> getPropertiesMap(List<KeyValue> list) {
         if (list == null) {

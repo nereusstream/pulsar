@@ -62,6 +62,7 @@ import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
 import java.util.function.BooleanSupplier;
@@ -215,6 +216,7 @@ import org.apache.pulsar.utils.TimedSingleThreadRateLimiter;
 public class ServerCnx extends PulsarHandler implements TransportCnx {
 
     private static final Logger LOG = Logger.get(ServerCnx.class);
+    private static final AtomicLong NEXT_GUARDED_SOURCE_CONNECTION_GENERATION = new AtomicLong(0);
     private Logger log = LOG;
 
     private static final Logger PAUSE_RECEIVING_LOG = Logger.get(ServerCnx.class.getName() + ".pauseReceiving");
@@ -694,7 +696,6 @@ public class ServerCnx extends PulsarHandler implements TransportCnx {
         if (topicName == null) {
             return;
         }
-
         if (!this.service.getPulsar().isRunning()) {
             log.debug()
                     .attr("topic", topicName)
@@ -1817,6 +1818,15 @@ public class ServerCnx extends PulsarHandler implements TransportCnx {
         if (topicName == null) {
             return;
         }
+        if (subscribe.hasResourceGuard()
+                && !Commands.peerSupportsTopicResourceGuard(getRemoteEndpointProtocolVersion())) {
+            commandSender.sendErrorResponse(requestId, ServerError.UnsupportedVersionError,
+                    "Guarded source requires broker protocol v22 or newer");
+            return;
+        }
+        final boolean guardedSourceRequest = subscribe.hasResourceGuard();
+        final TopicResourceGuard requestedSourceResourceGuard = guardedSourceRequest
+                ? new TopicResourceGuard().copyFrom(subscribe.getResourceGuard()) : null;
 
         log.debug()
                 .attr("authRole", authenticationRoleLoggingAnonymizer.anonymize(authRole))
@@ -1930,7 +1940,13 @@ public class ServerCnx extends PulsarHandler implements TransportCnx {
                                 .attr("consumerId", consumerId)
                                 .attr("consumer", consumer)
                                 .log("Consumer with the same id is already created:" + "consumerId=, consumer");
-                        commandSender.sendSuccessResponse(requestId);
+                        if (consumer.isGuardedSource()) {
+                            commandSender.sendSuccessResponse(requestId,
+                                    Optional.of(consumer.getResourceGuard().attestation()),
+                                    consumer.getGuardedSourceConnectionGeneration());
+                        } else {
+                            commandSender.sendSuccessResponse(requestId);
+                        }
                     }
                     return null;
                 }
@@ -1946,6 +1962,34 @@ public class ServerCnx extends PulsarHandler implements TransportCnx {
                                                 "Topic " + topicName + " does not exist"));
                             }
                             final Topic topic = optTopic.get();
+                            ValidatedTopicResourceGuard validatedSourceResourceGuard = null;
+                            long guardedSourceConnectionGeneration = 0;
+                            if (guardedSourceRequest) {
+                                if (!(topic instanceof PersistentTopic)) {
+                                    String message = "A guarded source requires a persistent topic";
+                                    consumers.remove(consumerId, consumerFuture);
+                                    consumerFuture.completeExceptionally(new IllegalStateException(message));
+                                    commandSender.sendErrorResponse(requestId,
+                                            ServerError.ResourceIncarnationMismatch, message);
+                                    return FutureUtil.failedFuture(new IllegalStateException(message));
+                                }
+                                validatedSourceResourceGuard = ((PersistentTopic) topic)
+                                        .getCurrentTopicResourceGuardView();
+                                if (!TopicResourceGuardValidator.matches(validatedSourceResourceGuard,
+                                        requestedSourceResourceGuard)) {
+                                    String message = "The expected topic resource incarnation is not current";
+                                    consumers.remove(consumerId, consumerFuture);
+                                    consumerFuture.completeExceptionally(new IllegalStateException(message));
+                                    commandSender.sendErrorResponse(requestId,
+                                            ServerError.ResourceIncarnationMismatch, message);
+                                    return FutureUtil.failedFuture(new IllegalStateException(message));
+                                }
+                                guardedSourceConnectionGeneration =
+                                        NEXT_GUARDED_SOURCE_CONNECTION_GENERATION.incrementAndGet();
+                            }
+                            final ValidatedTopicResourceGuard sourceResourceGuard =
+                                    validatedSourceResourceGuard;
+                            final long sourceConnectionGeneration = guardedSourceConnectionGeneration;
                             // Check max consumer limitation to avoid unnecessary ops wasting resources. For example:
                             // the new consumer reached max producer limitation, but pulsar did schema check first,
                             // it would waste CPU.
@@ -2002,6 +2046,8 @@ public class ServerCnx extends PulsarHandler implements TransportCnx {
                                                 .subscriptionProperties(subscriptionProperties)
                                                 .consumerEpoch(consumerEpoch)
                                                 .schemaType(schema == null ? null : schema.getType())
+                                                .resourceGuard(sourceResourceGuard)
+                                                .guardedSourceConnectionGeneration(sourceConnectionGeneration)
                                                 .build();
                                         if (schema != null && schema.getType() != SchemaType.AUTO_CONSUME) {
                                             return ignoreUnrecoverableBKException
@@ -2028,7 +2074,13 @@ public class ServerCnx extends PulsarHandler implements TransportCnx {
                                         .attr("topic", topicName)
                                         .attr("subscription", subscriptionName)
                                         .log("Created subscription on topic");
-                                commandSender.sendSuccessResponse(requestId);
+                                if (consumer.isGuardedSource()) {
+                                    commandSender.sendSuccessResponse(requestId,
+                                            Optional.of(consumer.getResourceGuard().attestation()),
+                                            consumer.getGuardedSourceConnectionGeneration());
+                                } else {
+                                    commandSender.sendSuccessResponse(requestId);
+                                }
                                 if (brokerInterceptor != null) {
                                     try {
                                         brokerInterceptor.consumerCreated(this, consumer, metadata);

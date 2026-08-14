@@ -440,6 +440,10 @@ message CommandSubscribe {
 
     // The consumer epoch, when exclusive and failover consumer redeliver unack message will increase the epoch
     optional uint64 consumer_epoch = 19;
+
+    // V1 source consumers carry the exact topic resource identity to the
+    // broker. A guarded source is never allowed to auto-create a topic.
+    optional TopicResourceGuard resource_guard = 20;
 }
 
 message CommandPartitionedTopicMetadata {
@@ -708,6 +712,8 @@ message CommandRedeliverUnacknowledgedMessages {
 message CommandSuccess {
     required uint64 request_id = 1;
     optional Schema schema = 2;
+    optional TopicResourceGuardAttestation resource_guard_attestation = 3;
+    optional uint64 connection_generation = 4;
 }
 
 /// Response from CommandProducer

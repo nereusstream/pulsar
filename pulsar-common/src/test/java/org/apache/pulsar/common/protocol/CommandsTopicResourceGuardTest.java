@@ -54,6 +54,26 @@ public class CommandsTopicResourceGuardTest {
     }
 
     @Test
+    public void subscribeGuardSurvivesWireRoundTrip() {
+        TopicResourceGuard guard = guard();
+        BaseCommand command = parseFrame(Commands.newSubscribe(
+                "persistent://tenant/ns/topic-partition-0", "source", 7L, 8L,
+                org.apache.pulsar.common.api.proto.CommandSubscribe.SubType.Exclusive, 0, "consumer", true,
+                null, Map.of(), false, false,
+                org.apache.pulsar.common.api.proto.CommandSubscribe.InitialPosition.Earliest, 0, null, false,
+                null, Map.of(), 0L, guard));
+
+        assertEquals(command.getType(), BaseCommand.Type.SUBSCRIBE);
+        assertTrue(command.getSubscribe().hasResourceGuard());
+        org.apache.pulsar.common.api.proto.TopicResourceGuard wireGuard =
+                command.getSubscribe().getResourceGuard();
+        assertEquals(wireGuard.getGuardVersion(), 1);
+        assertEquals(wireGuard.getAuthenticatedClusterId(), "cluster-a");
+        assertEquals(wireGuard.getTopicCreationTimestamp(), Long.MIN_VALUE);
+        assertEquals(wireGuard.getResourceIncarnation(), guard.resourceIncarnation());
+    }
+
+    @Test
     public void successAttestationAndReceiptSurviveWireRoundTrip() {
         TopicResourceGuardAttestation attestation = new TopicResourceGuardAttestation(
                 guard(), "persistent://tenant/ns/topic-partition-0", 0);

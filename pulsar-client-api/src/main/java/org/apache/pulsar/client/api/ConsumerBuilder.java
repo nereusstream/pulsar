@@ -57,6 +57,18 @@ public interface ConsumerBuilder<T> extends Cloneable {
     ConsumerBuilder<T> clone();
 
     /**
+     * Binds this consumer to the exact topic resource identity supplied by a
+     * source controller. Guarded consumers do not auto-create topics and the
+     * broker must return a connection generation before messages are exposed.
+     *
+     * @param guard expected topic resource identity
+     * @return the consumer builder instance
+     */
+    default ConsumerBuilder<T> resourceGuard(TopicResourceGuard guard) {
+        throw new UnsupportedOperationException("resourceGuard is not supported by this ConsumerBuilder");
+    }
+
+    /**
      * Load the configuration from provided <tt>config</tt> map.
      *
      * <p>Example:

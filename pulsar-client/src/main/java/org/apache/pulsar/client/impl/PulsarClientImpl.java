@@ -738,20 +738,25 @@ public class PulsarClientImpl implements PulsarClient {
 
         String topic = conf.getSingleTopic();
 
-        getPartitionedTopicMetadata(topic, true, false).thenAccept(metadata -> {
+        getPartitionedTopicMetadata(topic, conf.getTopicResourceGuard() == null, false).thenAccept(metadata -> {
                 log.debug().attr("topic", topic)
                         .attr("partitions", metadata.partitions)
                         .log("Received topic metadata. partitions");
 
             ConsumerBase<T> consumer;
             if (metadata.partitions > 0) {
+                if (conf.getTopicResourceGuard() != null) {
+                    consumerSubscribedFuture.completeExceptionally(new PulsarClientException.InvalidConfigurationException(
+                            "A guarded consumer requires a non-partitioned physical topic"));
+                    return;
+                }
                 consumer = MultiTopicsConsumerImpl.createPartitionedConsumer(PulsarClientImpl.this, conf,
                         externalExecutorProvider, consumerSubscribedFuture, metadata.partitions, schema, interceptors);
             } else {
                 int partitionIndex = TopicName.getPartitionIndex(topic);
                 consumer = ConsumerImpl.newConsumerImpl(PulsarClientImpl.this, topic, conf, externalExecutorProvider,
                         partitionIndex, false, consumerSubscribedFuture, null, schema, interceptors,
-                        true /* createTopicIfDoesNotExist */);
+                        conf.getTopicResourceGuard() == null /* createTopicIfDoesNotExist */);
             }
             consumers.add(consumer);
         }).exceptionally(ex -> {

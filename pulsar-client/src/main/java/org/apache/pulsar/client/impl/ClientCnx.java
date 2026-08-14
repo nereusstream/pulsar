@@ -634,9 +634,21 @@ public class ClientCnx extends PulsarHandler {
             log.debug().attr("requestId", success.getRequestId())
                     .log("Received success response from server");
         long requestId = success.getRequestId();
-        CompletableFuture<?> requestFuture = pendingRequests.remove(requestId);
+        CompletableFuture<ProducerResponse> requestFuture =
+                (CompletableFuture<ProducerResponse>) pendingRequests.remove(requestId);
         if (requestFuture != null) {
-            requestFuture.complete(null);
+            ProducerResponse response = new ProducerResponse(null, -1, null, Optional.empty(),
+                    success.hasResourceGuardAttestation()
+                            ? Optional.of(new TopicResourceGuardAttestation(
+                                    success.getResourceGuardAttestation().getGuardVersion(),
+                                    success.getResourceGuardAttestation().getAuthenticatedClusterId(),
+                                    success.getResourceGuardAttestation().getResourceIncarnation(),
+                                    success.getResourceGuardAttestation().getTopicCreationTimestamp(),
+                                    success.getResourceGuardAttestation().getPhysicalTopic(),
+                                    success.getResourceGuardAttestation().getPartition()))
+                            : Optional.empty(),
+                    success.hasConnectionGeneration() ? Optional.of(success.getConnectionGeneration()) : Optional.empty());
+            requestFuture.complete(response);
         } else {
             duplicatedResponseCounter.incrementAndGet();
             log.warn().attr("requestId", success.getRequestId())
@@ -698,7 +710,8 @@ public class ClientCnx extends PulsarHandler {
                                     success.getResourceGuardAttestation().getTopicCreationTimestamp(),
                                     success.getResourceGuardAttestation().getPhysicalTopic(),
                                     success.getResourceGuardAttestation().getPartition()))
-                            : Optional.empty());
+                            : Optional.empty(),
+                    Optional.empty());
             requestFuture.complete(pr);
         } else {
             duplicatedResponseCounter.incrementAndGet();

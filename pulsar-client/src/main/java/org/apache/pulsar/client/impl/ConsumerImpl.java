@@ -77,6 +77,7 @@ import org.apache.commons.lang3.RandomStringUtils;
 import org.apache.commons.lang3.StringUtils;
 import org.apache.commons.lang3.tuple.Triple;
 import org.apache.pulsar.client.api.Consumer;
+import org.apache.pulsar.client.api.GuardedConsumer;
 import org.apache.pulsar.client.api.ConsumerCryptoFailureAction;
 import org.apache.pulsar.client.api.DeadLetterPolicy;
 import org.apache.pulsar.client.api.DeadLetterProducerBuilderContext;
@@ -95,6 +96,8 @@ import org.apache.pulsar.client.api.SubscriptionInitialPosition;
 import org.apache.pulsar.client.api.SubscriptionMode;
 import org.apache.pulsar.client.api.SubscriptionType;
 import org.apache.pulsar.client.api.TopicMessageId;
+import org.apache.pulsar.client.api.TopicResourceGuard;
+import org.apache.pulsar.client.api.TopicResourceGuardAttestation;
 import org.apache.pulsar.client.api.TypedMessageBuilder;
 import org.apache.pulsar.client.api.transaction.TxnID;
 import org.apache.pulsar.client.impl.conf.ConsumerConfigurationData;
@@ -140,7 +143,7 @@ import org.apache.pulsar.common.util.collections.BitSetRecyclable;
 import org.apache.pulsar.common.util.collections.ConcurrentBitSet;
 import org.apache.pulsar.common.util.collections.GrowableArrayBlockingQueue;
 
-public class ConsumerImpl<T> extends ConsumerBase<T> implements ConnectionHandler.Connection {
+public class ConsumerImpl<T> extends ConsumerBase<T> implements GuardedConsumer<T>, ConnectionHandler.Connection {
     private static final Logger LOG = Logger.get(ConsumerImpl.class);
     protected final Logger log;
 
@@ -228,6 +231,9 @@ public class ConsumerImpl<T> extends ConsumerBase<T> implements ConnectionHandle
     private final BlockingQueue<String> pendingChunkedMessageUuidQueue;
 
     private final boolean createTopicIfDoesNotExist;
+    private final TopicResourceGuard topicResourceGuard;
+    private volatile Optional<TopicResourceGuardAttestation> resourceGuardAttestation = Optional.empty();
+    private volatile long guardedSourceConnectionGeneration;
     private final boolean poolMessages;
 
     private final Counter messagesReceivedCounter;
@@ -341,6 +347,7 @@ public class ConsumerImpl<T> extends ConsumerBase<T> implements ConnectionHandle
         this.negativeAcksTracker = new NegativeAcksTracker(this, conf);
         this.resetIncludeHead = conf.isResetIncludeHead();
         this.createTopicIfDoesNotExist = createTopicIfDoesNotExist;
+        this.topicResourceGuard = conf.getTopicResourceGuard();
         this.maxPendingChunkedMessage = conf.getMaxPendingChunkedMessage();
         this.pendingChunkedMessageUuidQueue = new GrowableArrayBlockingQueue<>();
         this.expireTimeOfIncompleteChunkedMessageMillis = conf.getExpireTimeOfIncompleteChunkedMessageMillis();
@@ -942,9 +949,12 @@ public class ConsumerImpl<T> extends ConsumerBase<T> implements ConnectionHandle
                     InitialPosition.valueOf(subscriptionInitialPosition.getValue()),
                     startMessageRollbackDuration, si, createTopicIfDoesNotExist, conf.getKeySharedPolicy(),
                     // Use the current epoch to subscribe.
-                    conf.getSubscriptionProperties(), CONSUMER_EPOCH.get(this));
+                    conf.getSubscriptionProperties(), CONSUMER_EPOCH.get(this), topicResourceGuard);
 
-            cnx.sendRequestWithId(request, requestId).thenRun(() -> {
+            cnx.sendRequestWithId(request, requestId).thenAccept(response -> {
+                if (topicResourceGuard != null) {
+                    validateGuardedSubscribeResponse(response);
+                }
                 synchronized (ConsumerImpl.this) {
                     if (changeToReadyState()) {
                         consumerIsReconnectedToBroker(cnx, currentSize);
@@ -2191,6 +2201,42 @@ public class ConsumerImpl<T> extends ConsumerBase<T> implements ConnectionHandle
 
     public boolean isConnected(ClientCnx cnx) {
         return cnx != null && (getState() == State.Ready);
+    }
+
+    private void validateGuardedSubscribeResponse(final ProducerResponse response) {
+        Optional<TopicResourceGuardAttestation> attestation = response.getResourceGuardAttestation();
+        Optional<Long> generation = response.getConnectionGeneration();
+        if (attestation.isEmpty() || generation.isEmpty() || generation.get() == 0) {
+            throw new IllegalStateException("guarded source SUBSCRIBE did not return connection proof");
+        }
+        TopicResourceGuardAttestation observed = attestation.get();
+        TopicResourceGuard observedGuard = new TopicResourceGuard(observed.authenticatedClusterId(),
+                observed.resourceIncarnation(), observed.topicCreationTimestamp());
+        if (!topicResourceGuard.equals(observedGuard)
+                || !getTopic().equals(observed.physicalTopic())
+                || observed.partition() != Math.max(0, partitionIndex)) {
+            throw new IllegalStateException("guarded source SUBSCRIBE returned foreign resource identity");
+        }
+        resourceGuardAttestation = attestation;
+        guardedSourceConnectionGeneration = generation.get();
+    }
+
+    @Override
+    public TopicResourceGuard resourceGuard() {
+        if (topicResourceGuard == null) {
+            throw new IllegalStateException("consumer was not created with a topic resource guard");
+        }
+        return topicResourceGuard;
+    }
+
+    @Override
+    public Optional<TopicResourceGuardAttestation> resourceGuardAttestation() {
+        return resourceGuardAttestation;
+    }
+
+    @Override
+    public long connectionGeneration() {
+        return guardedSourceConnectionGeneration;
     }
 
     int getPartitionIndex() {

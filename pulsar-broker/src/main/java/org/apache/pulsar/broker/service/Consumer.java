@@ -165,6 +165,10 @@ public class Consumer {
     @Getter
     private final SchemaType schemaType;
 
+    /** Resource identity and connection generation for a guarded source consumer. */
+    private final ValidatedTopicResourceGuard resourceGuard;
+    private final long guardedSourceConnectionGeneration;
+
     @Getter
     private final Instant connectedSince = Instant.now();
 
@@ -189,7 +193,7 @@ public class Consumer {
                     Map<String, String> metadata, boolean readCompacted,
                     KeySharedMeta keySharedMeta, MessageId startMessageId, long consumerEpoch) {
         this(subscription, subType, topicName, consumerId, priorityLevel, consumerName, isDurable, cnx, appId,
-                metadata, readCompacted, keySharedMeta, startMessageId, consumerEpoch, null);
+                metadata, readCompacted, keySharedMeta, startMessageId, consumerEpoch, null, null, 0);
     }
 
     public Consumer(Subscription subscription, SubType subType, String topicName, long consumerId,
@@ -198,6 +202,18 @@ public class Consumer {
                     Map<String, String> metadata, boolean readCompacted,
                     KeySharedMeta keySharedMeta, MessageId startMessageId,
                     long consumerEpoch, SchemaType schemaType) {
+        this(subscription, subType, topicName, consumerId, priorityLevel, consumerName, isDurable, cnx, appId,
+                metadata, readCompacted, keySharedMeta, startMessageId, consumerEpoch, schemaType, null, 0);
+    }
+
+    public Consumer(Subscription subscription, SubType subType, String topicName, long consumerId,
+                    int priorityLevel, String consumerName,
+                    boolean isDurable, TransportCnx cnx, String appId,
+                    Map<String, String> metadata, boolean readCompacted,
+                    KeySharedMeta keySharedMeta, MessageId startMessageId,
+                    long consumerEpoch, SchemaType schemaType,
+                    ValidatedTopicResourceGuard resourceGuard,
+                    long guardedSourceConnectionGeneration) {
         this.subscription = subscription;
         this.subType = subType;
         this.topicName = topicName;
@@ -226,6 +242,8 @@ public class Consumer {
         this.messageAckCounter = new LongAdder();
         this.messageAckRate = new Rate();
         this.appId = appId;
+        this.resourceGuard = resourceGuard;
+        this.guardedSourceConnectionGeneration = guardedSourceConnectionGeneration;
 
         // Ensure we start from compacted view
         this.startMessageId = (readCompacted && startMessageId == null) ? MessageId.earliest : startMessageId;
@@ -292,6 +310,8 @@ public class Consumer {
         this.startMessageId = null;
         this.isAcknowledgmentAtBatchIndexLevelEnabled = false;
         this.schemaType = null;
+        this.resourceGuard = null;
+        this.guardedSourceConnectionGeneration = 0;
         this.log = LOG.with().attr("consumerName", consumerName).build();
         MESSAGE_PERMITS_UPDATER.set(this, availablePermits);
         OPEN_TELEMETRY_ATTRIBUTES_FIELD_UPDATER.set(this, null);
@@ -501,6 +521,18 @@ public class Consumer {
         } catch (BrokerServiceException e) {
             log.warn().exception(e).log("Consumer was already closed");
         }
+    }
+
+    public boolean isGuardedSource() {
+        return resourceGuard != null;
+    }
+
+    public ValidatedTopicResourceGuard getResourceGuard() {
+        return resourceGuard;
+    }
+
+    public long getGuardedSourceConnectionGeneration() {
+        return guardedSourceConnectionGeneration;
     }
 
     public void doUnsubscribe(final long requestId, boolean force) {
