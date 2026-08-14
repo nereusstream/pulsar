@@ -662,6 +662,10 @@ public class PersistentTopicsBase extends AdminResource {
                     .log("properties is empty, ignore update");
             return CompletableFuture.completedFuture(null);
         }
+        if (containsResourceGuardProperty(properties.keySet())) {
+            return FutureUtil.failedFuture(new RestException(Status.FORBIDDEN,
+                    "nereus.resource.* properties may only be changed by the resource controller"));
+        }
         return validateTopicOperationAsync(topicName, TopicOperation.UPDATE_METADATA)
                 .thenCompose(__ -> validateTopicOwnershipAsync(topicName, authoritative))
                 .thenCompose(__ -> {
@@ -723,6 +727,10 @@ public class PersistentTopicsBase extends AdminResource {
     }
 
     protected CompletableFuture<Void> internalRemovePropertiesAsync(boolean authoritative, String key) {
+        if (key != null && key.startsWith("nereus.resource.")) {
+            return FutureUtil.failedFuture(new RestException(Status.FORBIDDEN,
+                    "nereus.resource.* properties may only be changed by the resource controller"));
+        }
         return validateTopicOperationAsync(topicName, TopicOperation.DELETE_METADATA)
                 .thenCompose(__ -> validateTopicOwnershipAsync(topicName, authoritative))
                 .thenCompose(__ -> {
@@ -779,6 +787,15 @@ public class PersistentTopicsBase extends AdminResource {
                     return null;
                 });
         return future;
+    }
+
+    private static boolean containsResourceGuardProperty(Iterable<String> keys) {
+        for (String key : keys) {
+            if (key != null && key.startsWith("nereus.resource.")) {
+                return true;
+            }
+        }
+        return false;
     }
 
     protected CompletableFuture<Void> internalCheckTopicExists(TopicName topicName) {

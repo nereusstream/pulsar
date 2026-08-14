@@ -31,6 +31,7 @@ import org.apache.pulsar.common.api.proto.CommandLookupTopicResponse;
 import org.apache.pulsar.common.api.proto.CommandTopicMigrated.ResourceType;
 import org.apache.pulsar.common.api.proto.ScalableConsumerAssignment;
 import org.apache.pulsar.common.api.proto.ServerError;
+import org.apache.pulsar.common.api.proto.TopicResourceGuardReceipt;
 import org.apache.pulsar.common.protocol.schema.SchemaVersion;
 import org.apache.pulsar.common.schema.SchemaInfo;
 
@@ -50,8 +51,28 @@ public interface PulsarCommandSender {
                                      SchemaVersion schemaVersion, Optional<Long> topicEpoch,
                                      boolean isProducerReady);
 
+    default void sendProducerSuccessResponse(long requestId, String producerName, long lastSequenceId,
+                                             SchemaVersion schemaVersion, Optional<Long> topicEpoch,
+                                             boolean isProducerReady,
+                                             Optional<org.apache.pulsar.client.api.TopicResourceGuardAttestation>
+                                                     guardAttestation) {
+        if (guardAttestation.isPresent()) {
+            throw new UnsupportedOperationException("guarded producer success is not supported by this sender");
+        }
+        sendProducerSuccessResponse(requestId, producerName, lastSequenceId, schemaVersion, topicEpoch,
+                isProducerReady);
+    }
+
     void sendSendReceiptResponse(long producerId, long sequenceId, long highestId, long ledgerId,
                                  long entryId);
+
+    default void sendSendReceiptResponse(long producerId, long sequenceId, long highestId, long ledgerId,
+                                         long entryId, TopicResourceGuardReceipt guardReceipt) {
+        if (guardReceipt != null) {
+            throw new UnsupportedOperationException("guarded send receipt is not supported by this sender");
+        }
+        sendSendReceiptResponse(producerId, sequenceId, highestId, ledgerId, entryId);
+    }
 
     void sendSendError(long producerId, long sequenceId, ServerError error, String errorMsg);
 

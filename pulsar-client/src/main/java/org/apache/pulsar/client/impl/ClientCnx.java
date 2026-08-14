@@ -57,6 +57,7 @@ import org.apache.pulsar.client.api.AuthenticationDataProvider;
 import org.apache.pulsar.client.api.PulsarClientException;
 import org.apache.pulsar.client.api.PulsarClientException.ConnectException;
 import org.apache.pulsar.client.api.PulsarClientException.TimeoutException;
+import org.apache.pulsar.client.api.TopicResourceGuardAttestation;
 import org.apache.pulsar.client.impl.BinaryProtoLookupService.LookupDataResult;
 import org.apache.pulsar.client.impl.conf.ClientConfigurationData;
 import org.apache.pulsar.client.impl.metrics.Counter;
@@ -563,7 +564,18 @@ public class ClientCnx extends PulsarHandler {
         }
 
         if (producer != null) {
-            producer.ackReceived(this, sequenceId, highestSequenceId, ledgerId, entryId);
+            if (producer.hasResourceGuard()) {
+                if (!sendReceipt.hasResourceGuardReceipt()) {
+                    producer.ackReceived(this, sequenceId, highestSequenceId, ledgerId, entryId,
+                            null, null, producer.getConnectionGeneration());
+                } else {
+                    producer.ackReceived(this, sequenceId, highestSequenceId, ledgerId, entryId,
+                            sendReceipt.getResourceGuardReceipt(), GuardedEvidenceUtils.sha256(sendReceipt),
+                            producer.getConnectionGeneration());
+                }
+            } else {
+                producer.ackReceived(this, sequenceId, highestSequenceId, ledgerId, entryId);
+            }
         } else {
                 log.debug().attr("producerId", producerId)
                         .attr("ledgerId", ledgerId)
@@ -677,7 +689,16 @@ public class ClientCnx extends PulsarHandler {
             ProducerResponse pr = new ProducerResponse(success.getProducerName(),
                     success.getLastSequenceId(),
                     success.getSchemaVersion(),
-                    success.hasTopicEpoch() ? Optional.of(success.getTopicEpoch()) : Optional.empty());
+                    success.hasTopicEpoch() ? Optional.of(success.getTopicEpoch()) : Optional.empty(),
+                    success.hasResourceGuardAttestation()
+                            ? Optional.of(new TopicResourceGuardAttestation(
+                                    success.getResourceGuardAttestation().getGuardVersion(),
+                                    success.getResourceGuardAttestation().getAuthenticatedClusterId(),
+                                    success.getResourceGuardAttestation().getResourceIncarnation(),
+                                    success.getResourceGuardAttestation().getTopicCreationTimestamp(),
+                                    success.getResourceGuardAttestation().getPhysicalTopic(),
+                                    success.getResourceGuardAttestation().getPartition()))
+                            : Optional.empty());
             requestFuture.complete(pr);
         } else {
             duplicatedResponseCounter.incrementAndGet();
@@ -875,6 +896,11 @@ public class ClientCnx extends PulsarHandler {
             break;
         case NotAllowedError:
             producer.recoverNotAllowedError(sequenceId, sendError.getMessage());
+            break;
+        case ResourceIncarnationMismatch:
+            producer.recoverResourceIncarnationMismatch(sequenceId, sendError.getMessage(),
+                    sendError.getError().getValue(), GuardedEvidenceUtils.sha256(sendError),
+                    producer.getConnectionGeneration());
             break;
         default:
             // don't close this ctx, otherwise it will close all consumers and producers which use this ctx
@@ -1722,6 +1748,8 @@ public class ClientCnx extends PulsarHandler {
             return new PulsarClientException.TransactionConflictException(errorMsg);
         case ProducerFenced:
             return new PulsarClientException.ProducerFencedException(errorMsg);
+        case ResourceIncarnationMismatch:
+            return new PulsarClientException.ResourceIncarnationMismatchException(errorMsg);
         case UnknownError:
         default:
             return new PulsarClientException(errorMsg);

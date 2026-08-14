@@ -586,7 +586,8 @@ public class PulsarClientImpl implements PulsarClient {
 
 
 
-        checkPartitions(topic, conf.isNonPartitionedTopicExpected(), conf.getProducerName()).thenAccept(partitions -> {
+        checkPartitions(topic, conf.isNonPartitionedTopicExpected() || conf.getTopicResourceGuard() != null,
+                conf.getProducerName()).thenAccept(partitions -> {
                 log.debug().attr("topic", topic)
                         .attr("partitions", partitions)
                         .log("Received topic metadata. partitions");

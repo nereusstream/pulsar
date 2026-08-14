@@ -59,6 +59,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -68,6 +69,8 @@ import java.util.function.Consumer;
 import org.apache.commons.lang3.StringUtils;
 import org.apache.pulsar.client.api.BatcherBuilder;
 import org.apache.pulsar.client.api.CompressionType;
+import org.apache.pulsar.client.api.GuardedSendErrorEvidence;
+import org.apache.pulsar.client.api.GuardedSendSuccessEvidence;
 import org.apache.pulsar.client.api.Message;
 import org.apache.pulsar.client.api.MessageCrypto;
 import org.apache.pulsar.client.api.MessageId;
@@ -79,6 +82,9 @@ import org.apache.pulsar.client.api.PulsarClientException.CryptoException;
 import org.apache.pulsar.client.api.PulsarClientException.IncompatibleSchemaException;
 import org.apache.pulsar.client.api.PulsarClientException.TimeoutException;
 import org.apache.pulsar.client.api.Schema;
+import org.apache.pulsar.client.api.TopicResourceGuard;
+import org.apache.pulsar.client.api.TopicResourceGuardAttestation;
+import org.apache.pulsar.client.api.TopicResourceGuardException;
 import org.apache.pulsar.client.api.transaction.Transaction;
 import org.apache.pulsar.client.impl.conf.ProducerConfigurationData;
 import org.apache.pulsar.client.impl.crypto.MessageCryptoBc;
@@ -169,6 +175,7 @@ public class ProducerImpl<T> extends ProducerBase<T> implements TimerTask, Conne
     private Optional<byte[]> schemaVersion = Optional.empty();
 
     private final ConnectionHandler connectionHandler;
+    private final TopicResourceGuard resourceGuard;
 
     // A batch flush task is scheduled when one of the following is true:
     // - A message is added to a message batch without also triggering a flush for that batch.
@@ -204,6 +211,7 @@ public class ProducerImpl<T> extends ProducerBase<T> implements TimerTask, Conne
                         CompletableFuture<Producer<T>> producerCreatedFuture, int partitionIndex, Schema<T> schema,
                         ProducerInterceptors interceptors, Optional<String> overrideProducerName) {
         super(client, topic, conf, producerCreatedFuture, schema, interceptors);
+        this.resourceGuard = conf.getTopicResourceGuard();
         this.producerId = client.newProducerId();
         this.producerName = conf.getProducerName();
         this.userProvidedProducerName = StringUtils.isNotBlank(producerName);
@@ -1348,6 +1356,12 @@ public class ProducerImpl<T> extends ProducerBase<T> implements TimerTask, Conne
     }
 
     protected void ackReceived(ClientCnx cnx, long sequenceId, long highestSequenceId, long ledgerId, long entryId) {
+        ackReceived(cnx, sequenceId, highestSequenceId, ledgerId, entryId, null, null, -1L);
+    }
+
+    protected void ackReceived(ClientCnx cnx, long sequenceId, long highestSequenceId, long ledgerId, long entryId,
+                               org.apache.pulsar.common.api.proto.TopicResourceGuardReceipt guardReceipt,
+                               byte[] responseCommandSha256, long connectionGeneration) {
         OpSendMsg op = null;
         synchronized (this) {
             op = pendingMessages.peek();
@@ -1357,6 +1371,17 @@ public class ProducerImpl<T> extends ProducerBase<T> implements TimerTask, Conne
                             .attr("highestSequenceId", highestSequenceId)
                             .log("Got ack for timed out msg");
                 return;
+            }
+
+            if (resourceGuard != null) {
+                if (guardReceipt == null || responseCommandSha256 == null
+                        || connectionGeneration != getConnectionGeneration()
+                        || cnx != cnx()
+                        || ledgerId < 0 || entryId < 0
+                        || !matchesGuardReceipt(guardReceipt)) {
+                    cnx.channel().close();
+                    return;
+                }
             }
 
             if (sequenceId > op.sequenceId) {
@@ -1404,7 +1429,23 @@ public class ProducerImpl<T> extends ProducerBase<T> implements TimerTask, Conne
 
         OpSendMsg finalOp = op;
         LAST_SEQ_ID_PUBLISHED_UPDATER.getAndUpdate(this, last -> Math.max(last, getHighestSequenceId(finalOp)));
-        op.setMessageId(ledgerId, entryId, partitionIndex);
+        if (resourceGuard != null) {
+            TopicResourceGuardAttestation attestation = new TopicResourceGuardAttestation(
+                    guardReceipt.getAttestation().getGuardVersion(),
+                    guardReceipt.getAttestation().getAuthenticatedClusterId(),
+                    guardReceipt.getAttestation().getResourceIncarnation(),
+                    guardReceipt.getAttestation().getTopicCreationTimestamp(),
+                    guardReceipt.getAttestation().getPhysicalTopic(),
+                    guardReceipt.getAttestation().getPartition());
+            GuardedSendSuccessEvidence evidence = new GuardedSendSuccessEvidence(
+                    22, connectionGeneration, producerId, sequenceId, attestation, ledgerId, entryId,
+                    guardReceipt.getBrokerEntryTimestamp(), GuardedEvidenceUtils.sha256(op.cmd),
+                    responseCommandSha256);
+            op.setGuardedMessageId(new GuardedMessageIdImpl(ledgerId, entryId, attestation.partition(), resourceGuard,
+                    attestation.physicalTopic(), guardReceipt.getBrokerEntryTimestamp(), evidence));
+        } else {
+            op.setMessageId(ledgerId, entryId, partitionIndex);
+        }
         if (op.totalChunks > 1) {
             if (op.chunkId == 0) {
                 op.chunkedMessageCtx.firstChunkMessageId = new MessageIdImpl(ledgerId, entryId, partitionIndex);
@@ -1434,6 +1475,32 @@ public class ProducerImpl<T> extends ProducerBase<T> implements TimerTask, Conne
 
     protected long getHighestSequenceId(OpSendMsg op) {
         return Math.max(op.highestSequenceId, op.sequenceId);
+    }
+
+    boolean hasResourceGuard() {
+        return resourceGuard != null;
+    }
+
+    long getConnectionGeneration() {
+        return connectionHandler.getEpoch();
+    }
+
+    private boolean matchesGuardReceipt(
+            org.apache.pulsar.common.api.proto.TopicResourceGuardReceipt guardReceipt) {
+        if (!guardReceipt.hasAttestation() || !guardReceipt.hasBrokerEntryTimestamp()
+                || guardReceipt.getBrokerEntryTimestamp() < 0) {
+            return false;
+        }
+        TopicResourceGuardAttestation actual = new TopicResourceGuardAttestation(
+                guardReceipt.getAttestation().getGuardVersion(),
+                guardReceipt.getAttestation().getAuthenticatedClusterId(),
+                guardReceipt.getAttestation().getResourceIncarnation(),
+                guardReceipt.getAttestation().getTopicCreationTimestamp(),
+                guardReceipt.getAttestation().getPhysicalTopic(),
+                guardReceipt.getAttestation().getPartition());
+        int expectedPartition = partitionIndex >= 0 ? partitionIndex
+                : Math.max(0, org.apache.pulsar.common.naming.TopicName.get(topic).getPartitionIndex());
+        return actual.equals(new TopicResourceGuardAttestation(resourceGuard, topic, expectedPartition));
     }
 
     protected void releaseSemaphoreForSendOp(OpSendMsg op) {
@@ -1523,6 +1590,35 @@ public class ProducerImpl<T> extends ProducerBase<T> implements TimerTask, Conne
             }
             ReferenceCountUtil.safeRelease(op.cmd);
             op.recycle();
+        }
+    }
+
+    protected synchronized void recoverResourceIncarnationMismatch(long sequenceId, String errorMsg,
+                                                                    int serverErrorCode,
+                                                                    byte[] responseCommandSha256,
+                                                                    long connectionGeneration) {
+        OpSendMsg op = pendingMessages.peek();
+        if (op != null && sequenceId == getHighestSequenceId(op)) {
+            pendingMessages.remove();
+            releaseSemaphoreForSendOp(op);
+            try {
+                GuardedSendErrorEvidence evidence = new GuardedSendErrorEvidence(
+                        22, connectionGeneration, producerId, sequenceId, serverErrorCode,
+                        GuardedEvidenceUtils.sha256(op.cmd), responseCommandSha256);
+                op.sendComplete(new TopicResourceGuardException(
+                        errorMsg, resourceGuard, Optional.of(evidence), true));
+            } catch (Throwable t) {
+                log.warn()
+                        .attr("msg", sequenceId)
+                        .exception(t)
+                        .log("Got exception while completing the guarded callback");
+            }
+            ReferenceCountUtil.safeRelease(op.cmd);
+            op.recycle();
+        }
+        ClientCnx currentCnx = cnx();
+        if (currentCnx != null) {
+            currentCnx.close();
         }
     }
 
@@ -1785,6 +1881,16 @@ public class ProducerImpl<T> extends ProducerBase<T> implements TimerTask, Conne
             }
         }
 
+        void setGuardedMessageId(GuardedMessageIdImpl messageId) {
+            if (msg != null) {
+                msg.setMessageId(messageId);
+            } else if (msgs.size() == 1) {
+                msgs.get(0).setMessageId(messageId);
+            } else {
+                throw new IllegalStateException("Guarded producer cannot complete a multi-message batch");
+            }
+        }
+
         void setMessageId(ChunkMessageIdImpl chunkMessageId) {
             if (msg != null) {
                 msg.setMessageId(chunkMessageId);
@@ -1931,6 +2037,11 @@ public class ProducerImpl<T> extends ProducerBase<T> implements TimerTask, Conne
 
     @Override
     public CompletableFuture<Void> connectionOpened(final ClientCnx cnx) {
+        if (resourceGuard != null && !Commands.peerSupportsTopicResourceGuard(
+                cnx.getRemoteEndpointProtocolVersion())) {
+            return FutureUtil.failedFuture(new PulsarClientException.UnsupportedVersionException(
+                    "Guarded producer requires broker protocol v22 or newer"));
+        }
         previousExceptionCount.set(0);
         getConnectionHandler().setMaxMessageSize(cnx.getMaxMessageSize());
         setChunkMaxMessageSize();
@@ -1994,8 +2105,13 @@ public class ProducerImpl<T> extends ProducerBase<T> implements TimerTask, Conne
                 Commands.newProducer(topic, producerId, requestId, producerName, conf.isEncryptionEnabled(), metadata,
                         schemaInfo, epoch, userProvidedProducerName,
                         conf.getAccessMode(), topicEpoch, client.conf.isEnableTransaction(),
-                        conf.getInitialSubscriptionName()),
+                        conf.getInitialSubscriptionName(), resourceGuard),
                 requestId).thenAccept(response -> {
+            if (resourceGuard != null && !isMatchingGuardAttestation(response.getResourceGuardAttestation())) {
+                throw new CompletionException(new TopicResourceGuardException(
+                        "Broker did not attest the expected topic resource guard",
+                        resourceGuard, Optional.empty(), true));
+            }
             String producerName = response.getProducerName();
             long lastSequenceId = response.getLastSequenceId();
             schemaVersion = Optional.ofNullable(response.getSchemaVersion());
@@ -2171,6 +2287,10 @@ public class ProducerImpl<T> extends ProducerBase<T> implements TimerTask, Conne
 
     @Override
     public boolean connectionFailed(PulsarClientException exception) {
+        if (resourceGuard != null
+                && exception instanceof PulsarClientException.ResourceIncarnationMismatchException) {
+            exception = new TopicResourceGuardException(exception.getMessage(), resourceGuard, Optional.empty(), true);
+        }
         boolean nonRetriableError = !PulsarClientException.isRetriableError(exception);
         boolean timeout = System.currentTimeMillis() > lookupDeadline;
         if (nonRetriableError || timeout) {
@@ -2199,6 +2319,16 @@ public class ProducerImpl<T> extends ProducerBase<T> implements TimerTask, Conne
             previousExceptionCount.incrementAndGet();
         }
         return true;
+    }
+
+    private boolean isMatchingGuardAttestation(Optional<TopicResourceGuardAttestation> actual) {
+        if (actual.isEmpty()) {
+            return false;
+        }
+        int expectedPartition = partitionIndex >= 0 ? partitionIndex : org.apache.pulsar.common.naming.TopicName
+                .get(topic).getPartitionIndex();
+        expectedPartition = Math.max(0, expectedPartition);
+        return actual.get().equals(new TopicResourceGuardAttestation(resourceGuard, topic, expectedPartition));
     }
 
     private void closeProducerTasks() {

@@ -2151,6 +2151,12 @@ public class ServerCnx extends PulsarHandler implements TransportCnx {
         checkArgument(state == State.Connected);
         final long producerId = cmdProducer.getProducerId();
         final long requestId = cmdProducer.getRequestId();
+        if (cmdProducer.hasResourceGuard()
+                && !Commands.peerSupportsTopicResourceGuard(getRemoteEndpointProtocolVersion())) {
+            commandSender.sendErrorResponse(requestId, ServerError.UnsupportedVersionError,
+                    "Guarded producer requires broker protocol v22 or newer");
+            return;
+        }
         // Use producer name provided by client if present
         final String producerName = cmdProducer.hasProducerName() ? cmdProducer.getProducerName()
                 : service.generateUniqueProducerName();
@@ -2230,7 +2236,8 @@ public class ServerCnx extends PulsarHandler implements TransportCnx {
                             .attr("producer", producer)
                             .log("Producer with the same id is already created:" + "producerId=, producer");
                     commandSender.sendProducerSuccessResponse(requestId, producer.getProducerName(),
-                            producer.getSchemaVersion());
+                            producer.getLastSequenceId(), producer.getSchemaVersion(), Optional.empty(), true,
+                            Optional.ofNullable(producer.getResourceGuardAttestation()));
                 }
                 return null;
             }
@@ -2243,6 +2250,25 @@ public class ServerCnx extends PulsarHandler implements TransportCnx {
                     .log("Creating producer");
 
             service.getOrCreateTopic(topicName.toString()).thenComposeAsync((Topic topic) -> {
+                final ValidatedTopicResourceGuard validatedResourceGuard;
+                if (cmdProducer.hasResourceGuard()) {
+                    if (!(topic instanceof PersistentTopic)) {
+                        commandSender.sendErrorResponse(requestId, ServerError.ResourceIncarnationMismatch,
+                                "A guarded producer requires a persistent topic");
+                        producers.remove(producerId, producerFuture);
+                        return CompletableFuture.completedFuture(null);
+                    }
+                    validatedResourceGuard = ((PersistentTopic) topic).getCurrentTopicResourceGuardView();
+                    if (!TopicResourceGuardValidator.matches(validatedResourceGuard,
+                            cmdProducer.getResourceGuard())) {
+                        commandSender.sendErrorResponse(requestId, ServerError.ResourceIncarnationMismatch,
+                                "The expected topic resource incarnation is not current");
+                        producers.remove(producerId, producerFuture);
+                        return CompletableFuture.completedFuture(null);
+                    }
+                } else {
+                    validatedResourceGuard = null;
+                }
                 // Check max producer limitation to avoid unnecessary ops wasting resources. For example: the new
                 // producer reached max producer limitation, but pulsar did schema check first, it would waste CPU
                 if (((AbstractTopic) topic).isProducersExceeded(producerName)) {
@@ -2364,7 +2390,8 @@ public class ServerCnx extends PulsarHandler implements TransportCnx {
 
                             buildProducerAndAddTopic(topic, producerId, producerName, requestId, isEncrypted,
                                     metadata, schemaVersion, epoch, userProvidedProducerName, topicName,
-                                    producerAccessMode, topicEpoch, supportsPartialProducer, producerFuture);
+                                    producerAccessMode, topicEpoch, supportsPartialProducer, validatedResourceGuard,
+                                    producerFuture);
                         }, ctx.executor());
                     }, ctx.executor());
                 }, ctx.executor());
@@ -2452,6 +2479,7 @@ public class ServerCnx extends PulsarHandler implements TransportCnx {
                              boolean userProvidedProducerName, TopicName topicName,
                              ProducerAccessMode producerAccessMode,
                              Optional<Long> topicEpoch, boolean supportsPartialProducer,
+                             ValidatedTopicResourceGuard resourceGuard,
                              CompletableFuture<Producer> producerFuture){
         if (producerFuture.isCompletedExceptionally()) {
             log.info()
@@ -2465,7 +2493,7 @@ public class ServerCnx extends PulsarHandler implements TransportCnx {
         CompletableFuture<Void> producerQueuedFuture = new CompletableFuture<>();
         Producer producer = new Producer(topic, ServerCnx.this, producerId, producerName,
                 getPrincipal(), isEncrypted, metadata, schemaVersion, epoch,
-                userProvidedProducerName, producerAccessMode, topicEpoch, supportsPartialProducer);
+                userProvidedProducerName, producerAccessMode, topicEpoch, supportsPartialProducer, resourceGuard);
 
         topic.addProducer(producer, producerQueuedFuture).thenAcceptAsync(newTopicEpoch -> {
             if (isActive()) {
@@ -2476,7 +2504,8 @@ public class ServerCnx extends PulsarHandler implements TransportCnx {
                             .log("Created new producer");
                     commandSender.sendProducerSuccessResponse(requestId, producerName,
                             producer.getLastSequenceId(), producer.getSchemaVersion(),
-                            newTopicEpoch, true /* producer is ready now */);
+                            newTopicEpoch, true /* producer is ready now */,
+                            Optional.ofNullable(producer.getResourceGuardAttestation()));
                     if (brokerInterceptor != null) {
                         try {
                             brokerInterceptor.producerCreated(this, producer, metadata);
@@ -2572,7 +2601,8 @@ public class ServerCnx extends PulsarHandler implements TransportCnx {
                         .log("Producer is waiting in queue");
                 commandSender.sendProducerSuccessResponse(requestId, producerName,
                         producer.getLastSequenceId(), producer.getSchemaVersion(),
-                        Optional.empty(), false/* producer is not ready now */);
+                        Optional.empty(), false/* producer is not ready now */,
+                        Optional.ofNullable(producer.getResourceGuardAttestation()));
                 if (brokerInterceptor != null) {
                     brokerInterceptor.
                             producerCreated(this, producer, metadata);
@@ -2602,6 +2632,17 @@ public class ServerCnx extends PulsarHandler implements TransportCnx {
         }
 
         Producer producer = producerFuture.getNow(null);
+        if (producer.hasResourceGuard() && !producer.validateResourceGuardNow()) {
+            commandSender.sendSendError(producer.getProducerId(), send.getSequenceId(),
+                    ServerError.ResourceIncarnationMismatch,
+                    "The guarded topic resource incarnation is no longer current");
+            return;
+        }
+        if (producer.hasResourceGuard() && send.hasTxnidMostBits() && send.hasTxnidLeastBits()) {
+            commandSender.sendSendError(producer.getProducerId(), send.getSequenceId(),
+                    ServerError.NotAllowedError, "Guarded producers do not support transaction sends");
+            return;
+        }
         printSendCommandDebug(send, headersAndPayload);
 
         // New messages are silently ignored during topic transfer. Note that the transferring flag is only set when the

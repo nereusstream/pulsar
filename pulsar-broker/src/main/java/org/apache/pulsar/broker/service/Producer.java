@@ -56,6 +56,7 @@ import org.apache.pulsar.common.api.proto.CommandTopicMigrated.ResourceType;
 import org.apache.pulsar.common.api.proto.MessageMetadata;
 import org.apache.pulsar.common.api.proto.ProducerAccessMode;
 import org.apache.pulsar.common.api.proto.ServerError;
+import org.apache.pulsar.common.api.proto.TopicResourceGuardReceipt;
 import org.apache.pulsar.common.naming.TopicName;
 import org.apache.pulsar.common.policies.data.ClusterPolicies.ClusterUrl;
 import org.apache.pulsar.common.policies.data.TopicOperation;
@@ -110,6 +111,7 @@ public class Producer {
     private final SchemaVersion schemaVersion;
     private final String clientAddress; // IP address only, no port number included
     private final AtomicBoolean isDisconnecting = new AtomicBoolean(false);
+    private final ValidatedTopicResourceGuard resourceGuard;
 
     public Producer(Topic topic, TransportCnx cnx, long producerId, String producerName, String appId,
             boolean isEncrypted, Map<String, String> metadata, SchemaVersion schemaVersion, long epoch,
@@ -117,6 +119,17 @@ public class Producer {
             ProducerAccessMode accessMode,
             Optional<Long> topicEpoch,
             boolean supportsPartialProducer) {
+        this(topic, cnx, producerId, producerName, appId, isEncrypted, metadata, schemaVersion, epoch,
+                userProvidedProducerName, accessMode, topicEpoch, supportsPartialProducer, null);
+    }
+
+    public Producer(Topic topic, TransportCnx cnx, long producerId, String producerName, String appId,
+            boolean isEncrypted, Map<String, String> metadata, SchemaVersion schemaVersion, long epoch,
+            boolean userProvidedProducerName,
+            ProducerAccessMode accessMode,
+            Optional<Long> topicEpoch,
+            boolean supportsPartialProducer,
+            ValidatedTopicResourceGuard resourceGuard) {
         final ServiceConfiguration serviceConf =  cnx.getBrokerService().pulsar().getConfiguration();
 
         this.topic = topic;
@@ -167,6 +180,7 @@ public class Producer {
         this.schemaVersion = schemaVersion;
         this.accessMode = accessMode;
         this.topicEpoch = topicEpoch;
+        this.resourceGuard = resourceGuard;
 
         this.clientAddress = cnx.clientSourceAddress();
         this.brokerInterceptor = cnx.getBrokerService().getInterceptor();
@@ -231,6 +245,15 @@ public class Producer {
 
     public boolean checkAndStartPublish(long producerId, long sequenceId, ByteBuf headersAndPayload, int batchSize,
                                         Position position) {
+        if (resourceGuard != null && !validateResourceGuardNow()) {
+            cnx.execute(() -> {
+                cnx.getCommandSender().sendSendError(producerId, sequenceId,
+                        ServerError.ResourceIncarnationMismatch,
+                        "The guarded topic resource incarnation is no longer current");
+                cnx.completedSendOperation(isNonPersistentTopic, headersAndPayload.readableBytes());
+            });
+            return false;
+        }
         if (!isShadowTopic && position != null) {
             cnx.execute(() -> {
                 cnx.getCommandSender().sendSendError(producerId, sequenceId, ServerError.NotAllowedError,
@@ -414,6 +437,13 @@ public class Producer {
         private long entryTimestamp;
 
         @Override
+        public void setMetadataFromEntryData(ByteBuf entryData) {
+            entryTimestamp = Commands.peekBrokerEntryMetadataToLong(entryData, brokerEntryMetadata ->
+                    brokerEntryMetadata != null && brokerEntryMetadata.hasBrokerTimestamp()
+                            ? brokerEntryMetadata.getBrokerTimestamp() : -1L);
+        }
+
+        @Override
         public long getLedgerId() {
             return ledgerId;
         }
@@ -563,6 +593,18 @@ public class Producer {
             // stats
             producer.stats.recordMsgIn(batchSize, msgSize);
             producer.topic.recordAddLatency(System.nanoTime() - startTimeNs, TimeUnit.NANOSECONDS);
+            if (producer.resourceGuard != null && entryTimestamp < 0) {
+                producer.cnx.getCommandSender().sendSendError(producer.producerId, sequenceId,
+                        ServerError.PersistenceError,
+                        "Guarded publish requires broker entry timestamp metadata");
+                producer.cnx.completedSendOperation(producer.isNonPersistentTopic, msgSize);
+                producer.publishOperationCompleted();
+                if (producer.cnx instanceof ServerCnx) {
+                    ((ServerCnx) producer.cnx).close();
+                }
+                recycle();
+                return;
+            }
             if (producer.isRemoteOrShadow && producer.isSupportsReplDedupByLidAndEid()) {
                 sendSendReceiptResponseRepl();
             } else {
@@ -615,7 +657,20 @@ public class Producer {
 
         private void sendSendReceiptResponseNormal() {
             producer.cnx.getCommandSender().sendSendReceiptResponse(producer.producerId, sequenceId, highestSequenceId,
-                    ledgerId, entryId);
+                    ledgerId, entryId, producer.resourceGuard == null ? null : createGuardReceipt());
+        }
+
+        private TopicResourceGuardReceipt createGuardReceipt() {
+            TopicResourceGuardReceipt receipt = new TopicResourceGuardReceipt();
+            receipt.setAttestation()
+                    .setGuardVersion(producer.resourceGuard.attestation().guardVersion())
+                    .setAuthenticatedClusterId(producer.resourceGuard.attestation().authenticatedClusterId())
+                    .setResourceIncarnation(producer.resourceGuard.attestation().resourceIncarnation())
+                    .setTopicCreationTimestamp(producer.resourceGuard.attestation().topicCreationTimestamp())
+                    .setPhysicalTopic(producer.resourceGuard.attestation().physicalTopic())
+                    .setPartition(producer.resourceGuard.attestation().partition());
+            receipt.setBrokerEntryTimestamp(entryTimestamp);
+            return receipt;
         }
 
         static MessagePublishContext get(Producer producer, long sequenceId, int msgSize, int batchSize,
@@ -634,6 +689,7 @@ public class Producer {
             callback.supportsReplDedupByLidAndEid = supportsReplDedupByLidAndEid;
             callback.ledgerId = position == null ? -1 : position.getLedgerId();
             callback.entryId = position == null ? -1 : position.getEntryId();
+            callback.entryTimestamp = -1L;
             if (callback.propertyMap != null) {
                 callback.propertyMap.clear();
             }
@@ -657,6 +713,7 @@ public class Producer {
             callback.supportsReplDedupByLidAndEid = supportsReplDedupByLidAndEid;
             callback.ledgerId = position == null ? -1 : position.getLedgerId();
             callback.entryId = position == null ? -1 : position.getEntryId();
+            callback.entryTimestamp = -1L;
             if (callback.propertyMap != null) {
                 callback.propertyMap.clear();
             }
@@ -699,6 +756,7 @@ public class Producer {
             msgSize = 0;
             ledgerId = -1L;
             entryId = -1L;
+            entryTimestamp = -1L;
             batchSize = 0;
             startTimeNs = -1L;
             chunked = false;
@@ -712,6 +770,20 @@ public class Producer {
 
     public Topic getTopic() {
         return topic;
+    }
+
+    public boolean hasResourceGuard() {
+        return resourceGuard != null;
+    }
+
+    public boolean validateResourceGuardNow() {
+        return resourceGuard != null
+                && topic instanceof PersistentTopic
+                && resourceGuard.sameIdentity(((PersistentTopic) topic).getCurrentTopicResourceGuardView());
+    }
+
+    public org.apache.pulsar.client.api.TopicResourceGuardAttestation getResourceGuardAttestation() {
+        return resourceGuard == null ? null : resourceGuard.attestation();
     }
 
     public String getProducerName() {

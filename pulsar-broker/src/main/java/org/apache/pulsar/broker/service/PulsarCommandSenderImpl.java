@@ -110,10 +110,34 @@ public class PulsarCommandSenderImpl implements PulsarCommandSender {
     }
 
     @Override
+    public void sendProducerSuccessResponse(long requestId, String producerName, long lastSequenceId,
+                                            SchemaVersion schemaVersion, Optional<Long> topicEpoch,
+                                            boolean isProducerReady,
+                                            Optional<org.apache.pulsar.client.api.TopicResourceGuardAttestation>
+                                                    guardAttestation) {
+        BaseCommand command = Commands.newProducerSuccessCommand(requestId, producerName, lastSequenceId,
+                schemaVersion, topicEpoch, isProducerReady, guardAttestation);
+        safeIntercept(command, cnx);
+        ByteBuf outBuf = Commands.serializeWithSize(command);
+        writeAndFlush(outBuf);
+    }
+
+    @Override
     public void sendSendReceiptResponse(long producerId, long sequenceId, long highestId, long ledgerId,
                                         long entryId) {
         BaseCommand command = Commands.newSendReceiptCommand(producerId, sequenceId, highestId, ledgerId,
                 entryId);
+        safeIntercept(command, cnx);
+        ByteBuf outBuf = Commands.serializeWithSize(command);
+        writeAndFlush(outBuf);
+    }
+
+    @Override
+    public void sendSendReceiptResponse(long producerId, long sequenceId, long highestId, long ledgerId,
+                                        long entryId, org.apache.pulsar.common.api.proto.TopicResourceGuardReceipt
+                                                guardReceipt) {
+        BaseCommand command = Commands.newSendReceiptCommand(producerId, sequenceId, highestId, ledgerId, entryId,
+                guardReceipt);
         safeIntercept(command, cnx);
         ByteBuf outBuf = Commands.serializeWithSize(command);
         writeAndFlush(outBuf);

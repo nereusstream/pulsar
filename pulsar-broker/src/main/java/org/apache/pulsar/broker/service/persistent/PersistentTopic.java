@@ -136,7 +136,9 @@ import org.apache.pulsar.broker.service.Subscription;
 import org.apache.pulsar.broker.service.SubscriptionOption;
 import org.apache.pulsar.broker.service.Topic;
 import org.apache.pulsar.broker.service.TopicPoliciesService;
+import org.apache.pulsar.broker.service.TopicResourceGuardValidator;
 import org.apache.pulsar.broker.service.TransportCnx;
+import org.apache.pulsar.broker.service.ValidatedTopicResourceGuard;
 import org.apache.pulsar.broker.service.schema.BookkeeperSchemaStorage;
 import org.apache.pulsar.broker.service.schema.exceptions.IncompatibleSchemaException;
 import org.apache.pulsar.broker.service.schema.exceptions.NotExistSchemaException;
@@ -217,6 +219,7 @@ public class PersistentTopic extends AbstractTopic implements Topic, AddEntryCal
 
     // Managed ledger associated with the topic
     protected final ManagedLedger ledger;
+    private final AtomicReference<ValidatedTopicResourceGuard> currentTopicResourceGuardView;
 
     // Subscriptions to this topic
     private final Map<String, PersistentSubscription> subscriptions = new ConcurrentHashMap<>();
@@ -416,6 +419,8 @@ public class PersistentTopic extends AbstractTopic implements Topic, AddEntryCal
                 ? brokerService.getTopicOrderedExecutor().chooseThread(topic)
                 : null;
         this.ledger = ledger;
+        this.currentTopicResourceGuardView = new AtomicReference<>(TopicResourceGuardValidator.load(this,
+                brokerService.pulsar().getConfiguration().getClusterName()));
         this.backloggedCursorThresholdEntries =
                 brokerService.pulsar().getConfiguration().getManagedLedgerCursorBackloggedThreshold();
         this.messageDeduplication = new MessageDeduplication(brokerService.pulsar(), this, ledger);
@@ -453,6 +458,8 @@ public class PersistentTopic extends AbstractTopic implements Topic, AddEntryCal
                 ? brokerService.getTopicOrderedExecutor().chooseThread(topic)
                 : null;
         this.ledger = ledger;
+        this.currentTopicResourceGuardView = new AtomicReference<>(TopicResourceGuardValidator.load(this,
+                brokerService.pulsar().getConfiguration().getClusterName()));
         this.messageDeduplication = messageDeduplication;
         this.backloggedCursorThresholdEntries =
                 brokerService.pulsar().getConfiguration().getManagedLedgerCursorBackloggedThreshold();
@@ -2685,6 +2692,90 @@ public class PersistentTopic extends AbstractTopic implements Topic, AddEntryCal
 
     public ManagedLedger getManagedLedger() {
         return ledger;
+    }
+
+    /** Returns the one immutable resource guard view used by guarded SEND hot paths. */
+    public ValidatedTopicResourceGuard getCurrentTopicResourceGuardView() {
+        return currentTopicResourceGuardView.get();
+    }
+
+    /** Invalidates the guard before an externally coordinated property update. */
+    public void invalidateTopicResourceGuardView(String reason) {
+        currentTopicResourceGuardView.set(ValidatedTopicResourceGuard.invalid(reason));
+        producers.values().forEach(producer -> {
+            if (producer.hasResourceGuard()) {
+                producer.disconnect();
+            }
+        });
+    }
+
+    /** Publishes a complete, strictly parsed resource property tuple. */
+    public void publishTopicResourceGuardView() {
+        ValidatedTopicResourceGuard view = TopicResourceGuardValidator.load(this,
+                getBrokerService().pulsar().getConfiguration().getClusterName());
+        if (view.isValid()) {
+            currentTopicResourceGuardView.set(view);
+        } else {
+            invalidateTopicResourceGuardView(view.reason());
+        }
+    }
+
+    /**
+     * Applies one complete resource-controller guard tuple and publishes it only after the
+     * managed-ledger update has succeeded and the resulting properties pass strict validation.
+     * Generic admin metadata APIs intentionally do not call this method.
+     */
+    public CompletableFuture<Void> updateTopicResourceGuardProperties(Map<String, String> properties) {
+        Set<String> requiredKeys = Set.of(ValidatedTopicResourceGuard.VERSION_PROPERTY,
+                ValidatedTopicResourceGuard.INCARNATION_PROPERTY,
+                ValidatedTopicResourceGuard.CREATED_AT_PROPERTY);
+        if (properties == null || !properties.keySet().equals(requiredKeys)) {
+            return FutureUtil.failedFuture(new IllegalArgumentException(
+                    "resource controller must provide the complete resource guard property tuple"));
+        }
+
+        Map<String, String> update = new HashMap<>(properties);
+        CompletableFuture<Void> result = new CompletableFuture<>();
+        executeOnTopicOrderedExecutor(() -> {
+            invalidateTopicResourceGuardView("resource guard update in progress");
+            ledger.asyncSetProperties(update, new UpdatePropertiesCallback() {
+                @Override
+                public void updatePropertiesComplete(Map<String, String> ignored, Object ctx) {
+                    executeOnTopicOrderedExecutor(() -> {
+                        ValidatedTopicResourceGuard view = TopicResourceGuardValidator.load(PersistentTopic.this,
+                                getBrokerService().pulsar().getConfiguration().getClusterName());
+                        if (!view.isValid()) {
+                            invalidateTopicResourceGuardView(view.reason());
+                            result.completeExceptionally(new IllegalArgumentException(view.reason()));
+                        } else {
+                            currentTopicResourceGuardView.set(view);
+                            result.complete(null);
+                        }
+                    }, result);
+                }
+
+                @Override
+                public void updatePropertiesFailed(ManagedLedgerException exception, Object ctx) {
+                    executeOnTopicOrderedExecutor(() -> {
+                        invalidateTopicResourceGuardView("resource guard update failed: " + exception.getMessage());
+                        result.completeExceptionally(exception);
+                    }, result);
+                }
+            }, null);
+        }, result);
+        return result;
+    }
+
+    private void executeOnTopicOrderedExecutor(Runnable task, CompletableFuture<Void> result) {
+        try {
+            if (orderedExecutor == null) {
+                task.run();
+            } else {
+                orderedExecutor.execute(task);
+            }
+        } catch (RuntimeException e) {
+            result.completeExceptionally(e);
+        }
     }
 
     @Override
