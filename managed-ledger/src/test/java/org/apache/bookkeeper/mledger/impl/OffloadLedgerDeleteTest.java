@@ -319,7 +319,7 @@ public class OffloadLedgerDeleteTest extends MockedBookKeeperTestCase {
         LedgerInfo intent = new LedgerInfo();
         intent.copyFrom(completed);
         intent.setOffloadContext()
-                .setBookkeeperDeleted(false)
+                .setBookkeeperDeleted(true)
                 .setBookkeeperDeleteState(BookKeeperDeleteState.BK_DELETE_INTENT);
         ledger.ledgers.put(firstLedgerId, intent);
 
@@ -333,6 +333,60 @@ public class OffloadLedgerDeleteTest extends MockedBookKeeperTestCase {
         Assert.assertTrue(done.isBookkeeperDeleted());
         Assert.assertEquals(offloader.revalidations.get(), 0);
         Assert.assertFalse(bkc.getLedgers().contains(firstLedgerId));
+    }
+
+    @Test
+    public void testSourceSafeDeleteEligibilityRequiresConsistentCompatibilityFence() throws Exception {
+        MockSourceSafeLedgerOffloader offloader =
+                new MockSourceSafeLedgerOffloader(SourceSafeLedgerOffloader.RetentionClass.DELETE_AFTER_VERIFIED);
+        ManagedLedgerImpl ledger =
+                (ManagedLedgerImpl) factory.open("source-safe-delete-eligibility", sourceSafeConfig(offloader));
+        long timestamp = ledger.getConfig().getClock().millis() - 1;
+
+        OffloadContext context = new OffloadContext()
+                .setTimestamp(timestamp)
+                .setComplete(true)
+                .setBookkeeperRetentionClass(BookKeeperRetentionClass.DELETE_AFTER_VERIFIED)
+                .setBookkeeperDeleteState(BookKeeperDeleteState.BK_DELETE_NONE)
+                .setBookkeeperDeleted(false);
+        Assert.assertTrue(ledger.isOffloadedNeedsDelete(context, Optional.of(offloader.getOffloadPolicies())));
+
+        context.setBookkeeperDeleteState(BookKeeperDeleteState.BK_DELETE_INTENT).setBookkeeperDeleted(true);
+        Assert.assertTrue(ledger.isOffloadedNeedsDelete(context, Optional.of(offloader.getOffloadPolicies())));
+
+        context.setBookkeeperDeleteState(BookKeeperDeleteState.BK_DELETE_DONE).setBookkeeperDeleted(true);
+        Assert.assertFalse(ledger.isOffloadedNeedsDelete(context, Optional.of(offloader.getOffloadPolicies())));
+
+        context.setBookkeeperDeleteState(BookKeeperDeleteState.BK_DELETE_NONE).setBookkeeperDeleted(true);
+        Assert.assertFalse(ledger.isOffloadedNeedsDelete(context, Optional.of(offloader.getOffloadPolicies())));
+
+        context.setBookkeeperDeleteState(BookKeeperDeleteState.BK_DELETE_INTENT).setBookkeeperDeleted(false);
+        Assert.assertFalse(ledger.isOffloadedNeedsDelete(context, Optional.of(offloader.getOffloadPolicies())));
+    }
+
+    @Test
+    public void testSourceSafeDeleteCompletesBeforeLogicalRetentionTrim() throws Exception {
+        MockSourceSafeLedgerOffloader offloader =
+                new MockSourceSafeLedgerOffloader(SourceSafeLedgerOffloader.RetentionClass.DELETE_AFTER_VERIFIED);
+        ManagedLedgerConfig config = sourceSafeConfig(offloader).setRetentionTime(0, TimeUnit.MILLISECONDS);
+        MockClock clock = (MockClock) config.getClock();
+        ManagedLedgerImpl ledger = (ManagedLedgerImpl) factory.open("source-safe-full-trim", config);
+        long firstLedgerId = writeAndOffloadFirstLedger(ledger);
+
+        clock.advance(1, TimeUnit.SECONDS);
+        CompletableFuture<Void> firstTrim = new CompletableFuture<>();
+        ledger.internalTrimConsumedLedgers(firstTrim);
+        firstTrim.join();
+
+        OffloadContext done = ledger.getLedgerInfo(firstLedgerId).join().getOffloadContext();
+        Assert.assertEquals(done.getBookkeeperDeleteState(), BookKeeperDeleteState.BK_DELETE_DONE);
+        Assert.assertTrue(done.isBookkeeperDeleted());
+        Assert.assertFalse(bkc.getLedgers().contains(firstLedgerId));
+
+        CompletableFuture<Void> secondTrim = new CompletableFuture<>();
+        ledger.internalTrimConsumedLedgers(secondTrim);
+        secondTrim.join();
+        Assert.assertNull(ledger.getLedgerInfo(firstLedgerId).join());
     }
 
     private static ManagedLedgerConfig sourceSafeConfig(MockSourceSafeLedgerOffloader offloader) {

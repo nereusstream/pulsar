@@ -2331,6 +2331,12 @@ public class ManagedLedgerImpl implements ManagedLedger, CreateCallback {
         long metadataVersion = ledgersStat == null ? 0 : ledgersStat.getVersion();
         OffloadReadSourceState.BookKeeperDeleteState deleteState;
         if (context.hasBookkeeperDeleteState()) {
+            boolean expectedCompatibilityFence =
+                    context.getBookkeeperDeleteState() != BookKeeperDeleteState.BK_DELETE_NONE;
+            if (context.isBookkeeperDeleted() != expectedCompatibilityFence) {
+                throw new IllegalStateException(
+                        "inconsistent BookKeeper delete state and compatibility fence during source selection");
+            }
             deleteState = switch (context.getBookkeeperDeleteState()) {
                 case BK_DELETE_NONE -> OffloadReadSourceState.BookKeeperDeleteState.NONE;
                 case BK_DELETE_INTENT -> OffloadReadSourceState.BookKeeperDeleteState.INTENT;
@@ -3075,6 +3081,10 @@ public class ManagedLedgerImpl implements ManagedLedger, CreateCallback {
         if (!offload.hasBookkeeperRetentionClass() && !offload.hasBookkeeperDeleteState()) {
             return !offload.isBookkeeperDeleted();
         }
+        boolean consistentPendingState = offload.getBookkeeperDeleteState() == BookKeeperDeleteState.BK_DELETE_NONE
+                ? !offload.isBookkeeperDeleted()
+                : offload.getBookkeeperDeleteState() == BookKeeperDeleteState.BK_DELETE_INTENT
+                        && offload.isBookkeeperDeleted();
         return config.getLedgerOffloader() instanceof SourceSafeLedgerOffloader sourceSafeOffloader
                 && sourceSafeOffloader.getBookKeeperRetentionClass()
                         == SourceSafeLedgerOffloader.RetentionClass.DELETE_AFTER_VERIFIED
@@ -3082,13 +3092,21 @@ public class ManagedLedgerImpl implements ManagedLedger, CreateCallback {
                 && offload.getBookkeeperRetentionClass() == BookKeeperRetentionClass.DELETE_AFTER_VERIFIED
                 && offload.hasBookkeeperDeleteState()
                 && offload.getBookkeeperDeleteState() != BookKeeperDeleteState.BK_DELETE_DONE
-                && !offload.isBookkeeperDeleted();
+                && consistentPendingState;
     }
 
     private static boolean isSourceSafeBookKeeperDeletion(LedgerInfo info) {
         return info.hasOffloadContext()
                 && info.getOffloadContext().hasBookkeeperRetentionClass()
                 && info.getOffloadContext().hasBookkeeperDeleteState();
+    }
+
+    private static boolean requiresSourceSafeBookKeeperDeletion(LedgerInfo info) {
+        return isSourceSafeBookKeeperDeletion(info)
+                && info.getOffloadContext().getBookkeeperRetentionClass()
+                        == BookKeeperRetentionClass.DELETE_AFTER_VERIFIED
+                && info.getOffloadContext().getBookkeeperDeleteState()
+                        != BookKeeperDeleteState.BK_DELETE_DONE;
     }
 
     /**
@@ -3320,6 +3338,17 @@ public class ManagedLedgerImpl implements ManagedLedger, CreateCallback {
                 return;
             }
 
+            Iterator<LedgerInfo> pendingSourceSafeDeletes = ledgersToDelete.iterator();
+            while (pendingSourceSafeDeletes.hasNext()) {
+                LedgerInfo info = pendingSourceSafeDeletes.next();
+                if (requiresSourceSafeBookKeeperDeletion(info)) {
+                    pendingSourceSafeDeletes.remove();
+                    if (!offloadedLedgersToDelete.contains(info)) {
+                        offloadedLedgersToDelete.add(info);
+                    }
+                }
+            }
+
             doDeleteLedgers(ledgersToDelete);
 
             for (LedgerInfo ls : offloadedLedgersToDelete) {
@@ -3358,10 +3387,15 @@ public class ManagedLedgerImpl implements ManagedLedger, CreateCallback {
                         log.info().attr("ledgerId", ls.getLedgerId())
                                 .attr("size", ls.getSize())
                                 .log("Deleting offloaded ledger from bookkeeper");
-                        if (isSourceSafeBookKeeperDeletion(ls)
-                                && config.getLedgerOffloader()
-                                        instanceof SourceSafeLedgerOffloader sourceSafeOffloader) {
-                            sourceSafeDeletes.add(deleteSourceSafeLedgerFromBookKeeper(ls, sourceSafeOffloader));
+                        if (isSourceSafeBookKeeperDeletion(ls)) {
+                            if (config.getLedgerOffloader()
+                                    instanceof SourceSafeLedgerOffloader sourceSafeOffloader) {
+                                sourceSafeDeletes.add(deleteSourceSafeLedgerFromBookKeeper(ls, sourceSafeOffloader));
+                            } else {
+                                sourceSafeDeletes.add(CompletableFuture.failedFuture(new OffloadConflict(
+                                        "Source-safe BookKeeper deletion rejected missing native provider for ledger "
+                                                + ls.getLedgerId())));
+                            }
                             continue;
                         }
                         invalidateReadHandle(ls.getLedgerId());
@@ -3614,6 +3648,10 @@ public class ManagedLedgerImpl implements ManagedLedger, CreateCallback {
             LedgerInfo info, SourceSafeLedgerOffloader offloader) {
         long ledgerId = info.getLedgerId();
         OffloadContext context = info.getOffloadContext();
+        boolean compatibleDeleteState = context.getBookkeeperDeleteState() == BookKeeperDeleteState.BK_DELETE_NONE
+                ? !context.isBookkeeperDeleted()
+                : context.getBookkeeperDeleteState() == BookKeeperDeleteState.BK_DELETE_INTENT
+                        && context.isBookkeeperDeleted();
         if (!context.isComplete()
                 || !context.hasUidMsb()
                 || !context.hasUidLsb()
@@ -3621,7 +3659,8 @@ public class ManagedLedgerImpl implements ManagedLedger, CreateCallback {
                 || !context.getDriverMetadata().hasName()
                 || !Objects.equals(context.getDriverMetadata().getName(), offloader.getOffloadDriverName())
                 || (context.getBookkeeperDeleteState() != BookKeeperDeleteState.BK_DELETE_NONE
-                        && context.getBookkeeperDeleteState() != BookKeeperDeleteState.BK_DELETE_INTENT)) {
+                        && context.getBookkeeperDeleteState() != BookKeeperDeleteState.BK_DELETE_INTENT)
+                || !compatibleDeleteState) {
             return CompletableFuture.failedFuture(new OffloadConflict(
                     "Source-safe BookKeeper deletion rejected incomplete or mismatched offload metadata for ledger "
                             + ledgerId));
@@ -3738,7 +3777,7 @@ public class ManagedLedgerImpl implements ManagedLedger, CreateCallback {
             LedgerInfo newInfo = new LedgerInfo();
             newInfo.copyFrom(oldInfo);
             newInfo.setOffloadContext()
-                    .setBookkeeperDeleted(false)
+                    .setBookkeeperDeleted(true)
                     .setBookkeeperDeleteState(BookKeeperDeleteState.BK_DELETE_INTENT);
             return newInfo;
         });
@@ -3763,6 +3802,7 @@ public class ManagedLedgerImpl implements ManagedLedger, CreateCallback {
             BookKeeperDeleteState expectedState,
             String transition) throws OffloadConflict {
         OffloadContext context = info.getOffloadContext();
+        boolean expectedCompatibilityFence = expectedState != BookKeeperDeleteState.BK_DELETE_NONE;
         if (!context.isComplete()
                 || !context.hasUidMsb()
                 || !context.hasUidLsb()
@@ -3771,7 +3811,7 @@ public class ManagedLedgerImpl implements ManagedLedger, CreateCallback {
                 || context.getBookkeeperRetentionClass() != BookKeeperRetentionClass.DELETE_AFTER_VERIFIED
                 || !context.hasBookkeeperDeleteState()
                 || context.getBookkeeperDeleteState() != expectedState
-                || context.isBookkeeperDeleted()) {
+                || context.isBookkeeperDeleted() != expectedCompatibilityFence) {
             throw new OffloadConflict("Source-safe " + transition
                     + " rejected stale or ineligible metadata for ledger " + info.getLedgerId());
         }
