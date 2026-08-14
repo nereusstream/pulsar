@@ -52,6 +52,7 @@ import java.nio.ByteBuffer;
 import java.time.Duration;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.Iterator;
@@ -2109,7 +2110,9 @@ public class ProducerImpl<T> extends ProducerBase<T> implements TimerTask, Conne
                 requestId).thenAccept(response -> {
             if (resourceGuard != null && !isMatchingGuardAttestation(response.getResourceGuardAttestation())) {
                 throw new CompletionException(new TopicResourceGuardException(
-                        "Broker did not attest the expected topic resource guard",
+                        "Broker did not attest the expected topic resource guard: expected="
+                                + describeGuard(resourceGuard, topic, partitionIndex)
+                                + ", actual=" + describeGuard(response.getResourceGuardAttestation()),
                         resourceGuard, Optional.empty(), true));
             }
             String producerName = response.getProducerName();
@@ -2160,6 +2163,12 @@ public class ProducerImpl<T> extends ProducerBase<T> implements TimerTask, Conne
             future.complete(null);
         }).exceptionally((e) -> {
             Throwable cause = e.getCause();
+            if (resourceGuard != null
+                    && cause instanceof PulsarClientException.ResourceIncarnationMismatchException) {
+                cause = new TopicResourceGuardException(cause.getMessage(), resourceGuard,
+                        Optional.empty(), true);
+            }
+            final Throwable failureCause = cause;
             cnx.removeProducer(producerId);
             State state = getState();
             if (state == State.Closing || state == State.Closed) {
@@ -2175,7 +2184,7 @@ public class ProducerImpl<T> extends ProducerBase<T> implements TimerTask, Conne
                     && !autoProduceBytesSchema.hasUserProvidedSchema()) {
                 client.reloadSchemaForAutoProduceProducer(topic, autoProduceBytesSchema)
                     .whenComplete((__, throwable) -> {
-                        future.completeExceptionally(cause);
+                        future.completeExceptionally(failureCause);
                     });
                 return null;
             }
@@ -2329,6 +2338,22 @@ public class ProducerImpl<T> extends ProducerBase<T> implements TimerTask, Conne
                 .get(topic).getPartitionIndex();
         expectedPartition = Math.max(0, expectedPartition);
         return actual.get().equals(new TopicResourceGuardAttestation(resourceGuard, topic, expectedPartition));
+    }
+
+    private static String describeGuard(TopicResourceGuard guard, String topic, int partitionIndex) {
+        int partition = partitionIndex >= 0 ? partitionIndex : TopicName.get(topic).getPartitionIndex();
+        return "cluster=" + guard.authenticatedClusterId()
+                + ",incarnationHash=" + Arrays.hashCode(guard.resourceIncarnation())
+                + ",createdAt=" + Long.toUnsignedString(guard.topicCreationTimestamp())
+                + ",physicalTopic=" + topic + ",partition=" + Math.max(0, partition);
+    }
+
+    private static String describeGuard(Optional<TopicResourceGuardAttestation> actual) {
+        return actual.map(attestation -> "cluster=" + attestation.authenticatedClusterId()
+                + ",incarnationHash=" + Arrays.hashCode(attestation.resourceIncarnation())
+                + ",createdAt=" + Long.toUnsignedString(attestation.topicCreationTimestamp())
+                + ",physicalTopic=" + attestation.physicalTopic()
+                + ",partition=" + attestation.partition()).orElse("absent");
     }
 
     private void closeProducerTasks() {

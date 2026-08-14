@@ -1186,6 +1186,8 @@ public class PulsarClientException extends IOException {
                 || t instanceof ConsumerAssignException
                 || t instanceof MessageAcknowledgeException
                 || t instanceof TransactionConflictException
+                || t instanceof ResourceIncarnationMismatchException
+                || t instanceof TopicResourceGuardException
                 || t instanceof ProducerBusyException
                 || t instanceof ConsumerBusyException
                 || t instanceof TransactionHasOperationFailedException) {

@@ -165,6 +165,7 @@ import org.apache.pulsar.common.api.proto.ProtocolVersion;
 import org.apache.pulsar.common.api.proto.ScalableConsumerType;
 import org.apache.pulsar.common.api.proto.Schema;
 import org.apache.pulsar.common.api.proto.ServerError;
+import org.apache.pulsar.common.api.proto.TopicResourceGuard;
 import org.apache.pulsar.common.api.proto.TxnAction;
 import org.apache.pulsar.common.configuration.anonymizer.DefaultAuthenticationRoleLoggingAnonymizer;
 import org.apache.pulsar.common.intercept.InterceptException;
@@ -2157,6 +2158,9 @@ public class ServerCnx extends PulsarHandler implements TransportCnx {
                     "Guarded producer requires broker protocol v22 or newer");
             return;
         }
+        final boolean guardedRequest = cmdProducer.hasResourceGuard();
+        final TopicResourceGuard requestedResourceGuard = guardedRequest
+                ? new TopicResourceGuard().copyFrom(cmdProducer.getResourceGuard()) : null;
         // Use producer name provided by client if present
         final String producerName = cmdProducer.hasProducerName() ? cmdProducer.getProducerName()
                 : service.generateUniqueProducerName();
@@ -2251,7 +2255,7 @@ public class ServerCnx extends PulsarHandler implements TransportCnx {
 
             service.getOrCreateTopic(topicName.toString()).thenComposeAsync((Topic topic) -> {
                 final ValidatedTopicResourceGuard validatedResourceGuard;
-                if (cmdProducer.hasResourceGuard()) {
+                if (guardedRequest) {
                     if (!(topic instanceof PersistentTopic)) {
                         commandSender.sendErrorResponse(requestId, ServerError.ResourceIncarnationMismatch,
                                 "A guarded producer requires a persistent topic");
@@ -2260,7 +2264,7 @@ public class ServerCnx extends PulsarHandler implements TransportCnx {
                     }
                     validatedResourceGuard = ((PersistentTopic) topic).getCurrentTopicResourceGuardView();
                     if (!TopicResourceGuardValidator.matches(validatedResourceGuard,
-                            cmdProducer.getResourceGuard())) {
+                            requestedResourceGuard)) {
                         commandSender.sendErrorResponse(requestId, ServerError.ResourceIncarnationMismatch,
                                 "The expected topic resource incarnation is not current");
                         producers.remove(producerId, producerFuture);
