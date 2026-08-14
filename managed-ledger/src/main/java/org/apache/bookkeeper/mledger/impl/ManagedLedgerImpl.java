@@ -118,10 +118,13 @@ import org.apache.bookkeeper.mledger.ManagedLedgerException.MetadataNotFoundExce
 import org.apache.bookkeeper.mledger.ManagedLedgerException.NonRecoverableLedgerException;
 import org.apache.bookkeeper.mledger.ManagedLedgerException.TooManyRequestsException;
 import org.apache.bookkeeper.mledger.ManagedLedgerMXBean;
+import org.apache.bookkeeper.mledger.OffloadReadSourceState;
+import org.apache.bookkeeper.mledger.OffloadReadSourceState.BookKeeperDeleteState;
 import org.apache.bookkeeper.mledger.OffloadedLedgerHandle;
 import org.apache.bookkeeper.mledger.Position;
 import org.apache.bookkeeper.mledger.PositionBound;
 import org.apache.bookkeeper.mledger.PositionFactory;
+import org.apache.bookkeeper.mledger.SourceSafeLedgerOffloader;
 import org.apache.bookkeeper.mledger.WaitingEntryCallBack;
 import org.apache.bookkeeper.mledger.impl.ManagedCursorImpl.VoidCallback;
 import org.apache.bookkeeper.mledger.impl.MetaStore.MetaStoreCallback;
@@ -180,6 +183,11 @@ public class ManagedLedgerImpl implements ManagedLedger, CreateCallback {
             ConcurrentLongHashMap.<CompletableFuture<ReadHandle>>newBuilder()
                     .expectedItems(16) // initial capacity
                     .concurrencyLevel(1) // number of sections
+                    .build();
+    final ConcurrentLongHashMap<LedgerReadSourcePinRegistry> offloadReadSourcePins =
+            ConcurrentLongHashMap.<LedgerReadSourcePinRegistry>newBuilder()
+                    .expectedItems(16)
+                    .concurrencyLevel(1)
                     .build();
     protected final NavigableMap<Long, LedgerInfo> ledgers = new ConcurrentSkipListMap<>();
     protected volatile Stat ledgersStat;
@@ -2238,7 +2246,12 @@ public class ManagedLedgerImpl implements ManagedLedger, CreateCallback {
             LedgerInfo info = ledgers.get(ledgerId);
             CompletableFuture<ReadHandle> openFuture;
 
-            if (config.getLedgerOffloader() != null
+            if (info != null
+                    && info.hasOffloadContext()
+                    && info.getOffloadContext().isComplete()
+                    && config.getLedgerOffloader() instanceof SourceSafeLedgerOffloader sourceSafeOffloader) {
+                openFuture = openSourceSafeReadHandle(ledgerId, info, sourceSafeOffloader);
+            } else if (config.getLedgerOffloader() != null
                     && config.getLedgerOffloader().getOffloadPolicies() != null
                     && config.getLedgerOffloader().getOffloadPolicies()
                     .getManagedLedgerOffloadedReadPriority() == OffloadedReadPriority.BOOKKEEPER_FIRST
@@ -2276,6 +2289,47 @@ public class ManagedLedgerImpl implements ManagedLedger, CreateCallback {
             }, executor);
             return promise;
         });
+    }
+
+    private CompletableFuture<ReadHandle> openSourceSafeReadHandle(
+            long ledgerId, LedgerInfo info, SourceSafeLedgerOffloader offloader) {
+        UUID uid = new UUID(info.getOffloadContext().getUidMsb(), info.getOffloadContext().getUidLsb());
+        Map<String, String> offloadDriverMetadata = OffloadUtils.getOffloadDriverMetadata(info);
+        offloadDriverMetadata.put("ManagedLedgerName", name);
+        OffloadedReadPriority priority = offloader.getOffloadPolicies().getManagedLedgerOffloadedReadPriority();
+        LedgerReadSourcePinRegistry pinRegistry = offloadReadSourcePins.computeIfAbsent(
+                ledgerId, ignored -> new LedgerReadSourcePinRegistry());
+        return DualSourceReadHandle.open(
+                ledgerId,
+                offloader,
+                () -> currentOffloadReadSourceState(ledgerId, uid),
+                priority,
+                pinRegistry,
+                () -> offloader.readOffloaded(ledgerId, uid, offloadDriverMetadata),
+                () -> bookKeeper.newOpenLedgerOp()
+                        .withRecovery(!isReadOnly())
+                        .withLedgerId(ledgerId)
+                        .withDigestType(config.getDigestType())
+                        .withPassword(config.getPassword())
+                        .withLoggerContext(log)
+                        .execute());
+    }
+
+    private synchronized OffloadReadSourceState currentOffloadReadSourceState(long ledgerId, UUID expectedUid) {
+        LedgerInfo info = ledgers.get(ledgerId);
+        if (info == null || !info.hasOffloadContext()) {
+            throw new IllegalStateException("ledger or offload context disappeared during source selection");
+        }
+        OffloadContext context = info.getOffloadContext();
+        UUID currentUid = new UUID(context.getUidMsb(), context.getUidLsb());
+        if (!currentUid.equals(expectedUid)) {
+            throw new IllegalStateException("offload attempt changed during source selection");
+        }
+        long metadataVersion = ledgersStat == null ? 0 : ledgersStat.getVersion();
+        BookKeeperDeleteState deleteState = context.isBookkeeperDeleted()
+                ? BookKeeperDeleteState.DONE
+                : BookKeeperDeleteState.NONE;
+        return new OffloadReadSourceState(metadataVersion, currentUid, context.isComplete(), deleteState);
     }
 
     void invalidateReadHandle(long ledgerId) {
@@ -3310,6 +3364,7 @@ public class ManagedLedgerImpl implements ManagedLedger, CreateCallback {
             }
 
             invalidateReadHandle(ls.getLedgerId());
+            offloadReadSourcePins.remove(ls.getLedgerId());
 
             ledgers.remove(ls.getLedgerId());
             NUMBER_OF_ENTRIES_UPDATER.addAndGet(this, -ls.getEntries());
