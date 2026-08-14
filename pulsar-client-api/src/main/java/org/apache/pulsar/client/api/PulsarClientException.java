@@ -722,6 +722,20 @@ public class PulsarClientException extends IOException {
         }
     }
 
+    /** The peer does not implement a required wire protocol capability. */
+    public static class UnsupportedVersionException extends NotSupportedException {
+        public UnsupportedVersionException(String msg) {
+            super(msg);
+        }
+    }
+
+    /** The broker rejected a producer or send because the resource incarnation changed. */
+    public static class ResourceIncarnationMismatchException extends PulsarClientException {
+        public ResourceIncarnationMismatchException(String msg) {
+            super(msg);
+        }
+    }
+
     /**
      * Not supported exception thrown by Pulsar client.
      */

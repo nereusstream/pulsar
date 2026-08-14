@@ -43,6 +43,7 @@ import org.apache.pulsar.client.api.MessageRouter;
 import org.apache.pulsar.client.api.MessageRoutingMode;
 import org.apache.pulsar.client.api.ProducerAccessMode;
 import org.apache.pulsar.client.api.ProducerCryptoFailureAction;
+import org.apache.pulsar.client.api.TopicResourceGuard;
 
 @Data
 @NoArgsConstructor
@@ -61,6 +62,9 @@ public class ProducerConfigurationData implements Serializable, Cloneable {
             description = "Topic name"
     )
     private String topicName = null;
+
+    @JsonIgnore
+    private TopicResourceGuard topicResourceGuard = null;
 
     @Schema(
             name = "producerName",

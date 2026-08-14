@@ -112,6 +112,7 @@ import org.apache.pulsar.common.api.proto.Schema;
 import org.apache.pulsar.common.api.proto.ServerError;
 import org.apache.pulsar.common.api.proto.SingleMessageMetadata;
 import org.apache.pulsar.common.api.proto.Subscription;
+import org.apache.pulsar.common.api.proto.TopicResourceGuardReceipt;
 import org.apache.pulsar.common.api.proto.TxnAction;
 import org.apache.pulsar.common.intercept.BrokerEntryMetadataInterceptor;
 import org.apache.pulsar.common.protocol.schema.SchemaVersion;
@@ -408,6 +409,13 @@ public class Commands {
 
     public static BaseCommand newProducerSuccessCommand(long requestId, String producerName, long lastSequenceId,
             SchemaVersion schemaVersion, Optional<Long> topicEpoch, boolean isProducerReady) {
+        return newProducerSuccessCommand(requestId, producerName, lastSequenceId, schemaVersion, topicEpoch,
+                isProducerReady, Optional.empty());
+    }
+
+    public static BaseCommand newProducerSuccessCommand(long requestId, String producerName, long lastSequenceId,
+            SchemaVersion schemaVersion, Optional<Long> topicEpoch, boolean isProducerReady,
+            Optional<org.apache.pulsar.client.api.TopicResourceGuardAttestation> guardAttestation) {
         BaseCommand cmd = localCmd(Type.PRODUCER_SUCCESS);
         CommandProducerSuccess ps = cmd.setProducerSuccess()
                 .setRequestId(requestId)
@@ -416,6 +424,7 @@ public class Commands {
                 .setSchemaVersion(schemaVersion.bytes())
                 .setProducerReady(isProducerReady);
         topicEpoch.ifPresent(ps::setTopicEpoch);
+        guardAttestation.ifPresent(attestation -> setTopicResourceGuardAttestation(ps, attestation));
         return cmd;
     }
 
@@ -423,6 +432,13 @@ public class Commands {
             SchemaVersion schemaVersion, Optional<Long> topicEpoch, boolean isProducerReady) {
         return serializeWithSize(newProducerSuccessCommand(requestId, producerName, lastSequenceId, schemaVersion,
                 topicEpoch, isProducerReady));
+    }
+
+    public static ByteBuf newProducerSuccess(long requestId, String producerName, long lastSequenceId,
+            SchemaVersion schemaVersion, Optional<Long> topicEpoch, boolean isProducerReady,
+            Optional<org.apache.pulsar.client.api.TopicResourceGuardAttestation> guardAttestation) {
+        return serializeWithSize(newProducerSuccessCommand(requestId, producerName, lastSequenceId, schemaVersion,
+                topicEpoch, isProducerReady, guardAttestation));
     }
 
     public static BaseCommand newErrorCommand(long requestId, ServerError serverError, String message) {
@@ -440,6 +456,11 @@ public class Commands {
 
     public static BaseCommand newSendReceiptCommand(long producerId, long sequenceId, long highestId, long ledgerId,
             long entryId) {
+        return newSendReceiptCommand(producerId, sequenceId, highestId, ledgerId, entryId, null);
+    }
+
+    public static BaseCommand newSendReceiptCommand(long producerId, long sequenceId, long highestId, long ledgerId,
+            long entryId, TopicResourceGuardReceipt guardReceipt) {
         BaseCommand cmd = localCmd(Type.SEND_RECEIPT);
         cmd.setSendReceipt()
                 .setProducerId(producerId)
@@ -448,12 +469,21 @@ public class Commands {
                 .setMessageId()
                 .setLedgerId(ledgerId)
                 .setEntryId(entryId);
+        if (guardReceipt != null) {
+            cmd.getSendReceipt().setResourceGuardReceipt().copyFrom(guardReceipt);
+        }
         return cmd;
     }
 
     public static ByteBuf newSendReceipt(long producerId, long sequenceId, long highestId, long ledgerId,
             long entryId) {
         return serializeWithSize(newSendReceiptCommand(producerId, sequenceId, highestId, ledgerId, entryId));
+    }
+
+    public static ByteBuf newSendReceipt(long producerId, long sequenceId, long highestId, long ledgerId,
+            long entryId, TopicResourceGuardReceipt guardReceipt) {
+        return serializeWithSize(newSendReceiptCommand(producerId, sequenceId, highestId, ledgerId, entryId,
+                guardReceipt));
     }
 
     public static BaseCommand newSendErrorCommand(long producerId, long sequenceId, ServerError error,
@@ -930,6 +960,16 @@ public class Commands {
                                       long epoch, boolean userProvidedProducerName,
                                       ProducerAccessMode accessMode, Optional<Long> topicEpoch, boolean isTxnEnabled,
                                       String initialSubscriptionName) {
+        return newProducer(topic, producerId, requestId, producerName, encrypted, metadata, schemaInfo, epoch,
+                userProvidedProducerName, accessMode, topicEpoch, isTxnEnabled, initialSubscriptionName, null);
+    }
+
+    public static ByteBuf newProducer(String topic, long producerId, long requestId, String producerName,
+                                      boolean encrypted, Map<String, String> metadata, SchemaInfo schemaInfo,
+                                      long epoch, boolean userProvidedProducerName,
+                                      ProducerAccessMode accessMode, Optional<Long> topicEpoch, boolean isTxnEnabled,
+                                      String initialSubscriptionName,
+                                      org.apache.pulsar.client.api.TopicResourceGuard resourceGuard) {
         BaseCommand cmd = localCmd(Type.PRODUCER);
         CommandProducer producer = cmd.setProducer()
                 .setTopic(topic)
@@ -958,6 +998,10 @@ public class Commands {
 
         if (!Strings.isNullOrEmpty(initialSubscriptionName)) {
             producer.setInitialSubscriptionName(initialSubscriptionName);
+        }
+
+        if (resourceGuard != null) {
+            setTopicResourceGuard(producer, resourceGuard);
         }
 
         return serializeWithSize(cmd);
@@ -2467,6 +2511,31 @@ public class Commands {
 
     public static boolean peerSupportsCarryAutoConsumeSchemaToBroker(int peerVersion) {
         return peerVersion >= ProtocolVersion.v21.getValue();
+    }
+
+    public static boolean peerSupportsTopicResourceGuard(int peerVersion) {
+        return peerVersion >= ProtocolVersion.v22.getValue();
+    }
+
+    private static void setTopicResourceGuard(CommandProducer producer,
+                                              org.apache.pulsar.client.api.TopicResourceGuard guard) {
+        producer.setResourceGuard()
+                .setGuardVersion(guard.guardVersion())
+                .setAuthenticatedClusterId(guard.authenticatedClusterId())
+                .setResourceIncarnation(guard.resourceIncarnation())
+                .setTopicCreationTimestamp(guard.topicCreationTimestamp());
+    }
+
+    private static void setTopicResourceGuardAttestation(CommandProducerSuccess success,
+                                                          org.apache.pulsar.client.api.TopicResourceGuardAttestation
+                                                                  attestation) {
+        success.setResourceGuardAttestation()
+                .setGuardVersion(attestation.guardVersion())
+                .setAuthenticatedClusterId(attestation.authenticatedClusterId())
+                .setResourceIncarnation(attestation.resourceIncarnation())
+                .setTopicCreationTimestamp(attestation.topicCreationTimestamp())
+                .setPhysicalTopic(attestation.physicalTopic())
+                .setPartition(attestation.partition());
     }
 
     private static org.apache.pulsar.common.api.proto.ProducerAccessMode convertProducerAccessMode(

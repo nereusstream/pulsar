@@ -241,6 +241,7 @@ enum ServerError {
                          // use this error to indicate that this producer is now permanently
                          // fenced. Applications are now supposed to close it and create a
                          // new producer
+    ResourceIncarnationMismatch = 26; // The guarded producer's expected topic identity is no longer current
 }
 
 enum AuthMethod {
@@ -277,6 +278,28 @@ enum ProtocolVersion {
     v19 = 19; // Add CommandTcClientConnectRequest and CommandTcClientConnectResponse
     v20 = 20; // Add client support for topic migration redirection CommandTopicMigrated
     v21 = 21; // Carry the AUTO_CONSUME schema to the Broker after this version
+    v22 = 22; // Carry first-class topic resource guard and guarded send receipts
+}
+
+message TopicResourceGuard {
+    required uint32 guard_version = 1;
+    required string authenticated_cluster_id = 2;
+    required bytes resource_incarnation = 3;
+    required uint64 topic_creation_timestamp = 4;
+}
+
+message TopicResourceGuardAttestation {
+    required uint32 guard_version = 1;
+    required string authenticated_cluster_id = 2;
+    required bytes resource_incarnation = 3;
+    required uint64 topic_creation_timestamp = 4;
+    required string physical_topic = 5;
+    required uint32 partition = 6;
+}
+
+message TopicResourceGuardReceipt {
+    required TopicResourceGuardAttestation attestation = 1;
+    required uint64 broker_entry_timestamp = 2;
 }
 
 message CommandConnect {
@@ -529,6 +552,7 @@ message CommandProducer {
     // If this field is set but the broker's `allowAutoSubscriptionCreation`
     // is disabled, the producer will fail to be created.
     optional string initial_subscription_name = 13;
+    optional TopicResourceGuard resource_guard = 14;
 }
 
 message CommandSend {
@@ -554,6 +578,7 @@ message CommandSendReceipt {
     required uint64 sequence_id = 2;
     optional MessageIdData message_id = 3;
     optional uint64 highest_sequence_id = 4 [default = 0];
+    optional TopicResourceGuardReceipt resource_guard_receipt = 5;
 }
 
 message CommandSendError {
@@ -703,6 +728,7 @@ message CommandProducerSuccess {
     // for creating the producer. Instead it will wait indefinitely until it gets
     // a subsequent  `CommandProducerSuccess` with `producer_ready==true`.
     optional bool producer_ready = 6 [default = true];
+    optional TopicResourceGuardAttestation resource_guard_attestation = 7;
 }
 
 message CommandError {

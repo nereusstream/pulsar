@@ -43,6 +43,7 @@ import org.apache.pulsar.client.api.ProducerBuilder;
 import org.apache.pulsar.client.api.ProducerCryptoFailureAction;
 import org.apache.pulsar.client.api.PulsarClientException;
 import org.apache.pulsar.client.api.Schema;
+import org.apache.pulsar.client.api.TopicResourceGuard;
 import org.apache.pulsar.client.api.interceptor.ProducerInterceptor;
 import org.apache.pulsar.client.api.interceptor.ProducerInterceptorWrapper;
 import org.apache.pulsar.client.impl.conf.ConfigurationDataUtils;
@@ -136,6 +137,18 @@ public class ProducerBuilderImpl<T> implements ProducerBuilder<T> {
     public ProducerBuilder<T> topic(String topicName) {
         checkArgument(StringUtils.isNotBlank(topicName), "topicName cannot be blank");
         conf.setTopicName(StringUtils.trim(topicName));
+        return this;
+    }
+
+    @Override
+    public ProducerBuilder<T> resourceGuard(TopicResourceGuard guard) {
+        conf.setTopicResourceGuard(java.util.Objects.requireNonNull(guard, "guard"));
+        // A guarded producer has exactly one unresolved, non-chunked SEND in V1.
+        conf.setBatchingEnabled(false);
+        conf.setChunkingEnabled(false);
+        conf.setMaxPendingMessages(1);
+        conf.setBlockIfQueueFull(false);
+        conf.setAutoUpdatePartitions(false);
         return this;
     }
 

@@ -110,6 +110,17 @@ public interface ProducerBuilder<T> extends Cloneable {
     ProducerBuilder<T> topic(String topicName);
 
     /**
+     * Require every producer handshake and SEND to match the supplied physical topic incarnation.
+     * Implementations that do not support this capability must fail closed.
+     *
+     * @param guard expected topic resource identity
+     * @return the producer builder instance
+     */
+    default ProducerBuilder<T> resourceGuard(TopicResourceGuard guard) {
+        throw new UnsupportedOperationException("resourceGuard is not supported by this ProducerBuilder");
+    }
+
+    /**
      * Specify a name for the producer.
      *
      * <p>If not assigned, the system will generate a globally unique name which can be accessed with
