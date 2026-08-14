@@ -222,6 +222,9 @@ public class P6NativeLocalStackEvidenceTest {
     private static String required(String name) {
         String value = System.getProperty(name);
         if (value == null || value.isBlank()) {
+            value = System.getenv(name.toUpperCase(Locale.ROOT).replace('.', '_'));
+        }
+        if (value == null || value.isBlank()) {
             throw new IllegalArgumentException("missing required P6 native evidence property " + name);
         }
         return value;
