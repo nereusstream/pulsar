@@ -31,6 +31,17 @@ message OffloadDriverMetadata {
     repeated KeyValue properties = 2;
 }
 
+enum BookKeeperRetentionClass {
+    RETAIN_BK = 0;
+    DELETE_AFTER_VERIFIED = 1;
+}
+
+enum BookKeeperDeleteState {
+    BK_DELETE_NONE = 0;
+    BK_DELETE_INTENT = 1;
+    BK_DELETE_DONE = 2;
+}
+
 message OffloadContext {
     optional int64 uidMsb = 1;
     optional int64 uidLsb = 2;
@@ -39,6 +50,8 @@ message OffloadContext {
     optional int64 timestamp = 5;
     optional OffloadDriverMetadata driverMetadata = 6;
     repeated OffloadSegment offloadSegment = 7;
+    optional BookKeeperRetentionClass bookkeeperRetentionClass = 8;
+    optional BookKeeperDeleteState bookkeeperDeleteState = 9;
 }
 
 message OffloadSegment {

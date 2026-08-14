@@ -27,6 +27,7 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.Collectors;
 import lombok.CustomLog;
 import org.apache.bookkeeper.client.BKException;
@@ -37,8 +38,12 @@ import org.apache.bookkeeper.mledger.LedgerOffloader;
 import org.apache.bookkeeper.mledger.ManagedCursor;
 import org.apache.bookkeeper.mledger.ManagedLedgerConfig;
 import org.apache.bookkeeper.mledger.ManagedLedgerException;
+import org.apache.bookkeeper.mledger.OffloadReadSourceState;
 import org.apache.bookkeeper.mledger.Position;
 import org.apache.bookkeeper.mledger.PositionFactory;
+import org.apache.bookkeeper.mledger.SourceSafeLedgerOffloader;
+import org.apache.bookkeeper.mledger.proto.BookKeeperDeleteState;
+import org.apache.bookkeeper.mledger.proto.BookKeeperRetentionClass;
 import org.apache.bookkeeper.mledger.proto.ManagedLedgerInfo.LedgerInfo;
 import org.apache.bookkeeper.mledger.proto.OffloadContext;
 import org.apache.bookkeeper.mledger.util.MockClock;
@@ -148,6 +153,208 @@ public class OffloadLedgerDeleteTest extends MockedBookKeeperTestCase {
         @Override
         public void close() {
         }
+    }
+
+    static class MockSourceSafeLedgerOffloader extends OffloadPrefixTest.MockLedgerOffloader
+            implements SourceSafeLedgerOffloader {
+        private final RetentionClass retentionClass;
+        private final AtomicInteger revalidations = new AtomicInteger();
+        private volatile Throwable revalidationFailure;
+
+        MockSourceSafeLedgerOffloader(RetentionClass retentionClass) {
+            this.retentionClass = retentionClass;
+        }
+
+        @Override
+        public RetentionClass getBookKeeperRetentionClass() {
+            return retentionClass;
+        }
+
+        @Override
+        public ReadFailureKind classifyOffloadedReadFailure(Throwable failure) {
+            return ReadFailureKind.OTHER;
+        }
+
+        @Override
+        public CompletableFuture<Void> revalidateOffloadedForSourceDeletion(
+                long ledgerId,
+                UUID attemptUuid,
+                Map<String, String> offloadDriverMetadata,
+                long lastAddConfirmed,
+                long entryCount,
+                long logicalLength) {
+            revalidations.incrementAndGet();
+            Assert.assertEquals(offloads.get(ledgerId), attemptUuid);
+            Assert.assertNotNull(offloadDriverMetadata.get("ManagedLedgerName"));
+            Assert.assertEquals(lastAddConfirmed, entryCount - 1);
+            Assert.assertTrue(entryCount > 0);
+            Assert.assertTrue(logicalLength > 0);
+            return revalidationFailure == null
+                    ? CompletableFuture.completedFuture(null)
+                    : CompletableFuture.failedFuture(revalidationFailure);
+        }
+    }
+
+    @Test
+    public void testSourceSafeDeletePersistsIntentDeletesAndProvesDone() throws Exception {
+        MockSourceSafeLedgerOffloader offloader =
+                new MockSourceSafeLedgerOffloader(SourceSafeLedgerOffloader.RetentionClass.DELETE_AFTER_VERIFIED);
+        ManagedLedgerConfig config = sourceSafeConfig(offloader);
+        MockClock clock = (MockClock) config.getClock();
+        ManagedLedgerImpl ledger = (ManagedLedgerImpl) factory.open("source-safe-delete", config);
+        long firstLedgerId = writeAndOffloadFirstLedger(ledger);
+
+        OffloadContext completed = ledger.getLedgerInfo(firstLedgerId).join().getOffloadContext();
+        Assert.assertEquals(
+                completed.getBookkeeperRetentionClass(), BookKeeperRetentionClass.DELETE_AFTER_VERIFIED);
+        Assert.assertEquals(completed.getBookkeeperDeleteState(), BookKeeperDeleteState.BK_DELETE_NONE);
+        Assert.assertFalse(completed.isBookkeeperDeleted());
+
+        clock.advance(1, TimeUnit.SECONDS);
+        CompletableFuture<Void> trim = new CompletableFuture<>();
+        ledger.internalTrimConsumedLedgers(trim);
+        trim.join();
+
+        OffloadContext deleted = ledger.getLedgerInfo(firstLedgerId).join().getOffloadContext();
+        Assert.assertEquals(deleted.getBookkeeperDeleteState(), BookKeeperDeleteState.BK_DELETE_DONE);
+        Assert.assertTrue(deleted.isBookkeeperDeleted());
+        Assert.assertEquals(offloader.revalidations.get(), 1);
+        Assert.assertFalse(bkc.getLedgers().contains(firstLedgerId));
+    }
+
+    @Test
+    public void testSourceSafeRetainClassNeverDeletesBookKeeper() throws Exception {
+        MockSourceSafeLedgerOffloader offloader =
+                new MockSourceSafeLedgerOffloader(SourceSafeLedgerOffloader.RetentionClass.RETAIN_BK);
+        ManagedLedgerConfig config = sourceSafeConfig(offloader);
+        MockClock clock = (MockClock) config.getClock();
+        ManagedLedgerImpl ledger = (ManagedLedgerImpl) factory.open("source-safe-retain", config);
+        long firstLedgerId = writeAndOffloadFirstLedger(ledger);
+
+        clock.advance(1, TimeUnit.SECONDS);
+        CompletableFuture<Void> trim = new CompletableFuture<>();
+        ledger.internalTrimConsumedLedgers(trim);
+        trim.join();
+
+        OffloadContext retained = ledger.getLedgerInfo(firstLedgerId).join().getOffloadContext();
+        Assert.assertEquals(retained.getBookkeeperRetentionClass(), BookKeeperRetentionClass.RETAIN_BK);
+        Assert.assertEquals(retained.getBookkeeperDeleteState(), BookKeeperDeleteState.BK_DELETE_NONE);
+        Assert.assertEquals(offloader.revalidations.get(), 0);
+        Assert.assertTrue(bkc.getLedgers().contains(firstLedgerId));
+    }
+
+    @Test
+    public void testSourceSafeRevalidationFailureLeavesNoneAndUnfencesBookKeeper() throws Exception {
+        MockSourceSafeLedgerOffloader offloader =
+                new MockSourceSafeLedgerOffloader(SourceSafeLedgerOffloader.RetentionClass.DELETE_AFTER_VERIFIED);
+        offloader.revalidationFailure = new IllegalStateException("revalidation failed");
+        ManagedLedgerConfig config = sourceSafeConfig(offloader);
+        MockClock clock = (MockClock) config.getClock();
+        ManagedLedgerImpl ledger =
+                (ManagedLedgerImpl) factory.open("source-safe-revalidation-failure", config);
+        long firstLedgerId = writeAndOffloadFirstLedger(ledger);
+        OffloadContext completed = ledger.getLedgerInfo(firstLedgerId).join().getOffloadContext();
+        UUID attemptUuid = new UUID(completed.getUidMsb(), completed.getUidLsb());
+
+        clock.advance(1, TimeUnit.SECONDS);
+        CompletableFuture<Void> trim = new CompletableFuture<>();
+        ledger.internalTrimConsumedLedgers(trim);
+        Assert.assertThrows(java.util.concurrent.CompletionException.class, trim::join);
+
+        OffloadContext unchanged = ledger.getLedgerInfo(firstLedgerId).join().getOffloadContext();
+        Assert.assertEquals(unchanged.getBookkeeperDeleteState(), BookKeeperDeleteState.BK_DELETE_NONE);
+        Assert.assertFalse(unchanged.isBookkeeperDeleted());
+        Assert.assertTrue(bkc.getLedgers().contains(firstLedgerId));
+        LedgerReadSourcePinRegistry registry = ledger.offloadReadSourcePins.get(firstLedgerId);
+        LedgerReadSourcePinRegistry.Pin pin = registry.acquire(
+                LedgerReadSourcePinRegistry.Source.BOOKKEEPER,
+                new OffloadReadSourceState(
+                        0, attemptUuid, true, OffloadReadSourceState.BookKeeperDeleteState.NONE));
+        pin.close();
+    }
+
+    @Test
+    public void testSourceSafeDrainTimeoutDoesNotDeleteAndUnfencesAfterLateRelease() throws Exception {
+        MockSourceSafeLedgerOffloader offloader =
+                new MockSourceSafeLedgerOffloader(SourceSafeLedgerOffloader.RetentionClass.DELETE_AFTER_VERIFIED);
+        ManagedLedgerConfig config = sourceSafeConfig(offloader).setMetadataOperationsTimeoutSeconds(1);
+        MockClock clock = (MockClock) config.getClock();
+        ManagedLedgerImpl ledger = (ManagedLedgerImpl) factory.open("source-safe-drain-timeout", config);
+        long firstLedgerId = writeAndOffloadFirstLedger(ledger);
+        OffloadContext completed = ledger.getLedgerInfo(firstLedgerId).join().getOffloadContext();
+        UUID attemptUuid = new UUID(completed.getUidMsb(), completed.getUidLsb());
+        LedgerReadSourcePinRegistry registry = ledger.offloadReadSourcePins.computeIfAbsent(
+                firstLedgerId, ignored -> new LedgerReadSourcePinRegistry());
+        LedgerReadSourcePinRegistry.Pin accepted = registry.acquire(
+                LedgerReadSourcePinRegistry.Source.BOOKKEEPER,
+                new OffloadReadSourceState(
+                        0, attemptUuid, true, OffloadReadSourceState.BookKeeperDeleteState.NONE));
+
+        clock.advance(1, TimeUnit.SECONDS);
+        CompletableFuture<Void> trim = new CompletableFuture<>();
+        ledger.internalTrimConsumedLedgers(trim);
+        Assert.assertThrows(java.util.concurrent.CompletionException.class, trim::join);
+
+        OffloadContext unchanged = ledger.getLedgerInfo(firstLedgerId).join().getOffloadContext();
+        Assert.assertEquals(unchanged.getBookkeeperDeleteState(), BookKeeperDeleteState.BK_DELETE_NONE);
+        Assert.assertTrue(bkc.getLedgers().contains(firstLedgerId));
+        Assert.assertEquals(offloader.revalidations.get(), 0);
+        accepted.close();
+        LedgerReadSourcePinRegistry.Pin admittedAgain = registry.acquire(
+                LedgerReadSourcePinRegistry.Source.BOOKKEEPER,
+                new OffloadReadSourceState(
+                        0, attemptUuid, true, OffloadReadSourceState.BookKeeperDeleteState.NONE));
+        admittedAgain.close();
+    }
+
+    @Test
+    public void testSourceSafeIntentResumesWithoutRepeatingRevalidation() throws Exception {
+        MockSourceSafeLedgerOffloader offloader =
+                new MockSourceSafeLedgerOffloader(SourceSafeLedgerOffloader.RetentionClass.DELETE_AFTER_VERIFIED);
+        ManagedLedgerConfig config = sourceSafeConfig(offloader);
+        MockClock clock = (MockClock) config.getClock();
+        ManagedLedgerImpl ledger = (ManagedLedgerImpl) factory.open("source-safe-intent-resume", config);
+        long firstLedgerId = writeAndOffloadFirstLedger(ledger);
+        LedgerInfo completed = ledger.getLedgerInfo(firstLedgerId).join();
+        LedgerInfo intent = new LedgerInfo();
+        intent.copyFrom(completed);
+        intent.setOffloadContext()
+                .setBookkeeperDeleted(false)
+                .setBookkeeperDeleteState(BookKeeperDeleteState.BK_DELETE_INTENT);
+        ledger.ledgers.put(firstLedgerId, intent);
+
+        clock.advance(1, TimeUnit.SECONDS);
+        CompletableFuture<Void> trim = new CompletableFuture<>();
+        ledger.internalTrimConsumedLedgers(trim);
+        trim.join();
+
+        OffloadContext done = ledger.getLedgerInfo(firstLedgerId).join().getOffloadContext();
+        Assert.assertEquals(done.getBookkeeperDeleteState(), BookKeeperDeleteState.BK_DELETE_DONE);
+        Assert.assertTrue(done.isBookkeeperDeleted());
+        Assert.assertEquals(offloader.revalidations.get(), 0);
+        Assert.assertFalse(bkc.getLedgers().contains(firstLedgerId));
+    }
+
+    private static ManagedLedgerConfig sourceSafeConfig(MockSourceSafeLedgerOffloader offloader) {
+        ManagedLedgerConfig config = new ManagedLedgerConfig();
+        config.setMaxEntriesPerLedger(10);
+        config.setMinimumRolloverTime(0, TimeUnit.SECONDS);
+        config.setRetentionTime(10, TimeUnit.MINUTES);
+        config.setRetentionSizeInMB(10);
+        config.setClock(new MockClock());
+        offloader.getOffloadPolicies().setManagedLedgerOffloadDeletionLagInMillis(0L);
+        offloader.getOffloadPolicies().setManagedLedgerOffloadedReadPriority(OffloadedReadPriority.BOOKKEEPER_FIRST);
+        config.setLedgerOffloader(offloader);
+        return config;
+    }
+
+    private static long writeAndOffloadFirstLedger(ManagedLedgerImpl ledger) throws Exception {
+        for (int i = 0; i < 15; i++) {
+            ledger.addEntry(("entry-" + i).getBytes());
+        }
+        long firstLedgerId = ledger.getLedgersInfoAsList().get(0).getLedgerId();
+        ledger.offloadPrefix(ledger.getLastConfirmedEntry());
+        return firstLedgerId;
     }
 
     @Test

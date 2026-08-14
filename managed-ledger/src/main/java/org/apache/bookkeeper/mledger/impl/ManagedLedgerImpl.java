@@ -119,7 +119,6 @@ import org.apache.bookkeeper.mledger.ManagedLedgerException.NonRecoverableLedger
 import org.apache.bookkeeper.mledger.ManagedLedgerException.TooManyRequestsException;
 import org.apache.bookkeeper.mledger.ManagedLedgerMXBean;
 import org.apache.bookkeeper.mledger.OffloadReadSourceState;
-import org.apache.bookkeeper.mledger.OffloadReadSourceState.BookKeeperDeleteState;
 import org.apache.bookkeeper.mledger.OffloadedLedgerHandle;
 import org.apache.bookkeeper.mledger.Position;
 import org.apache.bookkeeper.mledger.PositionBound;
@@ -131,6 +130,8 @@ import org.apache.bookkeeper.mledger.impl.MetaStore.MetaStoreCallback;
 import org.apache.bookkeeper.mledger.impl.cache.EntryCache;
 import org.apache.bookkeeper.mledger.intercept.ManagedLedgerInterceptor;
 import org.apache.bookkeeper.mledger.offload.OffloadUtils;
+import org.apache.bookkeeper.mledger.proto.BookKeeperDeleteState;
+import org.apache.bookkeeper.mledger.proto.BookKeeperRetentionClass;
 import org.apache.bookkeeper.mledger.proto.KeyValue;
 import org.apache.bookkeeper.mledger.proto.ManagedLedgerInfo;
 import org.apache.bookkeeper.mledger.proto.ManagedLedgerInfo.LedgerInfo;
@@ -189,6 +190,7 @@ public class ManagedLedgerImpl implements ManagedLedger, CreateCallback {
                     .expectedItems(16)
                     .concurrencyLevel(1)
                     .build();
+    private final Set<Long> sourceSafeBookKeeperDeletions = ConcurrentHashMap.newKeySet();
     protected final NavigableMap<Long, LedgerInfo> ledgers = new ConcurrentSkipListMap<>();
     protected volatile Stat ledgersStat;
 
@@ -2249,6 +2251,7 @@ public class ManagedLedgerImpl implements ManagedLedger, CreateCallback {
             if (info != null
                     && info.hasOffloadContext()
                     && info.getOffloadContext().isComplete()
+                    && isSourceSafeBookKeeperDeletion(info)
                     && config.getLedgerOffloader() instanceof SourceSafeLedgerOffloader sourceSafeOffloader) {
                 openFuture = openSourceSafeReadHandle(ledgerId, info, sourceSafeOffloader);
             } else if (config.getLedgerOffloader() != null
@@ -2326,14 +2329,24 @@ public class ManagedLedgerImpl implements ManagedLedger, CreateCallback {
             throw new IllegalStateException("offload attempt changed during source selection");
         }
         long metadataVersion = ledgersStat == null ? 0 : ledgersStat.getVersion();
-        BookKeeperDeleteState deleteState = context.isBookkeeperDeleted()
-                ? BookKeeperDeleteState.DONE
-                : BookKeeperDeleteState.NONE;
+        OffloadReadSourceState.BookKeeperDeleteState deleteState;
+        if (context.hasBookkeeperDeleteState()) {
+            deleteState = switch (context.getBookkeeperDeleteState()) {
+                case BK_DELETE_NONE -> OffloadReadSourceState.BookKeeperDeleteState.NONE;
+                case BK_DELETE_INTENT -> OffloadReadSourceState.BookKeeperDeleteState.INTENT;
+                case BK_DELETE_DONE -> OffloadReadSourceState.BookKeeperDeleteState.DONE;
+            };
+        } else {
+            deleteState = context.isBookkeeperDeleted()
+                    ? OffloadReadSourceState.BookKeeperDeleteState.DONE
+                    : OffloadReadSourceState.BookKeeperDeleteState.NONE;
+        }
         return new OffloadReadSourceState(metadataVersion, currentUid, context.isComplete(), deleteState);
     }
 
     void invalidateReadHandle(long ledgerId) {
         CompletableFuture<ReadHandle> rhf = ledgerCache.remove(ledgerId);
+        LedgerReadSourcePinRegistry pinRegistry = offloadReadSourcePins.get(ledgerId);
         if (rhf != null) {
             rhf.thenCompose(r -> {
                 if (r instanceof OffloadedLedgerHandle) {
@@ -2350,8 +2363,28 @@ public class ManagedLedgerImpl implements ManagedLedger, CreateCallback {
             }).exceptionally(ex -> {
                 log.warn().attr("ledgerId", ledgerId).exception(ex).log("Failed to close Ledger ReadHandle");
                 return null;
-            });
+            }).whenComplete((ignored, failure) -> releasePinRegistryAfterInvalidation(ledgerId, pinRegistry));
+        } else {
+            releasePinRegistryAfterInvalidation(ledgerId, pinRegistry);
         }
+    }
+
+    private synchronized void releasePinRegistryAfterInvalidation(
+            long ledgerId, LedgerReadSourcePinRegistry pinRegistry) {
+        if (pinRegistry == null
+                || pinRegistry.pinCount() != 0
+                || ledgerCache.get(ledgerId) != null
+                || sourceSafeBookKeeperDeletions.contains(ledgerId)) {
+            return;
+        }
+        LedgerInfo info = ledgers.get(ledgerId);
+        if (info != null
+                && isSourceSafeBookKeeperDeletion(info)
+                && info.getOffloadContext().getBookkeeperDeleteState()
+                        != BookKeeperDeleteState.BK_DELETE_NONE) {
+            return;
+        }
+        offloadReadSourcePins.remove(ledgerId, pinRegistry);
     }
 
     public void invalidateLedgerHandle(ReadHandle ledgerHandle) {
@@ -3032,10 +3065,30 @@ public class ManagedLedgerImpl implements ManagedLedger, CreateCallback {
 
     boolean isOffloadedNeedsDelete(OffloadContext offload, Optional<OffloadPolicies> offloadPolicies) {
         long elapsedMs = clock.millis() - offload.getTimestamp();
-        return offloadPolicies.filter(policies -> offload.isComplete() && !offload.isBookkeeperDeleted()
+        boolean deletionLagElapsed = offloadPolicies.filter(policies -> offload.isComplete()
                 && policies.getManagedLedgerOffloadDeletionLagInMillis() != null
                 && policies.getManagedLedgerOffloadDeletionLagInMillis() >= 0
                 && elapsedMs > policies.getManagedLedgerOffloadDeletionLagInMillis()).isPresent();
+        if (!deletionLagElapsed) {
+            return false;
+        }
+        if (!offload.hasBookkeeperRetentionClass() && !offload.hasBookkeeperDeleteState()) {
+            return !offload.isBookkeeperDeleted();
+        }
+        return config.getLedgerOffloader() instanceof SourceSafeLedgerOffloader sourceSafeOffloader
+                && sourceSafeOffloader.getBookKeeperRetentionClass()
+                        == SourceSafeLedgerOffloader.RetentionClass.DELETE_AFTER_VERIFIED
+                && offload.hasBookkeeperRetentionClass()
+                && offload.getBookkeeperRetentionClass() == BookKeeperRetentionClass.DELETE_AFTER_VERIFIED
+                && offload.hasBookkeeperDeleteState()
+                && offload.getBookkeeperDeleteState() != BookKeeperDeleteState.BK_DELETE_DONE
+                && !offload.isBookkeeperDeleted();
+    }
+
+    private static boolean isSourceSafeBookKeeperDeletion(LedgerInfo info) {
+        return info.hasOffloadContext()
+                && info.getOffloadContext().hasBookkeeperRetentionClass()
+                && info.getOffloadContext().hasBookkeeperDeleteState();
     }
 
     /**
@@ -3270,6 +3323,9 @@ public class ManagedLedgerImpl implements ManagedLedger, CreateCallback {
             doDeleteLedgers(ledgersToDelete);
 
             for (LedgerInfo ls : offloadedLedgersToDelete) {
+                if (isSourceSafeBookKeeperDeletion(ls)) {
+                    continue;
+                }
                 LedgerInfo newInfo = new LedgerInfo();
                 newInfo.copyFrom(ls);
                 newInfo.setOffloadContext().setBookkeeperDeleted(true);
@@ -3297,10 +3353,17 @@ public class ManagedLedgerImpl implements ManagedLedger, CreateCallback {
                         log.info().attr("ledgerId", ls.getLedgerId()).attr("size", ls.getSize()).log("Removing ledger");
                         asyncDeleteLedger(ls.getLedgerId(), ls);
                     }
+                    List<CompletableFuture<Void>> sourceSafeDeletes = new ArrayList<>();
                     for (LedgerInfo ls : offloadedLedgersToDelete) {
                         log.info().attr("ledgerId", ls.getLedgerId())
                                 .attr("size", ls.getSize())
                                 .log("Deleting offloaded ledger from bookkeeper");
+                        if (isSourceSafeBookKeeperDeletion(ls)
+                                && config.getLedgerOffloader()
+                                        instanceof SourceSafeLedgerOffloader sourceSafeOffloader) {
+                            sourceSafeDeletes.add(deleteSourceSafeLedgerFromBookKeeper(ls, sourceSafeOffloader));
+                            continue;
+                        }
                         invalidateReadHandle(ls.getLedgerId());
                         asyncDeleteLedgerFromBookKeeper(ls.getLedgerId()).thenAccept(__ -> {
                             log.info().attr("ledgerId", ls.getLedgerId())
@@ -3313,7 +3376,15 @@ public class ManagedLedgerImpl implements ManagedLedger, CreateCallback {
                             return null;
                         });
                     }
-                    promise.complete(null);
+                    CompletableFuture.allOf(sourceSafeDeletes.toArray(CompletableFuture[]::new))
+                            .whenComplete((ignored, sourceSafeFailure) -> {
+                                if (sourceSafeFailure == null) {
+                                    promise.complete(null);
+                                } else {
+                                    promise.completeExceptionally(FutureUtil.unwrapCompletionException(
+                                            sourceSafeFailure));
+                                }
+                            });
                 }
 
                 @Override
@@ -3539,6 +3610,173 @@ public class ManagedLedgerImpl implements ManagedLedger, CreateCallback {
         return asyncDeleteLedger(ledgerId, DEFAULT_LEDGER_DELETE_RETRIES);
     }
 
+    private CompletableFuture<Void> deleteSourceSafeLedgerFromBookKeeper(
+            LedgerInfo info, SourceSafeLedgerOffloader offloader) {
+        long ledgerId = info.getLedgerId();
+        OffloadContext context = info.getOffloadContext();
+        if (!context.isComplete()
+                || !context.hasUidMsb()
+                || !context.hasUidLsb()
+                || !context.hasDriverMetadata()
+                || !context.getDriverMetadata().hasName()
+                || !Objects.equals(context.getDriverMetadata().getName(), offloader.getOffloadDriverName())
+                || (context.getBookkeeperDeleteState() != BookKeeperDeleteState.BK_DELETE_NONE
+                        && context.getBookkeeperDeleteState() != BookKeeperDeleteState.BK_DELETE_INTENT)) {
+            return CompletableFuture.failedFuture(new OffloadConflict(
+                    "Source-safe BookKeeper deletion rejected incomplete or mismatched offload metadata for ledger "
+                            + ledgerId));
+        }
+        UUID attemptUuid = new UUID(context.getUidMsb(), context.getUidLsb());
+        boolean resumingIntent = context.getBookkeeperDeleteState() == BookKeeperDeleteState.BK_DELETE_INTENT;
+        AtomicBoolean intentPersisted = new AtomicBoolean(resumingIntent);
+        Map<String, String> driverMetadata = new HashMap<>(OffloadUtils.getOffloadDriverMetadata(
+                info, offloader.getOffloadDriverMetadata()));
+        driverMetadata.put("ManagedLedgerName", name);
+        LedgerReadSourcePinRegistry pinRegistry;
+        synchronized (this) {
+            if (!sourceSafeBookKeeperDeletions.add(ledgerId)) {
+                return CompletableFuture.failedFuture(new OffloadConflict(
+                        "Source-safe BookKeeper deletion is already running for ledger " + ledgerId));
+            }
+            pinRegistry = offloadReadSourcePins.computeIfAbsent(
+                    ledgerId, ignored -> new LedgerReadSourcePinRegistry());
+        }
+
+        CompletableFuture<Void> deletion = boundedSourceDeletionDrain(
+                pinRegistry.fence(LedgerReadSourcePinRegistry.Source.BOOKKEEPER), ledgerId);
+        if (!resumingIntent) {
+            deletion = deletion
+                    .thenCompose(ignored -> offloader.revalidateOffloadedForSourceDeletion(
+                            ledgerId,
+                            attemptUuid,
+                            driverMetadata,
+                            info.getEntries() - 1,
+                            info.getEntries(),
+                            info.getSize()))
+                    .thenCompose(ignored -> markBookKeeperDeleteIntent(ledgerId, attemptUuid))
+                    .thenRun(() -> intentPersisted.set(true));
+        }
+
+        return deletion.thenCompose(ignored -> closeCachedBookKeeperSource(ledgerId))
+                .thenCompose(ignored -> asyncDeleteLedgerFromBookKeeper(ledgerId))
+                .thenCompose(ignored -> verifyBookKeeperLedgerAbsent(ledgerId))
+                .thenCompose(ignored -> markBookKeeperDeleteDone(ledgerId, attemptUuid))
+                .whenComplete((ignored, failure) -> {
+                    if (failure != null && !intentPersisted.get()) {
+                        pinRegistry.unfenceBookKeeperAfterDrain();
+                    }
+                    synchronized (this) {
+                        sourceSafeBookKeeperDeletions.remove(ledgerId);
+                    }
+                });
+    }
+
+    private CompletableFuture<Void> boundedSourceDeletionDrain(CompletableFuture<Void> drain, long ledgerId) {
+        CompletableFuture<Void> bounded = new CompletableFuture<>();
+        long timeoutSeconds = Math.max(1, config.getMetadataOperationsTimeoutSeconds());
+        ScheduledFuture<?> timeout = scheduledExecutor.schedule(
+                () -> bounded.completeExceptionally(new TimeoutException(
+                        "Timed out draining BookKeeper source pins for ledger " + ledgerId)),
+                timeoutSeconds,
+                TimeUnit.SECONDS);
+        drain.whenComplete((ignored, failure) -> {
+            if (failure == null) {
+                bounded.complete(null);
+            } else {
+                bounded.completeExceptionally(FutureUtil.unwrapCompletionException(failure));
+            }
+        });
+        bounded.whenComplete((ignored, failure) -> timeout.cancel(false));
+        return bounded;
+    }
+
+    private CompletableFuture<Void> closeCachedBookKeeperSource(long ledgerId) {
+        CompletableFuture<ReadHandle> cached = ledgerCache.get(ledgerId);
+        if (cached == null) {
+            return CompletableFuture.completedFuture(null);
+        }
+        return cached.handle((handle, openFailure) -> {
+            if (openFailure != null) {
+                ledgerCache.remove(ledgerId, cached);
+                return CompletableFuture.<Void>completedFuture(null);
+            }
+            if (handle instanceof DualSourceReadHandle dualSource) {
+                return dualSource.closeBookKeeperSource();
+            }
+            ledgerCache.remove(ledgerId, cached);
+            return handle.closeAsync();
+        }).thenCompose(future -> future);
+    }
+
+    private CompletableFuture<Void> verifyBookKeeperLedgerAbsent(long ledgerId) {
+        return bookKeeper.newOpenLedgerOp()
+                .withRecovery(false)
+                .withLedgerId(ledgerId)
+                .withDigestType(config.getDigestType())
+                .withPassword(config.getPassword())
+                .withLoggerContext(log)
+                .execute()
+                .handle((handle, openFailure) -> {
+                    if (openFailure == null) {
+                        return handle.closeAsync().thenCompose(ignored -> CompletableFuture.<Void>failedFuture(
+                                new IllegalStateException(
+                                        "BookKeeper ledger " + ledgerId + " still exists after deletion")));
+                    }
+                    Throwable failure = FutureUtil.unwrapCompletionException(openFailure);
+                    if (isNoSuchLedgerExistsException(BKException.getExceptionCode(failure))) {
+                        return CompletableFuture.<Void>completedFuture(null);
+                    }
+                    return CompletableFuture.<Void>failedFuture(failure);
+                })
+                .thenCompose(future -> future);
+    }
+
+    private CompletableFuture<Void> markBookKeeperDeleteIntent(long ledgerId, UUID attemptUuid) {
+        return transformLedgerInfo(ledgerId, oldInfo -> {
+            validateSourceSafeDeleteState(
+                    oldInfo, attemptUuid, BookKeeperDeleteState.BK_DELETE_NONE, "delete-intent");
+            LedgerInfo newInfo = new LedgerInfo();
+            newInfo.copyFrom(oldInfo);
+            newInfo.setOffloadContext()
+                    .setBookkeeperDeleted(false)
+                    .setBookkeeperDeleteState(BookKeeperDeleteState.BK_DELETE_INTENT);
+            return newInfo;
+        });
+    }
+
+    private CompletableFuture<Void> markBookKeeperDeleteDone(long ledgerId, UUID attemptUuid) {
+        return transformLedgerInfo(ledgerId, oldInfo -> {
+            validateSourceSafeDeleteState(
+                    oldInfo, attemptUuid, BookKeeperDeleteState.BK_DELETE_INTENT, "delete-done");
+            LedgerInfo newInfo = new LedgerInfo();
+            newInfo.copyFrom(oldInfo);
+            newInfo.setOffloadContext()
+                    .setBookkeeperDeleted(true)
+                    .setBookkeeperDeleteState(BookKeeperDeleteState.BK_DELETE_DONE);
+            return newInfo;
+        });
+    }
+
+    private static void validateSourceSafeDeleteState(
+            LedgerInfo info,
+            UUID attemptUuid,
+            BookKeeperDeleteState expectedState,
+            String transition) throws OffloadConflict {
+        OffloadContext context = info.getOffloadContext();
+        if (!context.isComplete()
+                || !context.hasUidMsb()
+                || !context.hasUidLsb()
+                || !attemptUuid.equals(new UUID(context.getUidMsb(), context.getUidLsb()))
+                || !context.hasBookkeeperRetentionClass()
+                || context.getBookkeeperRetentionClass() != BookKeeperRetentionClass.DELETE_AFTER_VERIFIED
+                || !context.hasBookkeeperDeleteState()
+                || context.getBookkeeperDeleteState() != expectedState
+                || context.isBookkeeperDeleted()) {
+            throw new OffloadConflict("Source-safe " + transition
+                    + " rejected stale or ineligible metadata for ledger " + info.getLedgerId());
+        }
+    }
+
     private void asyncDeleteLedger(long ledgerId, LedgerInfo info) {
         if (!info.getOffloadContext().isBookkeeperDeleted()) {
             // only delete if it hasn't been previously deleted for offload
@@ -3573,7 +3811,7 @@ public class ManagedLedgerImpl implements ManagedLedger, CreateCallback {
                     future.completeExceptionally(BKException.create(rc));
                     return;
                 }
-                scheduledExecutor.schedule(() -> asyncDeleteLedger(ledgerId, retry - 1),
+                scheduledExecutor.schedule(() -> asyncDeleteLedgerWithRetry(future, ledgerId, retry - 1),
                         DEFAULT_LEDGER_DELETE_BACKOFF_TIME_SEC, TimeUnit.SECONDS);
             } else {
                 log.debug().attr("ledgerId", ledgerId).log("Deleted ledger");
@@ -3978,9 +4216,23 @@ public class ManagedLedgerImpl implements ManagedLedger, CreateCallback {
                                        }
                                        LedgerInfo newInfo = new LedgerInfo();
                                        newInfo.copyFrom(oldInfo);
-                                       newInfo.setOffloadContext()
-                                           .setUidMsb(uuid.getMostSignificantBits())
-                                           .setUidLsb(uuid.getLeastSignificantBits());
+                                       OffloadContext newContext = newInfo.setOffloadContext()
+                                               .setUidMsb(uuid.getMostSignificantBits())
+                                               .setUidLsb(uuid.getLeastSignificantBits())
+                                               .setBookkeeperDeleted(false);
+                                       if (config.getLedgerOffloader()
+                                               instanceof SourceSafeLedgerOffloader sourceSafeOffloader) {
+                                           BookKeeperRetentionClass retentionClass = switch (
+                                                   sourceSafeOffloader.getBookKeeperRetentionClass()) {
+                                               case RETAIN_BK -> BookKeeperRetentionClass.RETAIN_BK;
+                                               case DELETE_AFTER_VERIFIED ->
+                                                   BookKeeperRetentionClass.DELETE_AFTER_VERIFIED;
+                                           };
+                                           newContext.setBookkeeperRetentionClass(retentionClass)
+                                                   .setBookkeeperDeleteState(BookKeeperDeleteState.BK_DELETE_NONE);
+                                       } else {
+                                           newContext.clearBookkeeperRetentionClass().clearBookkeeperDeleteState();
+                                       }
                                        OffloadUtils.setOffloadDriverMetadata(
                                            newInfo,
                                            offloadDriverName,

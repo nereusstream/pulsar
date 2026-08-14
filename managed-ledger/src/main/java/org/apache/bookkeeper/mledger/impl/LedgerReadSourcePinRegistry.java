@@ -84,6 +84,22 @@ final class LedgerReadSourcePinRegistry {
         return true;
     }
 
+    CompletableFuture<Void> unfenceBookKeeperAfterDrain() {
+        CompletableFuture<Void> drained;
+        synchronized (this) {
+            drained = fence(Source.BOOKKEEPER);
+        }
+        return drained.handle((ignored, failure) -> {
+            synchronized (this) {
+                if (bookKeeperPins == 0 && !objectFenced) {
+                    bookKeeperFenced = false;
+                    bookKeeperDrain = null;
+                }
+            }
+            return null;
+        });
+    }
+
     synchronized int pinCount() {
         return objectPins + bookKeeperPins;
     }

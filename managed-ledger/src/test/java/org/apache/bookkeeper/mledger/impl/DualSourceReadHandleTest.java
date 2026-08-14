@@ -177,6 +177,20 @@ public class DualSourceReadHandleTest {
     }
 
     @Test
+    public void failedDeletionFenceUnfencesOnlyAfterLateBookKeeperPinDrains() {
+        LedgerReadSourcePinRegistry pins = new LedgerReadSourcePinRegistry();
+        LedgerReadSourcePinRegistry.Pin accepted = pins.acquire(Source.BOOKKEEPER, none());
+
+        CompletableFuture<Void> unfenced = pins.unfenceBookKeeperAfterDrain();
+
+        assertFalse(unfenced.isDone());
+        accepted.close();
+        unfenced.join();
+        LedgerReadSourcePinRegistry.Pin admittedAgain = pins.acquire(Source.BOOKKEEPER, none());
+        admittedAgain.close();
+    }
+
+    @Test
     public void closeWaitsForRangePinAndClosesInitializedChildExactlyOnce() {
         Harness harness = harness(OffloadedReadPriority.TIERED_STORAGE_FIRST, none());
         LedgerEntries accepted = harness.handle.readAsync(0, 1).join();
