@@ -1180,6 +1180,46 @@ public class PersistentTopics extends PersistentTopicsBase {
             });
     }
 
+    @PUT
+    @Path("/{tenant}/{namespace}/{topic}/resourceGuard")
+    @Operation(summary = "Update the complete Nereus resource guard on one physical partition topic.",
+            description = "Resource-controller endpoint. The generic topic properties endpoint rejects these keys.")
+    @ApiResponses(value = {
+        @ApiResponse(responseCode = "204", description = "Operation successful"),
+        @ApiResponse(responseCode = "400", description = "The request is not an exact partitioned physical topic"
+                + " or does not contain the complete guard tuple"),
+        @ApiResponse(responseCode = "401", description = "Not authorized to administer the topic"),
+        @ApiResponse(responseCode = "403", description = "Not authorized to administer the topic"),
+        @ApiResponse(responseCode = "404", description = "The physical topic does not exist"),
+        @ApiResponse(responseCode = "409", description = "Concurrent resource update"),
+        @ApiResponse(responseCode = "500", description = "Internal server error")
+    })
+    public void updateResourceGuard(
+        @Suspended final AsyncResponse asyncResponse,
+        @Parameter(description = "Specify the tenant", required = true)
+        @PathParam("tenant") String tenant,
+        @Parameter(description = "Specify the namespace", required = true)
+        @PathParam("namespace") String namespace,
+        @Parameter(description = "Specify the exact physical partition topic", required = true)
+        @PathParam("topic") @Encoded String encodedTopic,
+        @Parameter(description = "Whether leader broker redirected this call to this broker.")
+        @QueryParam("authoritative") @DefaultValue("false") boolean authoritative,
+        @RequestBody(description = "Complete resource guard property tuple") Map<String, String> properties) {
+        validatePersistentTopicName(tenant, namespace, encodedTopic);
+        internalUpdateTopicResourceGuardPropertiesAsync(authoritative, properties)
+                .thenAccept(__ -> asyncResponse.resume(Response.noContent().build()))
+                .exceptionally(ex -> {
+                    if (isNot307And404Exception(ex)) {
+                        log.error()
+                                .attr("topic", topicName)
+                                .exception(ex)
+                                .log("Failed to update Nereus topic resource guard");
+                    }
+                    resumeAsyncResponseExceptionally(asyncResponse, ex);
+                    return null;
+                });
+    }
+
     @DELETE
     @Path("/{tenant}/{namespace}/{topic}/properties")
     @Operation(summary = "Remove the key in properties on the given topic.")

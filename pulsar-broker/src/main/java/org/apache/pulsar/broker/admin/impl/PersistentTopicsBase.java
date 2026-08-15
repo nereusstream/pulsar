@@ -691,6 +691,39 @@ public class PersistentTopicsBase extends AdminResource {
                             .log("update properties success with properties"));
     }
 
+    /**
+     * Applies the complete resource-controller guard tuple to one exact physical topic.
+     * The generic topic-properties endpoint deliberately rejects these keys; this path keeps
+     * the ordered invalidation/persist/republish sequence inside PersistentTopic.
+     */
+    protected CompletableFuture<Void> internalUpdateTopicResourceGuardPropertiesAsync(
+            boolean authoritative, Map<String, String> properties) {
+        Set<String> requiredKeys = Set.of("nereus.resource.guard.version",
+                "nereus.resource.incarnation", "nereus.resource.created-at");
+        if (properties == null || !properties.keySet().equals(requiredKeys)) {
+            return FutureUtil.failedFuture(new RestException(Status.BAD_REQUEST,
+                    "resource controller must provide the complete resource guard property tuple"));
+        }
+        if (!topicName.isPartitioned()) {
+            return FutureUtil.failedFuture(new RestException(Status.BAD_REQUEST,
+                    "resource guard updates require an exact partitioned physical topic"));
+        }
+        return validateTopicOperationAsync(topicName, TopicOperation.UPDATE_METADATA)
+                .thenCompose(__ -> validateTopicOwnershipAsync(topicName, authoritative))
+                .thenCompose(__ -> pulsar().getBrokerService().getTopicIfExists(topicName.toString()))
+                .thenCompose(optional -> {
+                    if (optional.isEmpty()) {
+                        return FutureUtil.failedFuture(new RestException(Status.NOT_FOUND,
+                                getTopicNotFoundErrorMessage(topicName.toString())));
+                    }
+                    if (!(optional.get() instanceof PersistentTopic persistentTopic)) {
+                        return FutureUtil.failedFuture(new RestException(Status.BAD_REQUEST,
+                                "resource guard updates require a persistent physical topic"));
+                    }
+                    return persistentTopic.updateTopicResourceGuardProperties(properties);
+                });
+    }
+
     private CompletableFuture<Void> internalUpdateNonPartitionedTopicProperties(Map<String, String> properties) {
         CompletableFuture<Void> future = new CompletableFuture<>();
         pulsar().getBrokerService().getTopicIfExists(topicName.toString())
