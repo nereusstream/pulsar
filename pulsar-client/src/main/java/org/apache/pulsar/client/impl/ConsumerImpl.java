@@ -1548,6 +1548,10 @@ public class ConsumerImpl<T> extends ConsumerBase<T> implements GuardedConsumer<
                         .log("Ignoring message from before the startMessageId");
 
                 uncompressedPayload.release();
+                // The broker consumed one permit for this entry even though the client
+                // filtered it before exposing it to the application. Replenish that
+                // permit so a small receiver queue can continue past a seek boundary.
+                increaseAvailablePermits(cnx);
                 return;
             }
 
