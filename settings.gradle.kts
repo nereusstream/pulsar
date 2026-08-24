@@ -25,6 +25,14 @@ pluginManagement {
     includeBuild("build-logic")
 }
 
+val nereusM3DevelopmentRepository = providers.gradleProperty("nereusM3DevelopmentRepository")
+val nereusM3DevelopmentVersion = providers.gradleProperty("nereusM3DevelopmentVersion")
+val nereusM3DevelopmentEnabled =
+    nereusM3DevelopmentRepository.isPresent && nereusM3DevelopmentVersion.isPresent
+require(nereusM3DevelopmentRepository.isPresent == nereusM3DevelopmentVersion.isPresent) {
+    "nereusM3DevelopmentRepository and nereusM3DevelopmentVersion must be provided together"
+}
+
 dependencyResolutionManagement {
     val nereusN1SourceCommit = "330aaec349c51fb2ace52b1085e8a9e5a60b5e3e"
     val nereusN1Version = "0.2.0-n1.$nereusN1SourceCommit"
@@ -75,6 +83,19 @@ dependencyResolutionManagement {
             filter {
                 includeVersion("io.github.oxia-db", "oxia-client", oxiaClientVersion)
                 includeVersion("io.github.oxia-db", "oxia-client-api", oxiaClientVersion)
+            }
+        }
+        if (nereusM3DevelopmentEnabled) {
+            maven {
+                name = "nereusM3Development"
+                url = uri(file(nereusM3DevelopmentRepository.get()))
+                content {
+                    includeVersion("com.nereusstream", "nereus-domain", nereusM3DevelopmentVersion.get())
+                    includeVersion("com.nereusstream", "nereus-metadata-spi", nereusM3DevelopmentVersion.get())
+                    includeVersion("com.nereusstream", "nereus-storage-api", nereusM3DevelopmentVersion.get())
+                    includeVersion("com.nereusstream", "nereus-storage-object", nereusM3DevelopmentVersion.get())
+                    includeVersion("com.nereusstream", "nereus-pulsar-offload", nereusM3DevelopmentVersion.get())
+                }
             }
         }
         mavenCentral()

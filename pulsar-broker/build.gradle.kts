@@ -25,6 +25,18 @@ plugins {
     alias(libs.plugins.swagger)
 }
 
+val nereusM3DevelopmentVersion = providers.gradleProperty("nereusM3DevelopmentVersion")
+val nereusM3DevelopmentEnabled = nereusM3DevelopmentVersion.isPresent
+
+if (!nereusM3DevelopmentEnabled) {
+    sourceSets.main {
+        java.exclude("org/apache/pulsar/broker/storage/nereus/v2/NereusPulsarNativeCellOwnerAuthorityBridgeV1.java")
+    }
+    sourceSets.test {
+        java.exclude("org/apache/pulsar/broker/storage/nereus/v2/NereusPulsarNativeCellOwnerAuthorityBridgeV1Test.java")
+    }
+}
+
 dependencies {
     api(libs.slog)
     api(project(":managed-ledger"))
@@ -39,6 +51,11 @@ dependencies {
     implementation(libs.nereus.domain.n1)
     implementation(libs.nereus.metadata.spi.n1)
     implementation(libs.nereus.metadata.oxia.p1)
+    if (nereusM3DevelopmentEnabled) {
+        implementation("com.nereusstream:nereus-pulsar-offload:${nereusM3DevelopmentVersion.get()}") {
+            isChanging = true
+        }
+    }
     implementation(project(":pulsar-client-messagecrypto-bc"))
     api(project(":pulsar-functions:pulsar-functions-worker"))
     implementation(project(":pulsar-docs-tools")) {
@@ -142,6 +159,21 @@ dependencies {
     testImplementation(libs.oxia.testcontainers)
     testRuntimeOnly(libs.avro.protobuf) {
         exclude(group = "com.google.protobuf")
+    }
+}
+
+if (nereusM3DevelopmentEnabled) {
+    configurations.configureEach {
+        resolutionStrategy {
+            cacheChangingModulesFor(0, "seconds")
+            force(
+                "com.nereusstream:nereus-domain:${nereusM3DevelopmentVersion.get()}",
+                "com.nereusstream:nereus-metadata-spi:${nereusM3DevelopmentVersion.get()}",
+                "com.nereusstream:nereus-storage-api:${nereusM3DevelopmentVersion.get()}",
+                "com.nereusstream:nereus-storage-object:${nereusM3DevelopmentVersion.get()}",
+                "com.nereusstream:nereus-pulsar-offload:${nereusM3DevelopmentVersion.get()}",
+            )
+        }
     }
 }
 
