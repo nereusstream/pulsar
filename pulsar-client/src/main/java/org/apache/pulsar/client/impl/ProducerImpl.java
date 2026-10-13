@@ -1352,6 +1352,7 @@ public class ProducerImpl<T> extends ProducerBase<T> implements TimerTask, Conne
         PulsarClientException ex = new PulsarClientException.AlreadyClosedException(
                 format("The producer %s of the topic %s was already closed when closing the producers",
                         producerName, topic));
+        producerCreatedFuture.completeExceptionally(ex);
         // Use null for cnx to ensure that the pending messages are failed immediately
         failPendingMessages(null, ex);
     }
@@ -2342,11 +2343,11 @@ public class ProducerImpl<T> extends ProducerBase<T> implements TimerTask, Conne
                 .attr("retry", t.getClass().getName())
                 .exceptionMessage(t)
                 .log("Closed producer because get an error that does not support to retry");
+        producerCreatedFuture.completeExceptionally(t);
         closeAsync().whenComplete((v, ex) -> {
             if (ex != null) {
                 log.error().exception(ex).log("Failed to close producer on TopicDoesNotExistException.");
             }
-            producerCreatedFuture.completeExceptionally(t);
         });
     }
 

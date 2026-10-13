@@ -1195,6 +1195,7 @@ public class ConsumerImpl<T> extends ConsumerBase<T> implements GuardedConsumer<
 
 
         if (getState() == State.Closing || getState() == State.Closed) {
+            terminatePendingSubscription();
             closeConsumerTasks();
             failPendingReceive().whenComplete((r, t) -> closeFuture.complete(null));
             return compositeCloseFuture;
@@ -1205,6 +1206,7 @@ public class ConsumerImpl<T> extends ConsumerBase<T> implements GuardedConsumer<
         if (!isConnected()) {
             log.info("Closed Consumer (not connected)");
             setState(State.Closed);
+            terminatePendingSubscription();
             closeConsumerTasks();
             deregisterFromClientCnx();
             client.cleanupConsumer(this);
@@ -1215,6 +1217,7 @@ public class ConsumerImpl<T> extends ConsumerBase<T> implements GuardedConsumer<
         stats.getStatTimeout().ifPresent(Timeout::cancel);
 
         setState(State.Closing);
+        terminatePendingSubscription();
 
         closeConsumerTasks();
 
@@ -1237,6 +1240,11 @@ public class ConsumerImpl<T> extends ConsumerBase<T> implements GuardedConsumer<
         }
 
         return compositeCloseFuture;
+    }
+
+    private void terminatePendingSubscription() {
+        subscribeFuture.completeExceptionally(new PulsarClientException.AlreadyClosedException(
+                "Consumer closed before subscription completed"));
     }
 
     private void cleanupAtClose(CompletableFuture<Void> closeFuture, Throwable exception) {

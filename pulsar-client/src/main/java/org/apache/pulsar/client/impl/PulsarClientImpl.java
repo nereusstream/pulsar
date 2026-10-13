@@ -139,6 +139,7 @@ public class PulsarClientImpl implements PulsarClient {
 
     private final AtomicReference<State> state = new AtomicReference<>();
     private CompletableFuture<Void> closeFuture;
+    private volatile Thread closeShutdownThread;
     // These sets are updated from multiple threads, so they require a threadsafe data structure
     private final Set<ProducerBase<?>> producers = Collections.newSetFromMap(new ConcurrentHashMap<>());
     private final Set<ConsumerBase<?>> consumers = Collections.newSetFromMap(new ConcurrentHashMap<>());
@@ -308,10 +309,50 @@ public class PulsarClientImpl implements PulsarClient {
             // Log the exception first, or it could be missed if there are any subsequent exceptions in the
             // shutdown sequence
             log.error().exception(t).log("Failed to create Pulsar client instance.");
-            shutdown();
-            shutdownEventLoopGroup(eventLoopGroupReference);
-            closeCnxPool(connectionPoolReference);
+            ConstructionCleanupFailure cleanup = new ConstructionCleanupFailure(
+                    t, this, eventLoopGroupReference, connectionPoolReference);
+            try {
+                cleanup.retryTermination();
+            } catch (PulsarClientException failure) {
+                throw cleanup;
+            }
             throw t;
+        }
+    }
+
+    /** Keeps a failed constructor's original owned resources available solely for a later cleanup attempt. */
+    public static final class ConstructionCleanupFailure extends PulsarClientException {
+        private static final long serialVersionUID = 1L;
+        private final transient PulsarClientImpl failedClient;
+        private final transient EventLoopGroup eventLoops;
+        private final transient ConnectionPool connections;
+        private boolean terminated;
+
+        private ConstructionCleanupFailure(Throwable original, PulsarClientImpl failedClient,
+                EventLoopGroup eventLoops, ConnectionPool connections) {
+            super(original);
+            this.failedClient = failedClient;
+            this.eventLoops = eventLoops;
+            this.connections = connections;
+        }
+
+        public synchronized boolean resourcesTerminated() { return terminated; }
+
+        /** Blocking cleanup only; the constructor never exposes this partial client for application work. */
+        public synchronized void retryTermination() throws PulsarClientException {
+            if (terminated) { return; }
+            Throwable failure = null;
+            try { failedClient.shutdown(); }
+            catch (Throwable t) { failure = addShutdownFailure(failure, t); }
+            try { failedClient.shutdownEventLoopGroup(eventLoops); }
+            catch (Throwable t) { failure = addShutdownFailure(failure, t); }
+            try { failedClient.closeCnxPool(connections); }
+            catch (Throwable t) { failure = addShutdownFailure(failure, t); }
+            if (failure != null) {
+                if (getSuppressed().length == 0) { addSuppressed(failure); }
+                throw PulsarClientException.unwrap(failure);
+            }
+            terminated = true;
         }
     }
 
@@ -1058,7 +1099,7 @@ public class PulsarClientImpl implements PulsarClient {
 
     private void startCloseShutdown(Throwable closeFailure, ScheduledExecutorService shutdownExecutor) {
         try {
-            new Thread(() -> {
+            Thread shutdownThread = new Thread(() -> {
                 Throwable failure = closeFailure;
                 if (shutdownExecutor != null) {
                     try {
@@ -1086,7 +1127,9 @@ public class PulsarClientImpl implements PulsarClient {
                 } else {
                     closeFuture.completeExceptionally(failure);
                 }
-            }, "pulsar-client-shutdown-thread").start();
+            }, "pulsar-client-shutdown-thread");
+            closeShutdownThread = shutdownThread;
+            shutdownThread.start();
         } catch (Throwable failure) {
             if (shutdownExecutor != null) {
                 try {
@@ -1097,6 +1140,19 @@ public class PulsarClientImpl implements PulsarClient {
             }
             closeFuture.completeExceptionally(addShutdownFailure(closeFailure, failure));
         }
+    }
+
+    /** The explicit backend owner calls from outside SDK threads after observing the first close completion. */
+    public void awaitCloseShutdownTermination(long timeout, TimeUnit unit)
+            throws InterruptedException, TimeoutException {
+        if (timeout <= 0) { throw new IllegalArgumentException("close termination wait must be positive"); }
+        Thread shutdownThread = closeShutdownThread;
+        if (shutdownThread == null) { return; }
+        if (shutdownThread == Thread.currentThread()) {
+            throw new IllegalStateException("cannot await the client shutdown thread from itself");
+        }
+        shutdownThread.join(Math.max(1, unit.toMillis(timeout)));
+        if (shutdownThread.isAlive()) { throw new TimeoutException("Client shutdown thread has not terminated"); }
     }
 
     @Override
