@@ -34,7 +34,6 @@ import java.time.Clock;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Collections;
-import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -47,6 +46,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
@@ -138,6 +138,7 @@ public class PulsarClientImpl implements PulsarClient {
     }
 
     private final AtomicReference<State> state = new AtomicReference<>();
+    private CompletableFuture<Void> closeFuture;
     // These sets are updated from multiple threads, so they require a threadsafe data structure
     private final Set<ProducerBase<?>> producers = Collections.newSetFromMap(new ConcurrentHashMap<>());
     private final Set<ConsumerBase<?>> consumers = Collections.newSetFromMap(new ConcurrentHashMap<>());
@@ -979,87 +980,136 @@ public class PulsarClientImpl implements PulsarClient {
         }
     }
 
-    private void closeUrlLookupMap() {
-        Map<String, LookupService> closedUrlLookupServices = new HashMap<>(urlLookupMap.size());
-        urlLookupMap.entrySet().forEach(e -> {
+    private Throwable closeUrlLookupMap() {
+        Throwable failure = null;
+        for (Map.Entry<String, LookupService> e : urlLookupMap.entrySet()) {
             try {
                 e.getValue().close();
-            } catch (Exception ex) {
+                urlLookupMap.remove(e.getKey(), e.getValue());
+            } catch (Throwable ex) {
                 log.error().attr("service", e.getKey()).exception(ex).log("Error closing lookup service");
+                failure = addShutdownFailure(failure, ex);
             }
-            closedUrlLookupServices.put(e.getKey(), e.getValue());
-        });
-        closedUrlLookupServices.entrySet().forEach(e -> {
-            urlLookupMap.remove(e.getKey(), e.getValue());
-        });
+        }
+        return failure;
     }
 
     @Override
-    public CompletableFuture<Void> closeAsync() {
-        log.info().attr("url", lookup.getServiceUrl()).log("Client closing. URL");
+    public synchronized CompletableFuture<Void> closeAsync() {
+        if (closeFuture != null) {
+            return closeFuture.copy();
+        }
         if (!state.compareAndSet(State.Open, State.Closing)) {
             return FutureUtil.failedFuture(new PulsarClientException.AlreadyClosedException("Client already closed"));
         }
-
-        final CompletableFuture<Void> closeFuture = new CompletableFuture<>();
+        closeFuture = new CompletableFuture<>();
         List<CompletableFuture<Void>> futures = new ArrayList<>();
-
-        closeUrlLookupMap();
-
-        producers.forEach(p -> futures.add(p.closeAsync().handle((__, t) -> {
-            if (t != null) {
-                log.error().attr("producer", p).exception(t).log("Error closing producer");
+        Throwable lookupFailure = closeUrlLookupMap();
+        if (lookupFailure != null) {
+            futures.add(FutureUtil.failedFuture(lookupFailure));
+        }
+        producers.forEach(p -> {
+            try {
+                futures.add(p.closeAsync().whenComplete((__, t) -> {
+                    if (t != null) {
+                        log.error().attr("producer", p).exception(t).log("Error closing producer");
+                    }
+                }));
+            } catch (Throwable failure) {
+                futures.add(FutureUtil.failedFuture(failure));
             }
-            return null;
-        })));
-        consumers.forEach(c -> futures.add(c.closeAsync().handle((__, t) -> {
-            if (t != null) {
-                log.error().attr("consumer", c).exception(t).log("Error closing consumer");
+        });
+        consumers.forEach(c -> {
+            try {
+                futures.add(c.closeAsync().whenComplete((__, t) -> {
+                    if (t != null) {
+                        log.error().attr("consumer", c).exception(t).log("Error closing consumer");
+                    }
+                }));
+            } catch (Throwable failure) {
+                futures.add(FutureUtil.failedFuture(failure));
             }
-            return null;
-        })));
+        });
 
         // Need to run the shutdown sequence in a separate thread to prevent deadlocks
         // If there are consumers or producers that need to be shutdown we cannot use the same thread
         // to shutdown the EventLoopGroup as well as that would be trying to shutdown itself thus a deadlock
         // would happen
         CompletableFuture<Void> combinedFuture = FutureUtil.waitForAll(futures);
-        ScheduledExecutorService shutdownExecutor = Executors.newSingleThreadScheduledExecutor(
-                new ExecutorProvider.ExtendedThreadFactory("pulsar-client-shutdown-timeout-scheduler"));
-        FutureUtil.addTimeoutHandling(combinedFuture, Duration.ofSeconds(CLOSE_TIMEOUT_SECONDS),
-                shutdownExecutor, () -> FutureUtil.createTimeoutException("Closing producers and consumers timed out.",
-                        PulsarClientImpl.class, "closeAsync"));
-        combinedFuture.handle((__, t) -> {
-            if (t != null) {
-                log.error().exception(t).log("Closing producers and consumers failed. Continuing with shutdown.");
-            }
+        ScheduledExecutorService shutdownExecutor;
+        try {
+            shutdownExecutor = Executors.newSingleThreadScheduledExecutor(
+                    new ExecutorProvider.ExtendedThreadFactory("pulsar-client-shutdown-timeout-scheduler"));
+        } catch (Throwable failure) {
+            startCloseShutdown(failure, null);
+            return closeFuture.copy();
+        }
+        try {
+            FutureUtil.addTimeoutHandling(combinedFuture, Duration.ofSeconds(CLOSE_TIMEOUT_SECONDS),
+                    shutdownExecutor, () -> FutureUtil.createTimeoutException("Closing producers and consumers timed out.",
+                            PulsarClientImpl.class, "closeAsync"));
+        } catch (Throwable failure) {
+            startCloseShutdown(failure, shutdownExecutor);
+            return closeFuture.copy();
+        }
+        combinedFuture.whenComplete((__, failure) -> startCloseShutdown(failure, shutdownExecutor));
+        return closeFuture.copy();
+    }
+
+    private void startCloseShutdown(Throwable closeFailure, ScheduledExecutorService shutdownExecutor) {
+        try {
             new Thread(() -> {
-                shutdownExecutor.shutdownNow();
-                // All producers & consumers are now closed, we can stop the client safely
+                Throwable failure = closeFailure;
+                if (shutdownExecutor != null) {
+                    try {
+                        shutdownExecutor.shutdownNow();
+                        if (!shutdownExecutor.awaitTermination(CLOSE_TIMEOUT_SECONDS, TimeUnit.SECONDS)) {
+                            failure = addShutdownFailure(failure,
+                                    new TimeoutException("Client shutdown timeout scheduler has not terminated"));
+                        }
+                    } catch (InterruptedException interrupted) {
+                        Thread.currentThread().interrupt();
+                        failure = addShutdownFailure(failure, interrupted);
+                    } catch (Throwable cleanupFailure) {
+                        failure = addShutdownFailure(failure, cleanupFailure);
+                    }
+                }
                 try {
                     shutdown();
-                } catch (PulsarClientException e) {
-                    log.error().exception(e).log("Shutdown failed. Ignoring the exception.");
+                } catch (Throwable e) {
+                    log.error().exception(e).log("Client shutdown failed");
+                    failure = addShutdownFailure(failure, e);
                 }
                 state.set(State.Closed);
-                closeFuture.complete(null);
+                if (failure == null) {
+                    closeFuture.complete(null);
+                } else {
+                    closeFuture.completeExceptionally(failure);
+                }
             }, "pulsar-client-shutdown-thread").start();
-            return null;
-        });
-        return closeFuture;
+        } catch (Throwable failure) {
+            if (shutdownExecutor != null) {
+                try {
+                    shutdownExecutor.shutdownNow();
+                } catch (Throwable cleanupFailure) {
+                    failure = addShutdownFailure(failure, cleanupFailure);
+                }
+            }
+            closeFuture.completeExceptionally(addShutdownFailure(closeFailure, failure));
+        }
     }
 
     @Override
     public void shutdown() throws PulsarClientException {
+        state.compareAndSet(State.Open, State.Closing);
         try {
-            // We will throw the last thrown exception only, though logging all of them.
-            Throwable throwable = null;
+            Throwable throwable = closeUrlLookupMap();
             if (lookup != null) {
                 try {
                     lookup.close();
                 } catch (Throwable t) {
                     log.warn().exception(t).log("Failed to shutdown lookup");
-                    throwable = t;
+                    throwable = addShutdownFailure(throwable, t);
                 }
             }
             if (tcClient != null) {
@@ -1067,21 +1117,33 @@ public class PulsarClientImpl implements PulsarClient {
                     tcClient.close();
                 } catch (Throwable t) {
                     log.warn("Failed to close tcClient");
-                    throwable = t;
+                    throwable = addShutdownFailure(throwable, t);
                 }
             }
 
             // close the service url provider allocated resource.
             if (conf != null && conf.getServiceUrlProvider() != null && serviceUrlProviderInitialized) {
-                conf.getServiceUrlProvider().close();
+                try {
+                    conf.getServiceUrlProvider().close();
+                } catch (Throwable t) {
+                    throwable = addShutdownFailure(throwable, t);
+                }
             }
 
             if (addressResolver != null) {
-                addressResolver.close();
+                try {
+                    addressResolver.close();
+                } catch (Throwable t) {
+                    throwable = addShutdownFailure(throwable, t);
+                }
             }
 
             if (dnsResolverGroupLocalInstance != null) {
-                dnsResolverGroupLocalInstance.close();
+                try {
+                    dnsResolverGroupLocalInstance.close();
+                } catch (Throwable t) {
+                    throwable = addShutdownFailure(throwable, t);
+                }
             }
 
             try {
@@ -1090,26 +1152,26 @@ public class PulsarClientImpl implements PulsarClient {
                 shutdownEventLoopGroup(eventLoopGroup);
             } catch (PulsarClientException e) {
                 log.warn().exception(e).log("Failed to shutdown eventLoopGroup");
-                throwable = e;
+                throwable = addShutdownFailure(throwable, e);
             }
             try {
                 closeCnxPool(cnxPool);
             } catch (PulsarClientException e) {
                 log.warn().exception(e).log("Failed to shutdown cnxPool");
-                throwable = e;
+                throwable = addShutdownFailure(throwable, e);
             }
             if (timer != null && needStopTimer) {
                 try {
                     timer.stop();
                 } catch (Throwable t) {
                     log.warn().exception(t).log("Failed to shutdown timer");
-                    throwable = t;
+                    throwable = addShutdownFailure(throwable, t);
                 }
             }
             try {
                 shutdownExecutors();
             } catch (PulsarClientException e) {
-                throwable = e;
+                throwable = addShutdownFailure(throwable, e);
             }
 
             if (memoryBufferStats != null) {
@@ -1117,12 +1179,16 @@ public class PulsarClientImpl implements PulsarClient {
                     memoryBufferStats.close();
                 } catch (Throwable t) {
                     log.warn().exception(t).log("Failed to close memoryBufferStats");
-                    throwable = t;
+                    throwable = addShutdownFailure(throwable, t);
                 }
             }
 
             if (memoryLimitController != null) {
-                memoryLimitController.deregisterTrigger(memoryLimitTrigger);
+                try {
+                    memoryLimitController.deregisterTrigger(memoryLimitTrigger);
+                } catch (Throwable t) {
+                    throwable = addShutdownFailure(throwable, t);
+                }
             }
 
             if (conf != null && conf.getAuthentication() != null) {
@@ -1130,7 +1196,7 @@ public class PulsarClientImpl implements PulsarClient {
                     conf.getAuthentication().close();
                 } catch (Throwable t) {
                     log.warn().exception(t).log("Failed to close authentication");
-                    throwable = t;
+                    throwable = addShutdownFailure(throwable, t);
                 }
             }
             if (throwable != null) {
@@ -1140,6 +1206,16 @@ public class PulsarClientImpl implements PulsarClient {
             log.warn().exception(t).log("Failed to shutdown Pulsar client");
             throw PulsarClientException.unwrap(t);
         }
+    }
+
+    private static Throwable addShutdownFailure(Throwable failure, Throwable next) {
+        if (failure == null) {
+            return next;
+        }
+        if (failure != next) {
+            failure.addSuppressed(next);
+        }
+        return failure;
     }
 
     private void closeCnxPool(ConnectionPool cnxPool) throws PulsarClientException {
@@ -1153,9 +1229,12 @@ public class PulsarClientImpl implements PulsarClient {
     }
 
     private void shutdownEventLoopGroup(EventLoopGroup eventLoopGroup) throws PulsarClientException {
-        if (createdEventLoopGroup && eventLoopGroup != null && !eventLoopGroup.isShutdown()) {
+        if (createdEventLoopGroup && eventLoopGroup != null && !eventLoopGroup.isTerminated()) {
             try {
                 eventLoopGroup.shutdownGracefully().get(CLOSE_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+            } catch (InterruptedException t) {
+                Thread.currentThread().interrupt();
+                throw PulsarClientException.unwrap(t);
             } catch (Throwable t) {
                 throw PulsarClientException.unwrap(t);
             }
@@ -1163,46 +1242,46 @@ public class PulsarClientImpl implements PulsarClient {
     }
 
     private void shutdownExecutors() throws PulsarClientException {
-        PulsarClientException pulsarClientException = null;
+        Throwable failure = null;
         if (createdExecutorProviders) {
 
-            if (externalExecutorProvider != null && !externalExecutorProvider.isShutdown()) {
+            if (externalExecutorProvider != null) {
                 try {
-                    externalExecutorProvider.shutdownNow();
+                    externalExecutorProvider.shutdownNowAndAwaitTermination(CLOSE_TIMEOUT_SECONDS, TimeUnit.SECONDS);
                 } catch (Throwable t) {
                     log.warn().exception(t).log("Failed to shutdown externalExecutorProvider");
-                    pulsarClientException = PulsarClientException.unwrap(t);
+                    failure = addShutdownFailure(failure, t);
                 }
             }
-            if (internalExecutorProvider != null && !internalExecutorProvider.isShutdown()) {
+            if (internalExecutorProvider != null) {
                 try {
-                    internalExecutorProvider.shutdownNow();
+                    internalExecutorProvider.shutdownNowAndAwaitTermination(CLOSE_TIMEOUT_SECONDS, TimeUnit.SECONDS);
                 } catch (Throwable t) {
                     log.warn().exception(t).log("Failed to shutdown internalExecutorService");
-                    pulsarClientException = PulsarClientException.unwrap(t);
+                    failure = addShutdownFailure(failure, t);
                 }
             }
         }
-        if (createdScheduledProviders && scheduledExecutorProvider != null && !scheduledExecutorProvider.isShutdown()) {
+        if (createdScheduledProviders && scheduledExecutorProvider != null) {
             try {
-                scheduledExecutorProvider.shutdownNow();
+                scheduledExecutorProvider.shutdownNowAndAwaitTermination(CLOSE_TIMEOUT_SECONDS, TimeUnit.SECONDS);
             } catch (Throwable t) {
                 log.warn().exception(t).log("Failed to shutdown scheduledExecutorProvider");
-                pulsarClientException = PulsarClientException.unwrap(t);
+                failure = addShutdownFailure(failure, t);
             }
         }
 
-        if (createdLookupProviders && lookupExecutorProvider != null && !lookupExecutorProvider.isShutdown()) {
+        if (createdLookupProviders && lookupExecutorProvider != null) {
             try {
-                lookupExecutorProvider.shutdownNow();
+                lookupExecutorProvider.shutdownNowAndAwaitTermination(CLOSE_TIMEOUT_SECONDS, TimeUnit.SECONDS);
             } catch (Throwable t) {
                 log.warn().exception(t).log("Failed to shutdown lookupExecutorProvider");
-                pulsarClientException = PulsarClientException.unwrap(t);
+                failure = addShutdownFailure(failure, t);
             }
         }
 
-        if (pulsarClientException != null) {
-            throw pulsarClientException;
+        if (failure != null) {
+            throw PulsarClientException.unwrap(failure);
         }
     }
 

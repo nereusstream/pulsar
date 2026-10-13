@@ -27,6 +27,7 @@ import java.util.Objects;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.BiFunction;
 import lombok.CustomLog;
@@ -131,6 +132,28 @@ public class ExecutorProvider {
 
     public boolean isShutdown() {
         return isShutdown;
+    }
+
+    /** Stops owned executors and reports whether they actually terminated within the shared deadline. */
+    public void shutdownNowAndAwaitTermination(long timeout, TimeUnit unit)
+            throws InterruptedException, TimeoutException {
+        checkArgument(timeout > 0);
+        long deadline = System.nanoTime() + Objects.requireNonNull(unit).toNanos(timeout);
+        for (Pair<ExecutorService, ExtendedThreadFactory> entry : executors) {
+            entry.getKey().shutdownNow();
+        }
+        isShutdown = true;
+        for (Pair<ExecutorService, ExtendedThreadFactory> entry : executors) {
+            try {
+                if (!entry.getKey().awaitTermination(Math.max(0, deadline - System.nanoTime()),
+                        TimeUnit.NANOSECONDS)) {
+                    throw new TimeoutException("Executor pool " + poolName + " has not terminated");
+                }
+            } catch (InterruptedException failure) {
+                Thread.currentThread().interrupt();
+                throw failure;
+            }
+        }
     }
 
     private String getThreadDump(Thread thread) {

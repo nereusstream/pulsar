@@ -141,6 +141,8 @@ public class ProducerImpl<T> extends ProducerBase<T> implements TimerTask, Conne
 
     private final BatchMessageContainerBase batchMessageContainer;
     private CompletableFuture<MessageId> lastSendFuture = CompletableFuture.completedFuture(null);
+    private CompletableFuture<Void> closeFuture;
+    private final List<CompletableFuture<Void>> pendingProducerCreations = new ArrayList<>();
     private LastSendFutureWrapper lastSendFutureWrapper = LastSendFutureWrapper.create(lastSendFuture);
 
     // Globally unique producer name
@@ -1244,58 +1246,103 @@ public class ProducerImpl<T> extends ProducerBase<T> implements TimerTask, Conne
 
     @Override
     public synchronized CompletableFuture<Void> closeAsync() {
-        final State currentState = getAndUpdateState(state -> {
+        if (closeFuture != null) {
+            return closeFuture.copy();
+        }
+        closeFuture = new CompletableFuture<>();
+        getAndUpdateState(state -> {
             if (state == State.Closed) {
                 return state;
             }
             return State.Closing;
         });
 
-        CompletableFuture<Void> closeFuture = new CompletableFuture<>();
+        CompletableFuture<Void> producerCloseFuture = new CompletableFuture<>();
         List<CompletableFuture<Void>> closeTasks = new ArrayList<>();
-        closeTasks.add(closeFuture);
+        closeTasks.add(producerCloseFuture);
+        closeTasks.addAll(pendingProducerCreations);
         if (schema != null) {
-            closeTasks.add(schema.closeAsync().whenComplete((__, t) -> {
-                if (t != null) {
-                    log.warn().exception(t).log("Exception ignored in closing schema of producer");
-                }
-            }));
+            try {
+                closeTasks.add(schema.closeAsync().whenComplete((__, t) -> {
+                    if (t != null) {
+                        log.warn().exception(t).log("Failed to close producer schema");
+                    }
+                }));
+            } catch (Throwable failure) {
+                closeTasks.add(FutureUtil.failedFuture(failure));
+            }
         }
-        CompletableFuture<Void> compositeCloseFuture = FutureUtil.waitForAll(closeTasks);
-
-        if (currentState == State.Closed || currentState == State.Closing) {
-            return CompletableFuture.completedFuture(null);
-        }
-
         producersClosedCounter.increment();
-        closeProducerTasks();
-
-        ClientCnx cnx = cnx();
-        if (cnx == null || (currentState != State.Ready && currentState != State.RegisteringSchema)) {
-            log.info("Closed Producer (not connected)");
-            closeAndClearPendingMessages();
-            return CompletableFuture.completedFuture(null);
+        try {
+            closeProducerTasks();
+        } catch (Throwable failure) {
+            closeTasks.add(FutureUtil.failedFuture(failure));
         }
-
-        long requestId = client.newRequestId();
-        ByteBuf cmd = Commands.newCloseProducer(producerId, requestId);
-
-        cnx.sendRequestWithId(cmd, requestId).handle((v, exception) -> {
-            cnx.removeProducer(producerId);
-            if (exception == null || !cnx.ctx().channel().isActive()) {
-                // Either we've received the success response for the close producer command from the broker, or the
-                // connection did break in the meantime. In any case, the producer is gone.
-                log.info("Closed Producer");
-                closeAndClearPendingMessages();
+        CompletableFuture<Throwable> closeFailures = CompletableFuture.completedFuture(null);
+        for (CompletableFuture<Void> task : closeTasks) {
+            closeFailures = closeFailures.thenCombine(task.handle((__, failure) -> failure),
+                    ProducerImpl::addCloseFailure);
+        }
+        closeFailures.thenAccept(failure -> {
+            if (failure == null) {
                 closeFuture.complete(null);
             } else {
-                closeFuture.completeExceptionally(exception);
+                closeFuture.completeExceptionally(failure);
             }
-
-            return null;
         });
 
-        return compositeCloseFuture;
+        ClientCnx cnx = cnx();
+        if (cnx == null || !pendingProducerCreations.isEmpty()) {
+            log.info("Closed Producer (not connected)");
+            finishProducerClose(cnx, producerCloseFuture, null);
+            return closeFuture.copy();
+        }
+
+        closeProducerOnConnection(cnx, producerCloseFuture, null);
+        return closeFuture.copy();
+    }
+
+    private void closeProducerOnConnection(ClientCnx cnx, CompletableFuture<Void> completion, Throwable failure) {
+        try {
+            long requestId = client.newRequestId();
+            ByteBuf cmd = Commands.newCloseProducer(producerId, requestId);
+            cnx.sendRequestWithId(cmd, requestId).whenComplete((v, closeFailure) -> {
+                finishProducerClose(cnx, completion, addCloseFailure(failure, closeFailure));
+            });
+        } catch (Throwable closeFailure) {
+            finishProducerClose(cnx, completion, addCloseFailure(failure, closeFailure));
+        }
+    }
+
+    private void finishProducerClose(ClientCnx cnx, CompletableFuture<Void> producerCloseFuture, Throwable failure) {
+        if (cnx != null) {
+            try {
+                cnx.removeProducer(producerId);
+            } catch (Throwable cleanupFailure) {
+                failure = addCloseFailure(failure, cleanupFailure);
+            }
+        }
+        try {
+            closeAndClearPendingMessages();
+        } catch (Throwable cleanupFailure) {
+            failure = addCloseFailure(failure, cleanupFailure);
+        }
+        if (failure == null) {
+            log.info("Closed Producer");
+            producerCloseFuture.complete(null);
+        } else {
+            producerCloseFuture.completeExceptionally(failure);
+        }
+    }
+
+    private static Throwable addCloseFailure(Throwable failure, Throwable next) {
+        if (failure == null) {
+            return next;
+        }
+        if (next != null && failure != next) {
+            failure.addSuppressed(next);
+        }
+        return failure;
     }
 
     @VisibleForTesting
@@ -2048,6 +2095,7 @@ public class ProducerImpl<T> extends ProducerBase<T> implements TimerTask, Conne
         setChunkMaxMessageSize();
 
         final long epoch;
+        final CompletableFuture<Void> future = new CompletableFuture<>();
         synchronized (this) {
             // Because the state could have been updated while retrieving the connection, we set it back to connecting,
             // as long as the change from current state to connecting is a valid state change.
@@ -2063,8 +2111,14 @@ public class ProducerImpl<T> extends ProducerBase<T> implements TimerTask, Conne
             // We set the cnx reference before registering the producer on the cnx, so if the cnx breaks before creating
             // the producer, it will try to grab a new cnx. We also increment and get the epoch value for the producer.
             epoch = connectionHandler.switchClientCnx(cnx);
+            cnx.registerProducer(producerId, this);
+            pendingProducerCreations.add(future);
+            future.whenComplete((__, failure) -> {
+                synchronized (ProducerImpl.this) {
+                    pendingProducerCreations.remove(future);
+                }
+            });
         }
-        cnx.registerProducer(producerId, this);
 
         log.info("Creating producer");
 
@@ -2074,40 +2128,51 @@ public class ProducerImpl<T> extends ProducerBase<T> implements TimerTask, Conne
                 .compareAndSet(this, 0, System.currentTimeMillis() + client.getConfiguration().getOperationTimeoutMs());
 
         SchemaInfo schemaInfo = null;
-        if (schema != null) {
-            if (schema.getSchemaInfo() != null) {
-                if (schema.getSchemaInfo().getType() == SchemaType.JSON) {
-                    // for backwards compatibility purposes
-                    // JSONSchema originally generated a schema for pojo based of of the JSON schema standard
-                    // but now we have standardized on every schema to generate an Avro based schema
-                    if (Commands.peerSupportJsonSchemaAvroFormat(cnx.getRemoteEndpointProtocolVersion())) {
-                        schemaInfo = schema.getSchemaInfo();
-                    } else if (schema instanceof JSONSchema) {
-                        // Deprecated (PIP-464): This backward-compatible path sends old Jackson JsonSchema
-                        // format to brokers below protocol v13 (Pulsar < 2.1). Scheduled for removal in a
-                        // future major release.
-                        JSONSchema<?> jsonSchema = (JSONSchema<?>) schema;
-                        schemaInfo = jsonSchema.getBackwardsCompatibleJsonSchemaInfo();
+        try {
+            if (schema != null) {
+                if (schema.getSchemaInfo() != null) {
+                    if (schema.getSchemaInfo().getType() == SchemaType.JSON) {
+                        // for backwards compatibility purposes
+                        // JSONSchema originally generated a schema for pojo based of of the JSON schema standard
+                        // but now we have standardized on every schema to generate an Avro based schema
+                        if (Commands.peerSupportJsonSchemaAvroFormat(cnx.getRemoteEndpointProtocolVersion())) {
+                            schemaInfo = schema.getSchemaInfo();
+                        } else if (schema instanceof JSONSchema) {
+                            // Deprecated (PIP-464): This backward-compatible path sends old Jackson JsonSchema
+                            // format to brokers below protocol v13 (Pulsar < 2.1). Scheduled for removal in a
+                            // future major release.
+                            JSONSchema<?> jsonSchema = (JSONSchema<?>) schema;
+                            schemaInfo = jsonSchema.getBackwardsCompatibleJsonSchemaInfo();
+                        } else {
+                            schemaInfo = schema.getSchemaInfo();
+                        }
+                    } else if (schema.getSchemaInfo().getType() == SchemaType.BYTES
+                            || schema.getSchemaInfo().getType() == SchemaType.NONE) {
+                        // don't set schema info for Schema.BYTES
+                        schemaInfo = null;
                     } else {
                         schemaInfo = schema.getSchemaInfo();
                     }
-                } else if (schema.getSchemaInfo().getType() == SchemaType.BYTES
-                        || schema.getSchemaInfo().getType() == SchemaType.NONE) {
-                    // don't set schema info for Schema.BYTES
-                    schemaInfo = null;
-                } else {
-                    schemaInfo = schema.getSchemaInfo();
                 }
             }
+        } catch (Throwable failure) {
+            closeProducerOnConnection(cnx, future, failure);
+            return future;
         }
 
-        final CompletableFuture<Void> future = new CompletableFuture<>();
-        cnx.sendRequestWithId(
+        CompletableFuture<ProducerResponse> createRequest;
+        try {
+            createRequest = cnx.sendRequestWithId(
                 Commands.newProducer(topic, producerId, requestId, producerName, conf.isEncryptionEnabled(), metadata,
                         schemaInfo, epoch, userProvidedProducerName,
                         conf.getAccessMode(), topicEpoch, client.conf.isEnableTransaction(),
                         conf.getInitialSubscriptionName(), resourceGuard),
-                requestId).thenAccept(response -> {
+                requestId);
+        } catch (Throwable failure) {
+            closeProducerOnConnection(cnx, future, failure);
+            return future;
+        }
+        createRequest.thenAccept(response -> {
             if (resourceGuard != null && !isMatchingGuardAttestation(response.getResourceGuardAttestation())) {
                 throw new CompletionException(new TopicResourceGuardException(
                         "Broker did not attest the expected topic resource guard: expected="
@@ -2125,13 +2190,7 @@ public class ProducerImpl<T> extends ProducerBase<T> implements TimerTask, Conne
             synchronized (ProducerImpl.this) {
                 State state = getState();
                 if (state == State.Closing || state == State.Closed) {
-                    // Producer was closed while reconnecting, close the connection to make sure the broker
-                    // drops the producer on its side
-                    cnx.removeProducer(producerId);
-                    failPendingMessages(cnx,
-                            new PulsarClientException.ProducerFencedException("producer has been closed"));
-                    cnx.channel().close();
-                    future.complete(null);
+                    closeProducerOnConnection(cnx, future, null);
                     return;
                 }
                 resetBackoff();
@@ -2172,10 +2231,7 @@ public class ProducerImpl<T> extends ProducerBase<T> implements TimerTask, Conne
             cnx.removeProducer(producerId);
             State state = getState();
             if (state == State.Closing || state == State.Closed) {
-                // Producer was closed while reconnecting, close the connection to make sure the broker
-                // drops the producer on its side
-                cnx.channel().close();
-                future.complete(null);
+                closeProducerOnConnection(cnx, future, cause);
                 return null;
             }
 
@@ -2367,6 +2423,11 @@ public class ProducerImpl<T> extends ProducerBase<T> implements TimerTask, Conne
             keyGeneratorTask.cancel(false);
         }
 
+        if (batchFlushTask != null) {
+            batchFlushTask.cancel(false);
+            batchFlushTask = null;
+        }
+
         stats.cancelStatsTimeout();
     }
 
@@ -2374,9 +2435,7 @@ public class ProducerImpl<T> extends ProducerBase<T> implements TimerTask, Conne
         cnx.ctx().channel().eventLoop().execute(() -> {
             synchronized (ProducerImpl.this) {
                 if (getState() == State.Closing || getState() == State.Closed) {
-                    // Producer was closed while reconnecting, close the connection to make sure the broker
-                    // drops the producer on its side
-                    cnx.channel().close();
+                    cnx.removeProducer(producerId);
                     return;
                 }
 
@@ -2390,9 +2449,7 @@ public class ProducerImpl<T> extends ProducerBase<T> implements TimerTask, Conne
                         scheduleBatchFlushTask(0);
                         return;
                     } else {
-                        // Producer was closed while reconnecting, close the connection to make sure the broker
-                        // drops the producer on its side
-                        cnx.channel().close();
+                        cnx.removeProducer(producerId);
                         return;
                     }
 
