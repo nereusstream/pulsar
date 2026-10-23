@@ -160,6 +160,7 @@ public class OffloadLedgerDeleteTest extends MockedBookKeeperTestCase {
         private final RetentionClass retentionClass;
         private final AtomicInteger revalidations = new AtomicInteger();
         private volatile Throwable revalidationFailure;
+        private CompletableFuture<Void> revalidationGate = CompletableFuture.completedFuture(null);
 
         MockSourceSafeLedgerOffloader(RetentionClass retentionClass) {
             this.retentionClass = retentionClass;
@@ -190,7 +191,7 @@ public class OffloadLedgerDeleteTest extends MockedBookKeeperTestCase {
             Assert.assertTrue(entryCount > 0);
             Assert.assertTrue(logicalLength > 0);
             return revalidationFailure == null
-                    ? CompletableFuture.completedFuture(null)
+                    ? revalidationGate
                     : CompletableFuture.failedFuture(revalidationFailure);
         }
     }
@@ -241,6 +242,55 @@ public class OffloadLedgerDeleteTest extends MockedBookKeeperTestCase {
         Assert.assertEquals(retained.getBookkeeperDeleteState(), BookKeeperDeleteState.BK_DELETE_NONE);
         Assert.assertEquals(offloader.revalidations.get(), 0);
         Assert.assertTrue(bkc.getLedgers().contains(firstLedgerId));
+    }
+
+    @Test
+    public void testSourceSafePreparedOwnerCannotUseLegacyDeletion() throws Exception {
+        MockSourceSafeLedgerOffloader offloader =
+                new MockSourceSafeLedgerOffloader(SourceSafeLedgerOffloader.RetentionClass.DELETE_AFTER_VERIFIED);
+        var config = sourceSafeConfig(offloader);
+        var clock = (MockClock) config.getClock();
+        var ledger = (ManagedLedgerImpl) factory.open("source-prepared-no-legacy-delete", config);
+        long source = writeAndOffloadFirstLedger(ledger);
+        var preparation = ledger.captureNativeReadView().join();
+        preparation.installReadPreparation();
+        clock.advance(1, TimeUnit.SECONDS);
+        var trim = new CompletableFuture<Void>();
+        ledger.internalTrimConsumedLedgers(trim);
+        Assert.assertThrows(java.util.concurrent.CompletionException.class, trim::join);
+        Assert.assertEquals(offloader.revalidations.get(), 0);
+        Assert.assertTrue(bkc.getLedgers().contains(source));
+        Assert.assertEquals(ledger.getLedgerInfo(source).join().getOffloadContext().getBookkeeperDeleteState(),
+                BookKeeperDeleteState.BK_DELETE_NONE);
+        preparation.fenceReadPreparation().join();
+    }
+
+    @Test
+    public void testSourceSafeActiveDeletionRejectsSourceEnrollment() throws Exception {
+        MockSourceSafeLedgerOffloader offloader =
+                new MockSourceSafeLedgerOffloader(SourceSafeLedgerOffloader.RetentionClass.DELETE_AFTER_VERIFIED);
+        offloader.revalidationGate = new CompletableFuture<>();
+        var config = sourceSafeConfig(offloader);
+        var clock = (MockClock) config.getClock();
+        var ledger = (ManagedLedgerImpl) factory.open("source-active-delete-no-enrollment", config);
+        long source = writeAndOffloadFirstLedger(ledger);
+        clock.advance(1, TimeUnit.SECONDS);
+        var trim = new CompletableFuture<Void>();
+        ledger.internalTrimConsumedLedgers(trim);
+        try {
+            Awaitility.await().atMost(10, TimeUnit.SECONDS)
+                    .until(() -> offloader.revalidations.get() == 1);
+            var capture = ledger.captureNativeReadView().join();
+            Assert.assertThrows(IllegalStateException.class, capture::installReadPreparation);
+            Assert.assertThrows(IllegalStateException.class, () -> capture.installReadAdmission(
+                    (id, first, last, cleanup) -> CompletableFuture.completedFuture(null)));
+            Assert.assertTrue(bkc.getLedgers().contains(source));
+            Assert.assertFalse(trim.isDone());
+        } finally {
+            offloader.revalidationGate.complete(null);
+        }
+        trim.join();
+        Assert.assertFalse(bkc.getLedgers().contains(source));
     }
 
     @Test
@@ -387,6 +437,82 @@ public class OffloadLedgerDeleteTest extends MockedBookKeeperTestCase {
         ledger.internalTrimConsumedLedgers(secondTrim);
         secondTrim.join();
         Assert.assertNull(ledger.getLedgerInfo(firstLedgerId).join());
+    }
+
+    @Test
+    public void testNativeDeleteMetadataRequiresDrainRetainsCancelledOperationAndProvesAbsence() throws Exception {
+        var offloader = new MockSourceSafeLedgerOffloader(
+                SourceSafeLedgerOffloader.RetentionClass.DELETE_AFTER_VERIFIED);
+        var config = sourceSafeConfig(offloader);
+        var ledger = (ManagedLedgerImpl) factory.open("native-delete-metadata", config);
+        long ledgerId = writeAndOffloadFirstLedger(ledger);
+        var view = ledger.captureNativeReadView().join();
+        var source = view.captureBookKeeperDeletion(ledgerId);
+        Assert.expectThrows(java.util.concurrent.CompletionException.class,
+                () -> source.prepareIntent().join());
+        Assert.assertEquals(ledger.getLedgerInfo(ledgerId).join().getOffloadContext().getBookkeeperDeleteState(),
+                BookKeeperDeleteState.BK_DELETE_NONE);
+        view.fenceOwnerReadAdmission().join();
+        offloader.revalidationGate = new CompletableFuture<>();
+        var observer = source.prepareIntent();
+        Awaitility.await().untilAsserted(() -> Assert.assertEquals(offloader.revalidations.get(), 1));
+        Assert.assertTrue(observer.cancel(false));
+        var sameOperation = source.prepareIntent();
+        Assert.assertFalse(sameOperation.isDone());
+        offloader.revalidationGate.complete(null);
+        sameOperation.join();
+        Assert.assertEquals(offloader.revalidations.get(), 1);
+        Assert.assertEquals(ledger.getLedgerInfo(ledgerId).join().getOffloadContext().getBookkeeperDeleteState(),
+                BookKeeperDeleteState.BK_DELETE_INTENT);
+        Assert.assertTrue(bkc.getLedgers().contains(ledgerId));
+        ledger.close();
+
+        var reopened = (ManagedLedgerImpl) factory.open("native-delete-metadata", config);
+        var current = reopened.captureNativeReadView().join();
+        var intent = current.captureBookKeeperDeletion(ledgerId);
+        current.fenceOwnerReadAdmission().join();
+        long intentVersion = metadataStore.get("/managed-ledgers/native-delete-metadata").join()
+                .orElseThrow().getStat().getVersion();
+        intent.prepareIntent().join();
+        Assert.assertEquals(metadataStore.get("/managed-ledgers/native-delete-metadata").join()
+                .orElseThrow().getStat().getVersion(), intentVersion);
+        Assert.assertEquals(offloader.revalidations.get(), 1);
+        Assert.expectThrows(java.util.concurrent.CompletionException.class,
+                () -> intent.completeDone().join());
+        Assert.assertEquals(reopened.getLedgerInfo(ledgerId).join().getOffloadContext().getBookkeeperDeleteState(),
+                BookKeeperDeleteState.BK_DELETE_INTENT);
+        // Unit absence fixture only. The Native M5 integration must use its bound physical deleter.
+        bkc.deleteLedger(ledgerId);
+        intent.completeDone().join();
+        Assert.assertEquals(reopened.getLedgerInfo(ledgerId).join().getOffloadContext().getBookkeeperDeleteState(),
+                BookKeeperDeleteState.BK_DELETE_DONE);
+        Assert.assertFalse(bkc.getLedgers().contains(ledgerId));
+        reopened.close();
+        var cold = (ManagedLedgerImpl) factory.open("native-delete-metadata", config);
+        var doneView = cold.captureNativeReadView().join();
+        var done = doneView.captureBookKeeperDeletion(ledgerId);
+        doneView.fenceOwnerReadAdmission().join();
+        long doneVersion = metadataStore.get("/managed-ledgers/native-delete-metadata").join()
+                .orElseThrow().getStat().getVersion();
+        done.completeDone().join();
+        Assert.assertEquals(metadataStore.get("/managed-ledgers/native-delete-metadata").join()
+                .orElseThrow().getStat().getVersion(), doneVersion);
+        cold.close();
+    }
+
+    @Test
+    public void testNativeDeleteMetadataRetainClassCannotCaptureDeletionOrFenceReads() throws Exception {
+        var offloader = new MockSourceSafeLedgerOffloader(SourceSafeLedgerOffloader.RetentionClass.RETAIN_BK);
+        var ledger = (ManagedLedgerImpl) factory.open("native-delete-retain", sourceSafeConfig(offloader));
+        long ledgerId = writeAndOffloadFirstLedger(ledger);
+        var view = ledger.captureNativeReadView().join();
+        Assert.expectThrows(IllegalStateException.class, () -> view.captureBookKeeperDeletion(ledgerId));
+        Assert.assertTrue(view.isCurrent());
+        Assert.assertEquals(offloader.revalidations.get(), 0);
+        Assert.assertEquals(ledger.getLedgerInfo(ledgerId).join().getOffloadContext().getBookkeeperDeleteState(),
+                BookKeeperDeleteState.BK_DELETE_NONE);
+        Assert.assertTrue(bkc.getLedgers().contains(ledgerId));
+        ledger.close();
     }
 
     private static ManagedLedgerConfig sourceSafeConfig(MockSourceSafeLedgerOffloader offloader) {

@@ -20,6 +20,7 @@ package org.apache.bookkeeper.mledger.impl;
 
 import com.google.common.annotations.VisibleForTesting;
 import io.netty.buffer.ByteBuf;
+import io.netty.buffer.CompositeByteBuf;
 import io.netty.buffer.Unpooled;
 import io.netty.util.Recycler;
 import io.netty.util.Recycler.Handle;
@@ -205,6 +206,30 @@ public final class EntryImpl extends AbstractCASReferenceCounted
                     r.run();
                 }
             };
+        }
+    }
+
+    /** Owns this delivered buffer and every retained duplicate until its final actual payload release. */
+    void onDataBufferReleased(Runnable completion) {
+        ByteBuf previous = data;
+        CompositeByteBuf owned = new CompositeByteBuf(previous.alloc(), previous.isDirect(), 1) {
+            @Override
+            protected void deallocate() {
+                try {
+                    super.deallocate();
+                } finally {
+                    completion.run();
+                }
+            }
+        };
+        try {
+            owned.addComponent(false, previous.retainedDuplicate().setIndex(0, previous.capacity()));
+            owned.setIndex(previous.readerIndex(), previous.writerIndex());
+            data = owned;
+            previous.release();
+        } catch (Throwable failure) {
+            owned.release();
+            throw failure;
         }
     }
 

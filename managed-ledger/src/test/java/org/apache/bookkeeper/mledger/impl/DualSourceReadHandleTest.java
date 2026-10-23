@@ -32,6 +32,8 @@ import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import org.apache.bookkeeper.client.BKException;
 import org.apache.bookkeeper.client.api.LastConfirmedAndEntry;
@@ -54,6 +56,81 @@ import org.testng.annotations.Test;
 public class DualSourceReadHandleTest {
     private static final long LEDGER_ID = 42;
     private static final UUID ATTEMPT = UUID.fromString("123e4567-e89b-12d3-a456-426614174000");
+
+    @Test
+    public void objectOnlyOverridesBookKeeperPriorityAndNeverOpensFallback() {
+        AtomicReference<OffloadReadSourceState> state = new AtomicReference<>(none());
+        FakeReadHandle object = new FakeReadHandle();
+        AtomicInteger bkOpens = new AtomicInteger();
+        var pins = new LedgerReadSourcePinRegistry();
+        ReadHandle handle = DualSourceReadHandle.open(LEDGER_ID, new FakeOffloader(), state::get,
+                OffloadedReadPriority.BOOKKEEPER_FIRST, pins, () -> CompletableFuture.completedFuture(object),
+                () -> {
+                    bkOpens.incrementAndGet();
+                    return CompletableFuture.completedFuture(new FakeReadHandle());
+                }, true).join();
+        try (LedgerEntries entries = handle.readAsync(0, 1).join()) {
+            assertEntryIds(entries, 0, 1);
+        }
+        TaggedFailure failedObject = new TaggedFailure(ReadFailureKind.TIMEOUT);
+        object.failure = failedObject;
+        assertSame(failure(handle.readAsync(0, 1)), failedObject);
+        assertEquals(bkOpens.get(), 0);
+        assertEquals(pins.pinCount(), 0);
+        handle.closeAsync().join();
+        assertEquals(object.closes, 1);
+    }
+
+    @Test
+    public void objectOnlyOpenFailureCannotOpenBookKeeper() {
+        TaggedFailure failedObject = new TaggedFailure(ReadFailureKind.UNAVAILABLE);
+        AtomicInteger bkOpens = new AtomicInteger();
+        var opened = DualSourceReadHandle.open(LEDGER_ID, new FakeOffloader(),
+                DualSourceReadHandleTest::none, OffloadedReadPriority.BOOKKEEPER_FIRST,
+                new LedgerReadSourcePinRegistry(), () -> CompletableFuture.failedFuture(failedObject),
+                () -> {
+                    bkOpens.incrementAndGet();
+                    return CompletableFuture.completedFuture(new FakeReadHandle());
+                }, true);
+        assertSame(failure(opened), failedObject);
+        assertEquals(bkOpens.get(), 0);
+    }
+
+    @Test
+    public void unsupportedIdentityCaptureReleasesPinAndRetainsOrdinaryReads() {
+        Harness harness = harness(OffloadedReadPriority.BOOKKEEPER_FIRST, none());
+
+        assertTrue(failure(harness.handle.captureOffloadedReadSourceIdentity(none(), () -> true))
+                instanceof UnsupportedOperationException);
+        assertEquals(harness.object.reads, 0);
+        assertEquals(harness.bookKeeper.reads, 0);
+        assertEquals(harness.pins.pinCount(), 0);
+        try (LedgerEntries entries = harness.handle.readAsync(0, 0).join()) {
+            assertEntryIds(entries, 0);
+        }
+        harness.handle.closeAsync().join();
+        assertEquals(harness.object.closes, 1);
+        assertEquals(harness.bookKeeper.closes, 1);
+    }
+
+    @Test
+    public void identityCaptureGateFailureAfterPinReleasesAdmission() {
+        Harness harness = harness(OffloadedReadPriority.BOOKKEEPER_FIRST, none());
+        AtomicInteger checks = new AtomicInteger();
+        IllegalStateException failedGate = new IllegalStateException("identity gate failed after pin admission");
+
+        assertSame(failure(harness.handle.captureOffloadedReadSourceIdentity(none(), () -> {
+            if (checks.incrementAndGet() == 2) {
+                throw failedGate;
+            }
+            return true;
+        })), failedGate);
+        assertEquals(harness.pins.pinCount(), 0);
+        assertEquals(harness.object.reads, 0);
+        assertEquals(harness.bookKeeper.reads, 0);
+        harness.handle.closeAsync().join();
+        assertEquals(harness.object.closes, 0);
+    }
 
     @Test
     public void objectFirstReturnsOneExactObjectRange() {
@@ -196,13 +273,71 @@ public class DualSourceReadHandleTest {
         LedgerEntries accepted = harness.handle.readAsync(0, 1).join();
 
         CompletableFuture<Void> firstClose = harness.handle.closeAsync();
-        assertSame(harness.handle.closeAsync(), firstClose);
+        CompletableFuture<Void> repeatedClose = harness.handle.closeAsync();
+        assertTrue(firstClose != repeatedClose);
         assertFalse(firstClose.isDone());
+        assertFalse(repeatedClose.isDone());
+        assertTrue(harness.handle.closeAsync().cancel(false));
+        assertTrue(harness.handle.closeAsync().complete(null));
+        CompletableFuture<Void> afterChangedObservers = harness.handle.closeAsync();
+        assertFalse(afterChangedObservers.isDone());
         accepted.close();
         firstClose.join();
+        repeatedClose.join();
+        afterChangedObservers.join();
 
         assertEquals(harness.object.closes, 1);
         assertEquals(harness.bookKeeper.closes, 0);
+    }
+
+    @Test
+    public void cancelledObserverReleasesUndeliverablePrimaryRange() {
+        verifyUndeliverableRange(false, true);
+    }
+
+    @Test
+    public void completedObserverReleasesUndeliverablePrimaryRange() {
+        verifyUndeliverableRange(false, false);
+    }
+
+    @Test
+    public void cancelledObserverReleasesUndeliverableFallbackRange() {
+        verifyUndeliverableRange(true, true);
+    }
+
+    private static void verifyUndeliverableRange(boolean fallback, boolean cancelObserver) {
+        Harness harness = harness(OffloadedReadPriority.TIERED_STORAGE_FIRST, none());
+        FakeReadHandle held = fallback ? harness.bookKeeper : harness.object;
+        held.readGate = new CompletableFuture<>();
+        if (fallback) {
+            harness.object.failure = new TaggedFailure(ReadFailureKind.UNAVAILABLE);
+        }
+        CompletableFuture<LedgerEntries> read = harness.handle.readAsync(0, 1);
+        try {
+            assertFalse(read.isDone());
+            assertEquals(harness.pins.pinCount(), 1);
+            if (cancelObserver) {
+                assertTrue(read.cancel(false));
+            } else {
+                assertTrue(read.completeExceptionally(new IllegalStateException("observer completed externally")));
+            }
+            CompletableFuture<Void> close = harness.handle.closeAsync();
+            assertFalse(close.isDone());
+            assertEquals(harness.pins.pinCount(), 1);
+            held.readGate.complete(null);
+            assertEquals(held.closedRanges, 1);
+            assertEquals(harness.pins.pinCount(), 0);
+            assertTrue(close.isDone());
+            close.join();
+            assertEquals(held.closes, 1);
+            assertEquals(harness.object.reads, 1);
+            assertEquals(harness.bookKeeper.reads, fallback ? 1 : 0);
+        } finally {
+            held.readGate.complete(null);
+            if (held.lastRange != null && held.closedRanges == 0) {
+                held.lastRange.close();
+            }
+        }
     }
 
     @Test
@@ -239,6 +374,138 @@ public class DualSourceReadHandleTest {
 
         assertSame(failure(harness.handle.readAsync(0, 1)), harness.object.failure);
         assertEquals(harness.bookKeeper.reads, 0);
+    }
+
+    @Test
+    public void capturedReadRejectsChangedVersionBeforeSourceUse() {
+        Harness harness = harness(OffloadedReadPriority.TIERED_STORAGE_FIRST, none());
+        harness.state.set(new OffloadReadSourceState(8, ATTEMPT, true, BookKeeperDeleteState.NONE));
+
+        assertTrue(failure(harness.handle.readCapturedAsync(0, 1, none()))
+                instanceof LedgerReadSourcePinRegistry.SourcePinFencedException);
+        assertEquals(harness.object.reads, 0);
+        assertEquals(harness.bookKeeper.reads, 0);
+        harness.handle.closeAsync().join();
+    }
+
+    @Test
+    public void capturedReadDoesNotRecaptureVersionAfterPrimaryFailure() {
+        Harness captured = harness(OffloadedReadPriority.TIERED_STORAGE_FIRST, none());
+        captured.object.failure = new TaggedFailure(ReadFailureKind.TIMEOUT);
+        captured.object.onRead = () -> captured.state.set(
+                new OffloadReadSourceState(8, ATTEMPT, true, BookKeeperDeleteState.NONE));
+
+        Throwable primary = failure(captured.handle.readCapturedAsync(0, 1, none()));
+
+        assertSame(primary, captured.object.failure);
+        assertEquals(primary.getSuppressed().length, 1);
+        assertTrue(primary.getSuppressed()[0] instanceof LedgerReadSourcePinRegistry.SourcePinFencedException);
+        assertEquals(captured.object.reads, 1);
+        assertEquals(captured.bookKeeper.reads, 0);
+        captured.handle.closeAsync().join();
+
+        Harness ordinary = harness(OffloadedReadPriority.TIERED_STORAGE_FIRST, none());
+        ordinary.object.failure = new TaggedFailure(ReadFailureKind.TIMEOUT);
+        ordinary.object.onRead = () -> ordinary.state.set(
+                new OffloadReadSourceState(8, ATTEMPT, true, BookKeeperDeleteState.NONE));
+        try (LedgerEntries entries = ordinary.handle.readAsync(0, 1).join()) {
+            assertEntryIds(entries, 0, 1);
+            assertEquals(ordinary.bookKeeper.reads, 1);
+        }
+        ordinary.handle.closeAsync().join();
+    }
+
+    @Test
+    public void capturedReadKeepsWholeRangeFallbackWhenStateIsUnchanged() {
+        Harness harness = harness(OffloadedReadPriority.TIERED_STORAGE_FIRST, none());
+        harness.object.failure = new TaggedFailure(ReadFailureKind.TIMEOUT);
+
+        try (LedgerEntries entries = harness.handle.readCapturedAsync(0, 3, none()).join()) {
+            assertEntryIds(entries, 0, 1, 2, 3);
+            assertEquals(harness.object.reads, 1);
+            assertEquals(harness.bookKeeper.reads, 1);
+        }
+        harness.handle.closeAsync().join();
+    }
+
+    @Test
+    public void capturedReadDoesNotRetargetFencedBookKeeperSource() {
+        Harness harness = harness(OffloadedReadPriority.BOOKKEEPER_FIRST, none());
+        harness.pins.fence(Source.BOOKKEEPER).join();
+
+        assertTrue(failure(harness.handle.readCapturedAsync(0, 1, none()))
+                instanceof LedgerReadSourcePinRegistry.SourcePinFencedException);
+        assertEquals(harness.object.reads, 0);
+        assertEquals(harness.bookKeeper.reads, 0);
+        harness.handle.closeAsync().join();
+    }
+
+    @Test
+    public void cancelledCapturedReadDrainsPrimaryWithoutStartingFallback() {
+        Harness harness = harness(OffloadedReadPriority.TIERED_STORAGE_FIRST, none());
+        harness.object.readGate = new CompletableFuture<>();
+        CompletableFuture<LedgerEntries> reading = harness.handle.readCapturedAsync(0, 1, none());
+        assertTrue(reading.cancel(false));
+
+        harness.object.readGate.completeExceptionally(new TaggedFailure(ReadFailureKind.TIMEOUT));
+
+        assertEquals(harness.object.reads, 1);
+        assertEquals(harness.bookKeeper.reads, 0);
+        assertTrue(reading.isCancelled());
+        harness.handle.closeAsync().join();
+        assertEquals(harness.object.closes, 1);
+        assertEquals(harness.bookKeeper.closes, 0);
+    }
+
+    @Test
+    public void capturedSourceGateRejectsBeforeProviderUse() {
+        Harness harness = harness(OffloadedReadPriority.TIERED_STORAGE_FIRST, none());
+
+        assertTrue(failure(harness.handle.readCapturedAsync(0, 1, none(), () -> false))
+                instanceof LedgerReadSourcePinRegistry.SourcePinFencedException);
+        assertEquals(harness.object.reads, 0);
+        assertEquals(harness.bookKeeper.reads, 0);
+        harness.handle.closeAsync().join();
+    }
+
+    @Test
+    public void closedCapturedSourceGateWaitsForPrimaryAndRejectsNewFallback() {
+        Harness harness = harness(OffloadedReadPriority.TIERED_STORAGE_FIRST, none());
+        AtomicBoolean sourceUseOpen = new AtomicBoolean(true);
+        harness.object.readGate = new CompletableFuture<>();
+        CompletableFuture<LedgerEntries> reading =
+                harness.handle.readCapturedAsync(0, 1, none(), sourceUseOpen::get);
+        sourceUseOpen.set(false);
+        CompletableFuture<Void> drain = harness.pins.fence(Source.OBJECT);
+        assertFalse(reading.isDone());
+        assertFalse(drain.isDone());
+        TaggedFailure primary = new TaggedFailure(ReadFailureKind.TIMEOUT);
+
+        harness.object.readGate.completeExceptionally(primary);
+
+        assertSame(failure(reading), primary);
+        assertEquals(harness.bookKeeper.reads, 0);
+        drain.join();
+        harness.handle.closeAsync().join();
+    }
+
+    @Test
+    public void capturedGateFailureAfterPinReleasesAdmission() {
+        Harness harness = harness(OffloadedReadPriority.TIERED_STORAGE_FIRST, none());
+        AtomicInteger checks = new AtomicInteger();
+        IllegalStateException failedGate = new IllegalStateException("source gate failed after pin admission");
+
+        Throwable failure = failure(harness.handle.readCapturedAsync(0, 1, none(), () -> {
+            if (checks.incrementAndGet() == 3) {
+                throw failedGate;
+            }
+            return true;
+        }));
+
+        assertSame(failure, failedGate);
+        assertEquals(harness.object.reads, 0);
+        assertEquals(harness.bookKeeper.reads, 0);
+        harness.handle.closeAsync().join();
     }
 
     private static Harness harness(OffloadedReadPriority priority, OffloadReadSourceState initial) {
@@ -301,6 +568,8 @@ public class DualSourceReadHandleTest {
         private Throwable failure;
         private long entryIdDelta;
         private Runnable onRead = () -> { };
+        private CompletableFuture<Void> readGate = CompletableFuture.completedFuture(null);
+        private LedgerEntries lastRange;
         private int reads;
         private int closes;
         private int closedRanges;
@@ -312,14 +581,17 @@ public class DualSourceReadHandleTest {
             if (failure != null) {
                 return CompletableFuture.failedFuture(failure);
             }
-            List<LedgerEntry> entries = new ArrayList<>();
-            for (long entryId = firstEntry; entryId <= lastEntry; entryId++) {
-                long returnedId = entryId + entryIdDelta;
-                entries.add(LedgerEntryImpl.create(
-                        LEDGER_ID, returnedId, 1, Unpooled.wrappedBuffer(new byte[] {(byte) returnedId})));
-            }
-            LedgerEntries delegate = LedgerEntriesImpl.create(entries);
-            return CompletableFuture.completedFuture(new TrackingEntries(delegate, () -> closedRanges++));
+            return readGate.thenApply(ignored -> {
+                List<LedgerEntry> entries = new ArrayList<>();
+                for (long entryId = firstEntry; entryId <= lastEntry; entryId++) {
+                    long returnedId = entryId + entryIdDelta;
+                    entries.add(LedgerEntryImpl.create(
+                            LEDGER_ID, returnedId, 1, Unpooled.wrappedBuffer(new byte[] {(byte) returnedId})));
+                }
+                LedgerEntries delegate = LedgerEntriesImpl.create(entries);
+                lastRange = new TrackingEntries(delegate, () -> closedRanges++);
+                return lastRange;
+            });
         }
 
         @Override

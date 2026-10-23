@@ -59,6 +59,110 @@ public class MetaStoreImpl implements MetaStore, Consumer<Notification> {
     private static final String PREFIX = BASE_NODE + "/";
 
     private final MetadataStore store;
+    private StoredMutationGuard storedMutationGuard;
+    private boolean storedMutationStarted;
+
+    /** Install once before this factory starts Native writes. There is no removal or unguarded retry path. */
+    public synchronized void installStoredMutationGuard(StoredMutationGuard originalGuard) {
+        java.util.Objects.requireNonNull(originalGuard, "original metadata guard");
+        if (storedMutationGuard != null && storedMutationGuard != originalGuard) {
+            throw new IllegalStateException("Native metadata factory already has another mutation guard");
+        }
+        if (storedMutationGuard == null && storedMutationStarted) {
+            throw new IllegalStateException("Native metadata guard must precede the first mutation");
+        }
+        storedMutationGuard = originalGuard;
+    }
+
+    /** Exact original backend value for a mutation's reference comparison; never creates or repairs metadata. */
+    public record StoredMutationValue(byte[] storedBytes, Stat stat) {
+        public StoredMutationValue {
+            storedBytes = storedBytes.clone();
+            java.util.Objects.requireNonNull(stat, "actual metadata stat");
+        }
+
+        @Override
+        public byte[] storedBytes() {
+            return storedBytes.clone();
+        }
+    }
+
+    public CompletableFuture<Optional<StoredMutationValue>> readStoredMutationValue(
+            String ledgerName, String path, int maximumBytes) {
+        String parent = PREFIX + ledgerName;
+        if (maximumBytes < 1 || maximumBytes > 8_388_608
+                || !(path.equals(parent) || path.startsWith(parent + "/"))) {
+            return CompletableFuture.failedFuture(
+                    new IllegalArgumentException("metadata predecessor scope/bound differs"));
+        }
+        return store.get(path).thenApply(observed -> observed.map(value -> {
+            if (value.getValue().length > maximumBytes || !path.equals(value.getStat().getPath())) {
+                throw new IllegalArgumentException("actual metadata predecessor exceeds its scope/bound");
+            }
+            return new StoredMutationValue(value.getValue(), value.getStat());
+        })).copy();
+    }
+
+    /** Same factory/backend readback after a known original mutation response; it performs no write or retry. */
+    public CompletableFuture<Void> verifyStoredMutationResult(String ledgerName, String path,
+            byte[] originalStoredBytes, Stat originalReply) {
+        String parent = PREFIX + ledgerName;
+        if (!path.equals(parent) && !path.startsWith(parent + "/")) {
+            return CompletableFuture.failedFuture(new IllegalArgumentException("metadata readback path differs"));
+        }
+        if (originalStoredBytes != null && originalReply == null) {
+            return CompletableFuture.failedFuture(new IllegalArgumentException("metadata put reply is absent"));
+        }
+        return store.get(path).thenAccept(observed -> {
+            if (originalStoredBytes == null) {
+                if (observed.isPresent()) {
+                    throw new IllegalStateException("original metadata delete readback still exists");
+                }
+            } else if (observed.isEmpty() || observed.get().getStat().getVersion() != originalReply.getVersion()
+                    || !java.util.Arrays.equals(observed.get().getValue(), originalStoredBytes)) {
+                throw new IllegalStateException("original metadata put readback differs");
+            }
+        }).copy();
+    }
+
+    private synchronized StoredMutationGuard beginStoredMutation() {
+        storedMutationStarted = true;
+        return storedMutationGuard;
+    }
+
+    @Override
+    public synchronized StoredMutationGuard cursorResetGuard() {
+        return beginStoredMutation();
+    }
+
+    private CompletableFuture<Stat> putStored(String ledgerName, String path, byte[] bytes,
+            Optional<Long> expectedVersion) {
+        StoredMutationGuard guard = beginStoredMutation();
+        if (guard == null) {
+            return store.put(path, bytes, expectedVersion);
+        }
+        byte[] original = bytes.clone();
+        try {
+            return guard.execute(ledgerName, path, original.clone(), expectedVersion,
+                    () -> store.put(path, original, expectedVersion));
+        } catch (Throwable failure) {
+            return CompletableFuture.failedFuture(failure);
+        }
+    }
+
+    private CompletableFuture<Void> deleteStored(String ledgerName, String path) {
+        StoredMutationGuard guard = beginStoredMutation();
+        if (guard == null) {
+            return store.delete(path, Optional.empty());
+        }
+        try {
+            return guard.execute(ledgerName, path, null, Optional.empty(),
+                    () -> store.delete(path, Optional.empty()));
+        } catch (Throwable failure) {
+            return CompletableFuture.failedFuture(failure);
+        }
+    }
+
     private final OrderedExecutor executor;
 
     private static final int MAGIC_MANAGED_INFO_METADATA = 0x4778; // 0100 0111 0111 1000
@@ -102,6 +206,16 @@ public class MetaStoreImpl implements MetaStore, Consumer<Notification> {
     @Override
     public void getManagedLedgerInfo(String ledgerName, boolean createIfMissing, Map<String, String> properties,
             MetaStoreCallback<ManagedLedgerInfo> callback) {
+        getManagedLedgerInfo(ledgerName, createIfMissing, properties, true, callback);
+    }
+
+    @Override
+    public void readStoredManagedLedgerInfo(String ledgerName, MetaStoreCallback<ManagedLedgerInfo> callback) {
+        getManagedLedgerInfo(ledgerName, false, null, false, callback);
+    }
+
+    private void getManagedLedgerInfo(String ledgerName, boolean createIfMissing, Map<String, String> properties,
+            boolean repairTimestamps, MetaStoreCallback<ManagedLedgerInfo> callback) {
         // Try to get the content or create an empty node
         String path = PREFIX + ledgerName;
         store.get(path)
@@ -110,7 +224,9 @@ public class MetaStoreImpl implements MetaStore, Consumer<Notification> {
                         ManagedLedgerInfo info;
                         try {
                             info = parseManagedLedgerInfo(optResult.get().getValue());
-                            info = updateMLInfoTimestamp(info);
+                            if (repairTimestamps) {
+                                info = updateMLInfoTimestamp(info);
+                            }
                             callback.operationComplete(info, optResult.get().getStat());
                         } catch (Exception e) {
                             callback.operationFailed(getException(e));
@@ -120,7 +236,7 @@ public class MetaStoreImpl implements MetaStore, Consumer<Notification> {
                         if (createIfMissing) {
                             log.info().attr("path", path).log("Creating managed ledger path");
 
-                            store.put(path, new byte[0], Optional.of(-1L))
+                            putStored(ledgerName, path, new byte[0], Optional.of(-1L))
                                     .thenAccept(stat -> {
                                         ManagedLedgerInfo ledgerBuilder = new ManagedLedgerInfo();
                                         if (properties != null) {
@@ -190,7 +306,7 @@ public class MetaStoreImpl implements MetaStore, Consumer<Notification> {
                 .log("Updating metadata");
 
         String path = PREFIX + ledgerName;
-        store.put(path, compressLedgerInfo(mlInfo), Optional.of(stat.getVersion()))
+        putStored(ledgerName, path, compressLedgerInfo(mlInfo), Optional.of(stat.getVersion()))
                 .thenAcceptAsync(newVersion -> callback.operationComplete(null, newVersion),
                         executor.chooseThread(ledgerName))
                 .exceptionally(ex -> {
@@ -211,6 +327,16 @@ public class MetaStoreImpl implements MetaStore, Consumer<Notification> {
                 .exceptionally(ex -> {
                     executor.executeOrdered(ledgerName,
                             () -> callback.operationFailed(getException(ex)));
+                    return null;
+                });
+    }
+
+    @Override
+    public void readStoredCursorNames(String ledgerName, MetaStoreCallback<List<String>> callback) {
+        store.getChildrenFromStore(PREFIX + ledgerName)
+                .thenAcceptAsync(value -> callback.operationComplete(value, null), executor.chooseThread(ledgerName))
+                .exceptionally(failure -> {
+                    executor.executeOrdered(ledgerName, () -> callback.operationFailed(getException(failure)));
                     return null;
                 });
     }
@@ -242,6 +368,29 @@ public class MetaStoreImpl implements MetaStore, Consumer<Notification> {
     }
 
     @Override
+    public void readStoredCursorInfo(String ledgerName, String cursorName,
+                                     MetaStoreCallback<StoredCursorInfo> callback) {
+        String path = PREFIX + ledgerName + "/" + cursorName;
+        store.get(path).thenAcceptAsync(value -> {
+            if (value.isEmpty()) {
+                callback.operationFailed(new MetadataNotFoundException("Cursor metadata not found"));
+                return;
+            }
+            try {
+                var observed = value.orElseThrow();
+                var parsed = parseManagedCursorInfo(observed.getValue());
+                callback.operationComplete(new StoredCursorInfo(observed.getValue(), parsed.toByteArray()),
+                        observed.getStat());
+            } catch (Exception failure) {
+                callback.operationFailed(getException(failure));
+            }
+        }, executor.chooseThread(ledgerName)).exceptionally(failure -> {
+            executor.executeOrdered(ledgerName, () -> callback.operationFailed(getException(failure)));
+            return null;
+        });
+    }
+
+    @Override
     public void asyncUpdateCursorInfo(String ledgerName, String cursorName, ManagedCursorInfo info, Stat stat,
             MetaStoreCallback<Void> callback) {
         log.debug().attr("ledgerName", ledgerName)
@@ -270,7 +419,7 @@ public class MetaStoreImpl implements MetaStore, Consumer<Notification> {
                     .attr("info", info)
                     .log("Updating consumer on meta-data store");
         }
-        store.put(path, content, Optional.of(expectedVersion))
+        putStored(ledgerName, path, content, Optional.of(expectedVersion))
                 .thenAcceptAsync(optStat -> callback.operationComplete(null, optStat), executor
                         .chooseThread(ledgerName))
                 .exceptionally(ex -> {
@@ -285,7 +434,7 @@ public class MetaStoreImpl implements MetaStore, Consumer<Notification> {
         String path = PREFIX + ledgerName + "/" + cursorName;
         log.info().attr("ledgerName", ledgerName).attr("cursorName", cursorName).log("Remove cursor");
 
-        store.delete(path, Optional.empty())
+        deleteStored(ledgerName, path)
                 .thenAcceptAsync(v -> {
                     log.debug().attr("ledgerName", ledgerName).attr("cursorName", cursorName).log("Cursor delete done");
                     callback.operationComplete(null, null);
@@ -311,7 +460,7 @@ public class MetaStoreImpl implements MetaStore, Consumer<Notification> {
         log.info().attr("ledgerName", ledgerName).log("Remove ManagedLedger");
 
         String path = PREFIX + ledgerName;
-        store.delete(path, Optional.empty())
+        deleteStored(ledgerName, path)
                 .thenAcceptAsync(v -> {
                     log.debug().attr("ledgerName", ledgerName).log("Managed ledger delete done");
                     callback.operationComplete(null, null);
@@ -487,6 +636,52 @@ public class MetaStoreImpl implements MetaStore, Consumer<Notification> {
             ManagedLedgerInfo info = new ManagedLedgerInfo();
             info.parseFrom(data);
             return info;
+        }
+    }
+
+    /** Check the original compression envelope before decoding within an admitted metadata workspace. */
+    public ManagedCursorInfo parseManagedCursorInfo(byte[] data, int maximumBytes) throws Exception {
+        requireBoundedManagedInfo(data, maximumBytes, true);
+        return parseManagedCursorInfo(data);
+    }
+
+    public ManagedLedgerInfo parseManagedLedgerInfo(byte[] data, int maximumBytes) throws Exception {
+        requireBoundedManagedInfo(data, maximumBytes, false);
+        return parseManagedLedgerInfo(data);
+    }
+
+    private void requireBoundedManagedInfo(byte[] data, int maximumBytes, boolean cursor) throws Exception {
+        if (maximumBytes < 1 || maximumBytes > 8_388_608 || data.length > maximumBytes) {
+            throw new IllegalArgumentException("Native cursor metadata exceeds its admitted bound");
+        }
+        ByteBuf input = Unpooled.wrappedBuffer(data);
+        try {
+            if (input.readableBytes() >= 2 && input.readShort() == MAGIC_MANAGED_INFO_METADATA) {
+                if (input.readableBytes() < 4) {
+                    throw new IllegalArgumentException("Native cursor compression envelope is truncated");
+                }
+                int length = input.readInt();
+                if (length < 1 || length > input.readableBytes() || length > maximumBytes) {
+                    throw new IllegalArgumentException("Native cursor compression metadata exceeds its bound");
+                }
+                byte[] header = new byte[length];
+                input.readBytes(header);
+                int decodedBytes;
+                if (cursor) {
+                    ManagedCursorInfoMetadata metadata = new ManagedCursorInfoMetadata();
+                    metadata.parseFrom(header);
+                    decodedBytes = metadata.getUncompressedSize();
+                } else {
+                    ManagedLedgerInfoMetadata metadata = new ManagedLedgerInfoMetadata();
+                    metadata.parseFrom(header);
+                    decodedBytes = metadata.getUncompressedSize();
+                }
+                if (decodedBytes < 0 || decodedBytes > maximumBytes) {
+                    throw new IllegalArgumentException("Native cursor decoded metadata exceeds its admitted bound");
+                }
+            }
+        } finally {
+            input.release();
         }
     }
 

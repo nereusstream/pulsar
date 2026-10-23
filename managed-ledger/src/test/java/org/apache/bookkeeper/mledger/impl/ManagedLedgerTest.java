@@ -20,6 +20,7 @@ package org.apache.bookkeeper.mledger.impl;
 
 import static java.nio.charset.StandardCharsets.UTF_8;
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.ArgumentMatchers.anyLong;
@@ -50,6 +51,7 @@ import com.google.common.collect.Sets;
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.ByteBufAllocator;
 import io.netty.util.concurrent.DefaultThreadFactory;
+import java.io.IOException;
 import java.lang.reflect.Field;
 import java.nio.ReadOnlyBufferException;
 import java.nio.charset.Charset;
@@ -116,6 +118,7 @@ import org.apache.bookkeeper.mledger.AsyncCallbacks.AddEntryCallback;
 import org.apache.bookkeeper.mledger.AsyncCallbacks.CloseCallback;
 import org.apache.bookkeeper.mledger.AsyncCallbacks.DeleteLedgerCallback;
 import org.apache.bookkeeper.mledger.AsyncCallbacks.MarkDeleteCallback;
+import org.apache.bookkeeper.mledger.AsyncCallbacks.OffloadCallback;
 import org.apache.bookkeeper.mledger.AsyncCallbacks.OpenCursorCallback;
 import org.apache.bookkeeper.mledger.AsyncCallbacks.OpenLedgerCallback;
 import org.apache.bookkeeper.mledger.AsyncCallbacks.ReadEntriesCallback;
@@ -136,6 +139,7 @@ import org.apache.bookkeeper.mledger.ManagedLedgerFactoryMXBean;
 import org.apache.bookkeeper.mledger.Position;
 import org.apache.bookkeeper.mledger.PositionBound;
 import org.apache.bookkeeper.mledger.PositionFactory;
+import org.apache.bookkeeper.mledger.SourceSafeLedgerOffloader;
 import org.apache.bookkeeper.mledger.impl.ManagedCursorImpl.VoidCallback;
 import org.apache.bookkeeper.mledger.impl.MetaStore.MetaStoreCallback;
 import org.apache.bookkeeper.mledger.impl.cache.EntryCache;
@@ -153,6 +157,7 @@ import org.apache.pulsar.common.policies.data.EnsemblePlacementPolicyConfig;
 import org.apache.pulsar.common.policies.data.OffloadPoliciesImpl;
 import org.apache.pulsar.common.util.FutureUtil;
 import org.apache.pulsar.metadata.api.MetadataStoreException;
+import org.apache.pulsar.metadata.api.Option;
 import org.apache.pulsar.metadata.api.Stat;
 import org.apache.pulsar.metadata.api.extended.SessionEvent;
 import org.apache.pulsar.metadata.impl.FaultInjectionMetadataStore;
@@ -1058,6 +1063,412 @@ public class ManagedLedgerTest extends MockedBookKeeperTestCase {
     }
 
     @Test(timeOut = 20000)
+    public void testCloseWaitsForReadHandleAcknowledgement() throws Exception {
+        verifyReadHandleClose(false, false, false);
+        verifyReadHandleClose(true, false, false);
+        verifyReadHandleClose(false, true, false);
+        verifyReadHandleClose(true, true, false);
+    }
+
+    @Test(timeOut = 20000)
+    public void testCloseWaitsForCancelledReadHandleOpen() throws Exception {
+        verifyReadHandleClose(false, false, true);
+    }
+
+    @Test(timeOut = 20000)
+    public void testInvalidatedReadErrorKeepsReplacementHandle() throws Exception {
+        ManagedLedgerConfig config = new ManagedLedgerConfig().setMaxEntriesPerLedger(1);
+        config.setMinimumRolloverTime(0, TimeUnit.SECONDS);
+        ManagedLedgerImpl ledger = (ManagedLedgerImpl) factory.open("read-error-replacement-handle", config);
+        ledger.openCursor("retained-cursor");
+        Position first = ledger.addEntry("first".getBytes(UTF_8));
+        ledger.addEntry("second".getBytes(UTF_8));
+        try {
+            ReadHandle old = ledger.getLedgerHandle(first.getLedgerId()).get(5, TimeUnit.SECONDS);
+            ledger.invalidateReadHandle(first.getLedgerId());
+            ReadHandle replacement = ledger.getLedgerHandle(first.getLedgerId()).get(5, TimeUnit.SECONDS);
+            assertThat(replacement).isNotSameAs(old);
+            ledger.invalidateLedgerHandle(old);
+            assertThat(ledger.getLedgerHandle(first.getLedgerId()).get(5, TimeUnit.SECONDS)).isSameAs(replacement);
+            try (var entries = replacement.readAsync(0, 0).get(5, TimeUnit.SECONDS)) {
+                assertThat(entries.getEntry(0).getEntryBytes()).containsExactly("first".getBytes(UTF_8));
+            }
+        } finally {
+            ledger.close();
+        }
+    }
+
+    @Test(timeOut = 20000)
+    public void testCapturedTailReadDrainSurvivesObserverMutation() throws Exception {
+        SourceSafeLedgerOffloader offloader = mock(SourceSafeLedgerOffloader.class);
+        when(offloader.isAppendable()).thenReturn(true);
+        ManagedLedgerImpl ledger = (ManagedLedgerImpl) factory.open("captured-tail-read-drain",
+                new ManagedLedgerConfig().setLedgerOffloader(offloader));
+        CompletableFuture<LedgerEntries> firstReply = new CompletableFuture<>();
+        CompletableFuture<LedgerEntries> secondReply = new CompletableFuture<>();
+        LedgerEntries firstEntries = null;
+        LedgerEntries secondEntries = null;
+        try {
+            ledger.openCursor("retained-cursor");
+            Position position = ledger.addEntry("tail".getBytes(UTF_8));
+            firstEntries = spy(ledger.currentLedger.readAsync(0, 0).get(5, TimeUnit.SECONDS));
+            secondEntries = spy(ledger.currentLedger.readAsync(0, 0).get(5, TimeUnit.SECONDS));
+            var firstBuffer = firstEntries.getEntry(0).getEntryBuffer();
+            var secondBuffer = secondEntries.getEntry(0).getEntryBuffer();
+            int originalReferences = firstBuffer.refCnt();
+            assertThat(originalReferences).isGreaterThan(2);
+            LedgerHandle heldHandle = spy(ledger.currentLedger);
+            doReturn(firstReply, secondReply).when(heldHandle).readAsync(0, 0);
+            ledger.currentLedger = heldHandle;
+            var view = ledger.captureNativeReadView().get(5, TimeUnit.SECONDS);
+            var source = view.captureBookKeeperSource(position.getLedgerId()).get(5, TimeUnit.SECONDS);
+            var limits = new ManagedLedgerImpl.CapturedReadLimits(1, 64, 64);
+            var cancelledOperation = source.readOwnedOperation(0, 0, limits, () -> true);
+            var completedOperation = source.readOwnedOperation(0, 0, limits, () -> true);
+            var cancelled = cancelledOperation.result();
+            var completed = completedOperation.result();
+            var cancelledDrain = cancelledOperation.drained();
+            var completedDrain = completedOperation.drained();
+            assertThat(cancelled.cancel(false)).isTrue();
+            assertThat(completed.complete(null)).isTrue();
+            assertThat(cancelledDrain.cancel(false)).isTrue();
+            assertThat(completedDrain.complete(null)).isTrue();
+            var actualFirstDrain = cancelledOperation.drained();
+            var actualSecondDrain = completedOperation.drained();
+            assertThat(actualFirstDrain).isNotDone();
+            assertThat(actualSecondDrain).isNotDone();
+            var fence = view.fenceOwnerReadAdmission();
+            var repeated = view.fenceOwnerReadAdmission();
+            assertThat(fence).isNotDone();
+            assertThat(repeated.cancel(false)).isTrue();
+            assertThatThrownBy(() -> source.readOwnedAsync(0, 0, limits, () -> true).join())
+                    .hasRootCauseMessage("captured plain BookKeeper source is stale");
+            verify(heldHandle, times(2)).readAsync(0, 0);
+            Futures.CloseFuture close = new Futures.CloseFuture();
+            ledger.asyncClose(close, null);
+            assertThat(close).isNotDone();
+            firstReply.complete(firstEntries);
+            actualFirstDrain.get(5, TimeUnit.SECONDS);
+            assertThat(actualSecondDrain).isNotDone();
+            assertThat(firstBuffer.refCnt()).isEqualTo(originalReferences - 1);
+            assertThat(fence).isNotDone();
+            assertThat(close).isNotDone();
+            secondReply.complete(secondEntries);
+            actualSecondDrain.get(5, TimeUnit.SECONDS);
+            fence.get(5, TimeUnit.SECONDS);
+            close.get(5, TimeUnit.SECONDS);
+            assertThat(secondBuffer.refCnt()).isEqualTo(originalReferences - 2);
+            verify(firstEntries, times(1)).close();
+            verify(secondEntries, times(1)).close();
+        } finally {
+            if (firstEntries != null && !firstReply.isDone()) {
+                firstReply.complete(firstEntries);
+            }
+            if (secondEntries != null && !secondReply.isDone()) {
+                secondReply.complete(secondEntries);
+            }
+            ledger.close();
+        }
+    }
+
+    @Test(timeOut = 20000)
+    public void testCapturedReadCleanupFailureRetainsOwnerFailure() throws Exception {
+        SourceSafeLedgerOffloader offloader = mock(SourceSafeLedgerOffloader.class);
+        when(offloader.isAppendable()).thenReturn(true);
+        ManagedLedgerImpl ledger = (ManagedLedgerImpl) factory.open("captured-tail-cleanup-failure",
+                new ManagedLedgerConfig().setLedgerOffloader(offloader));
+        CompletableFuture<LedgerEntries> reply = new CompletableFuture<>();
+        LedgerEntries entries = null;
+        try {
+            ledger.openCursor("retained-cursor");
+            Position position = ledger.addEntry("tail".getBytes(UTF_8));
+            entries = spy(ledger.currentLedger.readAsync(0, 0).get(5, TimeUnit.SECONDS));
+            IllegalStateException cleanupFailure = new IllegalStateException("actual SDK entries close failed");
+            doAnswer(invocation -> {
+                invocation.callRealMethod();
+                throw cleanupFailure;
+            }).when(entries).close();
+            LedgerHandle heldHandle = spy(ledger.currentLedger);
+            doReturn(reply).when(heldHandle).readAsync(0, 0);
+            ledger.currentLedger = heldHandle;
+            var source = ledger.captureNativeReadView().get(5, TimeUnit.SECONDS)
+                    .captureBookKeeperSource(position.getLedgerId()).get(5, TimeUnit.SECONDS);
+            var operation = source.readOwnedOperation(0, 0, new ManagedLedgerImpl.CapturedReadLimits(1, 64, 64),
+                    () -> true);
+            reply.complete(entries);
+            assertThatThrownBy(() -> operation.result().join()).hasRootCause(cleanupFailure);
+            assertThatThrownBy(() -> operation.drained().join()).hasRootCause(cleanupFailure);
+            assertThatThrownBy(() -> ledger.captureNativeReadView().get(5, TimeUnit.SECONDS)
+                    .fenceOwnerReadAdmission().join()).hasRootCause(cleanupFailure);
+            Futures.CloseFuture close = new Futures.CloseFuture();
+            ledger.asyncClose(close, null);
+            assertThatThrownBy(close::join).hasRootCause(cleanupFailure);
+        } finally {
+            if (entries != null && !reply.isDone()) {
+                reply.complete(entries);
+            }
+            ledger.asyncClose(new Futures.CloseFuture(), null);
+        }
+    }
+
+    @Test(timeOut = 20000)
+    public void testRegisteredAdmissionCancellationBeforeSdk() throws Exception {
+        verifyRegisteredAdmissionBeforeSdk(true);
+    }
+
+    @Test(timeOut = 20000)
+    public void testRegisteredAdmissionFenceBeforeSdk() throws Exception {
+        verifyRegisteredAdmissionBeforeSdk(false);
+    }
+
+    private void verifyRegisteredAdmissionBeforeSdk(boolean cancel) throws Exception {
+        SourceSafeLedgerOffloader offloader = mock(SourceSafeLedgerOffloader.class);
+        when(offloader.isAppendable()).thenReturn(true);
+        ManagedLedgerImpl ledger = (ManagedLedgerImpl) factory.open("registered-read-admission-" + cancel,
+                new ManagedLedgerConfig().setLedgerOffloader(offloader));
+        CompletableFuture<Void> admitted = new CompletableFuture<>();
+        AtomicReference<java.util.concurrent.CompletionStage<Void>> cleanup = new AtomicReference<>();
+        try {
+            ledger.openCursor("retained-cursor");
+            Position position = ledger.addEntry("tail".getBytes(UTF_8));
+            LedgerHandle sourceHandle = spy(ledger.currentLedger);
+            ledger.currentLedger = sourceHandle;
+            var view = ledger.captureNativeReadView().get(5, TimeUnit.SECONDS);
+            var unregisteredView = ledger.captureNativeReadView().get(5, TimeUnit.SECONDS);
+            var source = view.captureBookKeeperSource(position.getLedgerId()).get(5, TimeUnit.SECONDS);
+            view.installReadAdmission((id, first, last, actualCleanup) -> {
+                assertThat(id).isEqualTo(position.getLedgerId());
+                assertThat(first).isZero();
+                assertThat(last).isZero();
+                cleanup.set(actualCleanup);
+                return admitted;
+            });
+            var operation = source.readOwnedOperation(0, 0,
+                    new ManagedLedgerImpl.CapturedReadLimits(1, 64, 64), () -> true);
+            var result = operation.result();
+            assertThat(result).isNotDone();
+            assertThat(cleanup.get().toCompletableFuture()).isNotDone();
+            verify(sourceHandle, times(0)).readAsync(anyLong(), anyLong());
+            ledger.setProperty("read-cut", "advanced");
+            assertThat(view.isCurrent()).isFalse();
+            assertThat(unregisteredView.isCurrent()).isFalse();
+            assertThatThrownBy(() -> unregisteredView.fenceOwnerReadAdmission().join())
+                    .hasRootCauseMessage("captured native source is stale");
+            if (cancel) {
+                assertThat(result.cancel(false)).isTrue();
+            }
+            var fence = cancel ? null : view.fenceOwnerReadAdmission();
+            if (fence != null) {
+                assertThat(fence).isNotDone();
+            }
+            admitted.complete(null);
+            operation.drained().get(5, TimeUnit.SECONDS);
+            cleanup.get().toCompletableFuture().get(5, TimeUnit.SECONDS);
+            if (fence == null) {
+                fence = view.fenceOwnerReadAdmission();
+            }
+            fence.get(5, TimeUnit.SECONDS);
+            verify(sourceHandle, times(0)).readAsync(anyLong(), anyLong());
+            if (cancel) {
+                assertThat(result).isCancelled();
+            } else {
+                assertThatThrownBy(result::join).hasRootCauseMessage("Native owner read admission is closed");
+            }
+        } finally {
+            admitted.complete(null);
+            ledger.close();
+        }
+    }
+
+    @Test(timeOut = 20000)
+    public void testCloseWaitsForNativeOffloadCompletion() throws Exception {
+        verifyNativeOffloadClose(false, false);
+    }
+
+    @Test(timeOut = 20000)
+    public void testCloseWaitsForNativeOffloadFailure() throws Exception {
+        verifyNativeOffloadClose(false, true);
+    }
+
+    @Test(timeOut = 20000)
+    public void testCloseWaitsForNativeOffloadMetadata() throws Exception {
+        verifyNativeOffloadClose(true, false);
+    }
+
+    private void verifyNativeOffloadClose(boolean holdMetadata, boolean failOffload) throws Exception {
+        String name = "close-native-offload-" + holdMetadata + "-" + failOffload;
+        String rootPath = "/managed-ledgers/" + name;
+        CompletableFuture<Void> publication = new CompletableFuture<>();
+        CompletableFuture<Void> acknowledgement = new CompletableFuture<>();
+        AtomicBoolean holdNext = new AtomicBoolean();
+        CountDownLatch started = new CountDownLatch(1);
+        CountDownLatch metadataWritten = new CountDownLatch(1);
+        FaultInjectionMetadataStore heldStore = new FaultInjectionMetadataStore(metadataStore) {
+            @Override
+            public CompletableFuture<Stat> put(String metadataPath, byte[] value, Optional<Long> expectedVersion,
+                    Set<Option> options) {
+                CompletableFuture<Stat> written = super.put(metadataPath, value, expectedVersion, options);
+                if (metadataPath.equals(rootPath) && holdNext.compareAndSet(true, false)) {
+                    return written.thenCompose(stat -> {
+                        metadataWritten.countDown();
+                        return acknowledgement.thenApply(ignored -> stat);
+                    });
+                }
+                return written;
+            }
+        };
+        ManagedLedgerFactoryImpl localFactory = new ManagedLedgerFactoryImpl(heldStore, bkc);
+        LedgerOffloader offloader = mock(LedgerOffloader.class);
+        when(offloader.isAppendable()).thenReturn(true);
+        when(offloader.getOffloadDriverName()).thenReturn("native-offload-close-test");
+        when(offloader.getOffloadDriverMetadata()).thenReturn(Map.of());
+        when(offloader.offload(any(), any(), any())).thenAnswer(invocation -> {
+            started.countDown();
+            return publication;
+        });
+        ManagedLedgerConfig config = new ManagedLedgerConfig().setMaxEntriesPerLedger(1).setLedgerOffloader(offloader);
+        config.setMinimumRolloverTime(0, TimeUnit.SECONDS);
+        ManagedLedgerImpl ledger = (ManagedLedgerImpl) localFactory.open(name, config);
+        try {
+            ledger.openCursor("retained-cursor");
+            Position first = ledger.addEntry("first".getBytes(UTF_8));
+            ledger.addEntry("second".getBytes(UTF_8));
+            CompletableFuture<Position> result = new CompletableFuture<>();
+            CountDownLatch callbackReturned = new CountDownLatch(1);
+            ledger.asyncOffloadPrefix(ledger.getLastConfirmedEntry(), new OffloadCallback() {
+                @Override
+                public void offloadComplete(Position position, Object ctx) {
+                    result.complete(position);
+                    callbackReturned.countDown();
+                }
+
+                @Override
+                public void offloadFailed(ManagedLedgerException failure, Object ctx) {
+                    result.completeExceptionally(failure);
+                    callbackReturned.countDown();
+                }
+            }, null);
+            assertThat(started.await(5, TimeUnit.SECONDS)).isTrue();
+            if (holdMetadata) {
+                holdNext.set(true);
+                publication.complete(null);
+                assertThat(metadataWritten.await(5, TimeUnit.SECONDS)).isTrue();
+                byte[] bytes = metadataStore.get(rootPath).get(5, TimeUnit.SECONDS).orElseThrow().getValue();
+                ManagedLedgerInfo persisted =
+                        ((MetaStoreImpl) localFactory.getMetaStore()).parseManagedLedgerInfo(bytes);
+                LedgerInfo persistedSource = null;
+                for (int i = 0; i < persisted.getLedgerInfosCount(); i++) {
+                    if (persisted.getLedgerInfoAt(i).getLedgerId() == first.getLedgerId()) {
+                        persistedSource = persisted.getLedgerInfoAt(i);
+                    }
+                }
+                assertThat(persistedSource).isNotNull();
+                assertThat(persistedSource.getOffloadContext().isComplete()).isTrue();
+                assertThat(ledger.getLedgersInfo().get(first.getLedgerId()).getOffloadContext().isComplete()).isFalse();
+            }
+            Futures.CloseFuture close = new Futures.CloseFuture();
+            ledger.asyncClose(close, null);
+            Futures.CloseFuture repeated = new Futures.CloseFuture();
+            ledger.asyncClose(repeated, null);
+            assertThat(repeated).isNotDone();
+            assertThat(close).isNotDone();
+            assertThatThrownBy(() -> close.get(1, TimeUnit.SECONDS)).isInstanceOf(TimeoutException.class);
+            assertThat(repeated.cancel(false)).isTrue();
+            if (failOffload) {
+                publication.completeExceptionally(new IOException("offload provider acknowledgement lost"));
+                assertThatThrownBy(() -> result.get(5, TimeUnit.SECONDS))
+                        .hasRootCauseInstanceOf(IOException.class)
+                        .hasRootCauseMessage("offload provider acknowledgement lost");
+            } else {
+                publication.complete(null);
+                acknowledgement.complete(null);
+                result.get(5, TimeUnit.SECONDS);
+                assertThat(ledger.getLedgersInfo().get(first.getLedgerId()).getOffloadContext().isComplete()).isTrue();
+            }
+            assertThat(callbackReturned.await(5, TimeUnit.SECONDS)).isTrue();
+            close.get(5, TimeUnit.SECONDS);
+            Futures.CloseFuture finalClose = new Futures.CloseFuture();
+            ledger.asyncClose(finalClose, null);
+            finalClose.get(5, TimeUnit.SECONDS);
+        } finally {
+            publication.complete(null);
+            acknowledgement.complete(null);
+            try {
+                ledger.close();
+            } finally {
+                localFactory.shutdown();
+            }
+        }
+    }
+
+    private void verifyReadHandleClose(boolean invalidateFirst, boolean failClose, boolean cancelPendingOpen)
+            throws Exception {
+        String name = "close-read-handle-" + invalidateFirst + "-" + failClose + "-" + cancelPendingOpen;
+        LedgerOffloader offloader = mock(LedgerOffloader.class);
+        when(offloader.isAppendable()).thenReturn(true);
+        when(offloader.getOffloadDriverName()).thenReturn("close-read-handle-test");
+        when(offloader.getOffloadDriverMetadata()).thenReturn(Map.of());
+        when(offloader.offload(any(), any(), any())).thenReturn(CompletableFuture.completedFuture(null));
+        ManagedLedgerConfig config = new ManagedLedgerConfig().setMaxEntriesPerLedger(1).setLedgerOffloader(offloader);
+        config.setMinimumRolloverTime(0, TimeUnit.SECONDS);
+        ManagedLedgerImpl ledger = (ManagedLedgerImpl) factory.open(name, config);
+        ledger.openCursor("retained-cursor");
+        Position first = ledger.addEntry("first".getBytes(UTF_8));
+        ledger.addEntry("second".getBytes(UTF_8));
+        ReadHandle source = bkc.newOpenLedgerOp().withRecovery(false).withLedgerId(first.getLedgerId())
+                .withDigestType(config.getDigestType()).withPassword(config.getPassword()).execute()
+                .get(5, TimeUnit.SECONDS);
+        ReadHandle handle = spy(source);
+        CompletableFuture<Void> acknowledgement = new CompletableFuture<>();
+        doReturn(acknowledgement).when(handle).closeAsync();
+        CompletableFuture<ReadHandle> opening = new CompletableFuture<>();
+        when(offloader.readOffloaded(eq(first.getLedgerId()), any(UUID.class), any())).thenReturn(opening);
+        try {
+            ledger.offloadPrefix(ledger.getLastConfirmedEntry());
+            CompletableFuture<ReadHandle> observer = ledger.reopenReadHandle(first.getLedgerId());
+            if (cancelPendingOpen) {
+                assertThat(observer.cancel(false)).isTrue();
+            } else {
+                opening.complete(handle);
+                assertThat(observer.get(5, TimeUnit.SECONDS)).isSameAs(handle);
+            }
+            if (invalidateFirst) {
+                ledger.invalidateReadHandle(first.getLedgerId());
+            }
+            Futures.CloseFuture close = new Futures.CloseFuture();
+            ledger.asyncClose(close, null);
+            Futures.CloseFuture repeated = new Futures.CloseFuture();
+            ledger.asyncClose(repeated, null);
+            assertThat(repeated).isNotDone();
+            assertThat(close).isNotDone();
+            if (cancelPendingOpen) {
+                opening.complete(handle);
+                verify(handle, Mockito.timeout(5000)).closeAsync();
+                assertThat(close).isNotDone();
+            }
+            if (failClose) {
+                acknowledgement.completeExceptionally(new IOException("read handle close acknowledgement lost"));
+                assertThat(close.handle((ignored, failure) -> failure).get(5, TimeUnit.SECONDS)).isNotNull();
+                assertThat(repeated.handle((ignored, failure) -> failure).get(5, TimeUnit.SECONDS)).isNotNull();
+                Futures.CloseFuture last = new Futures.CloseFuture();
+                ledger.asyncClose(last, null);
+                assertThat(last).isCompletedExceptionally();
+            } else {
+                acknowledgement.complete(null);
+                close.get(5, TimeUnit.SECONDS);
+                repeated.get(5, TimeUnit.SECONDS);
+                Futures.CloseFuture last = new Futures.CloseFuture();
+                ledger.asyncClose(last, null);
+                assertThat(last).isCompleted();
+            }
+        } finally {
+            opening.complete(handle);
+            acknowledgement.complete(null);
+            source.closeAsync().get(5, TimeUnit.SECONDS);
+        }
+    }
+
+    @Test(timeOut = 20000)
     public void asyncCloseWithoutError() throws Exception {
         ManagedLedger ledger = factory.open("my_test_ledger");
         ledger.openCursor("test-cursor");
@@ -1726,6 +2137,97 @@ public class ManagedLedgerTest extends MockedBookKeeperTestCase {
         }
         assertTrue(latch.await(300, TimeUnit.SECONDS));
         factory.shutdown();
+    }
+
+    @Test(timeOut = 20000)
+    public void testStoredMetadataGuardRejectsBeforeOriginalDispatch() throws Exception {
+        var store = (MetaStoreImpl) factory.getMetaStore();
+        store.installStoredMutationGuard(new MetaStore.StoredMutationGuard() {
+            @Override
+            public <T> CompletableFuture<T> execute(String ledgerName, String path, byte[] proposedStoredBytes,
+                    Optional<Long> expectedVersion,
+                    java.util.function.Supplier<CompletableFuture<T>> originalDispatch) {
+                return CompletableFuture.failedFuture(new IllegalStateException("metadata guard denied"));
+            }
+        });
+        assertThatThrownBy(() -> factory.open("metadata-guard-denied"))
+                .hasRootCauseMessage("metadata guard denied");
+        assertThat(metadataStore.get("/managed-ledgers/metadata-guard-denied").join()).isEmpty();
+        assertThat(bkc.getLedgers()).isEmpty();
+    }
+
+    @Test(timeOut = 20000)
+    public void testStoredMetadataGuardOwnsCandidateCopyAcrossNativeWritesAndDeletes() throws Exception {
+        var store = (MetaStoreImpl) factory.getMetaStore();
+        var putPaths = new java.util.concurrent.ConcurrentHashMap<String, Boolean>();
+        var deletePaths = new java.util.concurrent.ConcurrentHashMap<String, Boolean>();
+        MetaStore.StoredMutationGuard originalGuard = new MetaStore.StoredMutationGuard() {
+            @Override
+            public <T> CompletableFuture<T> execute(String ledgerName, String path, byte[] proposedStoredBytes,
+                    Optional<Long> expectedVersion,
+                    java.util.function.Supplier<CompletableFuture<T>> originalDispatch) {
+                assertEquals(ledgerName, "metadata-guard-copies");
+                if (proposedStoredBytes == null) {
+                    deletePaths.put(path, true);
+                } else {
+                    putPaths.put(path, true);
+                    if (proposedStoredBytes.length > 0) {
+                        proposedStoredBytes[0] ^= 0xff;
+                    }
+                }
+                return originalDispatch.get();
+            }
+        };
+        store.installStoredMutationGuard(originalGuard);
+        store.installStoredMutationGuard(originalGuard);
+        var ledger = factory.open("metadata-guard-copies");
+        var cursor = ledger.openCursor("guarded-cursor");
+        var position = ledger.addEntry("original".getBytes(UTF_8));
+        cursor.markDelete(position);
+        var stored = metadataStore.get("/managed-ledgers/metadata-guard-copies").join().orElseThrow();
+        assertThat(store.parseManagedLedgerInfo(stored.getValue()).getLedgerInfosCount()).isPositive();
+        assertThat(store.parseManagedCursorInfo(metadataStore
+                .get("/managed-ledgers/metadata-guard-copies/guarded-cursor").join().orElseThrow().getValue()))
+                .isNotNull();
+        ledger.deleteCursor("guarded-cursor");
+        ledger.delete();
+        assertThat(putPaths.keySet()).contains("/managed-ledgers/metadata-guard-copies",
+                "/managed-ledgers/metadata-guard-copies/guarded-cursor");
+        assertThat(deletePaths.keySet()).containsExactlyInAnyOrder("/managed-ledgers/metadata-guard-copies",
+                "/managed-ledgers/metadata-guard-copies/guarded-cursor");
+        assertThat(metadataStore.get("/managed-ledgers/metadata-guard-copies").join()).isEmpty();
+        assertThatThrownBy(() -> store.installStoredMutationGuard(new MetaStore.StoredMutationGuard() {
+            @Override
+            public <T> CompletableFuture<T> execute(String ledgerName, String path, byte[] proposedStoredBytes,
+                    Optional<Long> expectedVersion,
+                    java.util.function.Supplier<CompletableFuture<T>> originalDispatch) {
+                return originalDispatch.get();
+            }
+        })).hasMessage("Native metadata factory already has another mutation guard");
+    }
+
+    @Test(timeOut = 20000)
+    public void testStoredMetadataGuardCannotAdoptAnAlreadyWritingFactory() throws Exception {
+        var ledger = factory.open("metadata-guard-too-late");
+        var store = (MetaStoreImpl) factory.getMetaStore();
+        assertThatThrownBy(() -> store.installStoredMutationGuard(new MetaStore.StoredMutationGuard() {
+            @Override
+            public <T> CompletableFuture<T> execute(String ledgerName, String path, byte[] proposedStoredBytes,
+                    Optional<Long> expectedVersion,
+                    java.util.function.Supplier<CompletableFuture<T>> originalDispatch) {
+                return originalDispatch.get();
+            }
+        })).hasMessage("Native metadata guard must precede the first mutation");
+        var cursor = ledger.openCursor("still-original", InitialPosition.Earliest);
+        ledger.addEntry("original".getBytes(UTF_8));
+        var entries = cursor.readEntries(1);
+        try {
+            assertThat(entries).hasSize(1);
+            assertThat(entries.get(0).getData()).isEqualTo("original".getBytes(UTF_8));
+        } finally {
+            entries.forEach(Entry::release);
+            ledger.close();
+        }
     }
 
     @Test
@@ -3354,6 +3856,172 @@ public class ManagedLedgerTest extends MockedBookKeeperTestCase {
         assertTrue(ledgerCreateHook.isCompletedExceptionally());
 
         ledger.close();
+    }
+
+    @Test(timeOut = 20000)
+    public void testSourceSafeCloseWaitsForActualCreateAndLateHandleClose() throws Exception {
+        verifySourceSafeCreateClose(false);
+    }
+
+    @Test(timeOut = 20000)
+    public void testSourceSafeLateCreateCloseFailureCannotConfirmOwnerDrain() throws Exception {
+        verifySourceSafeCreateClose(true);
+    }
+
+    @Test(timeOut = 20000)
+    public void testUnregisteredPreparationObserverCannotConfirmSdkDrain() throws Exception {
+        verifyUnregisteredPreparationDrain(false);
+    }
+
+    @Test(timeOut = 20000)
+    public void testUnregisteredPreparationCloseFailureCannotQualifyDrain() throws Exception {
+        verifyUnregisteredPreparationDrain(true);
+    }
+
+    @Test(timeOut = 20000)
+    public void testOrdinaryCreateDispatchDoesNotWaitForLedgerMonitor() throws Exception {
+        verifyCreateDispatchWithoutLedgerMonitor(false);
+    }
+
+    @Test(timeOut = 20000)
+    public void testSourceSafeCreateDispatchDoesNotWaitForLedgerMonitor() throws Exception {
+        verifyCreateDispatchWithoutLedgerMonitor(true);
+    }
+
+    private void verifyCreateDispatchWithoutLedgerMonitor(boolean sourceSafe) throws Exception {
+        ManagedLedgerConfig config = new ManagedLedgerConfig();
+        if (sourceSafe) {
+            SourceSafeLedgerOffloader offloader = mock(SourceSafeLedgerOffloader.class);
+            when(offloader.isAppendable()).thenReturn(true);
+            config.setLedgerOffloader(offloader);
+        }
+        ManagedLedgerImpl ledger =
+                (ManagedLedgerImpl) factory.open("create-without-ledger-monitor-" + sourceSafe, config);
+        BookKeeper client = mock(BookKeeper.class);
+        CreateBuilder builder = mock(CreateBuilder.class, Mockito.RETURNS_SELF);
+        when(client.newCreateLedgerOp()).thenReturn(builder);
+        when(builder.execute())
+                .thenReturn(CompletableFuture.failedFuture(new IllegalStateException("SDK create rejected")));
+        CountDownLatch held = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        CountDownLatch callback = new CountDownLatch(1);
+        Thread holder = new Thread(() -> {
+            synchronized (ledger) {
+                held.countDown();
+                try {
+                    release.await(10, TimeUnit.SECONDS);
+                } catch (InterruptedException interrupted) {
+                    Thread.currentThread().interrupt();
+                }
+            }
+        });
+        var caller = Executors.newSingleThreadExecutor();
+        try {
+            holder.start();
+            assertTrue(held.await(5, TimeUnit.SECONDS));
+            caller.submit(() -> ledger.asyncCreateLedger(client, config, DigestType.CRC32C,
+                    (rc, handle, ctx) -> callback.countDown(), Map.of(), ledger.getLogger())).get(1, TimeUnit.SECONDS);
+            assertTrue(callback.await(1, TimeUnit.SECONDS));
+        } finally {
+            release.countDown();
+            holder.join(5000);
+            assertFalse(holder.isAlive());
+            caller.shutdown();
+            assertTrue(caller.awaitTermination(5, TimeUnit.SECONDS));
+            ledger.close();
+        }
+    }
+
+    private void verifyUnregisteredPreparationDrain(boolean failClose) throws Exception {
+        SourceSafeLedgerOffloader offloader = mock(SourceSafeLedgerOffloader.class);
+        when(offloader.isAppendable()).thenReturn(true);
+        ManagedLedgerImpl ledger = (ManagedLedgerImpl) factory.open("unregistered-preparation-" + failClose,
+                new ManagedLedgerConfig().setLedgerOffloader(offloader));
+        CompletableFuture<Void> actualClose = new CompletableFuture<>();
+        try {
+            var scope = ledger.captureNativeReadView().get(5, TimeUnit.SECONDS);
+            scope.installReadPreparation();
+            ReadHandle handle = mock(ReadHandle.class);
+            when(handle.closeAsync()).thenReturn(actualClose);
+            ledger.ledgerCache.put(ledger.currentLedger.getId(), CompletableFuture.completedFuture(handle));
+            var observer = scope.fenceUnregisteredReadPreparation();
+            observer.complete(null);
+            assertThat(scope.fenceUnregisteredReadPreparation()).isNotDone();
+            assertThatThrownBy(scope::requireUnregisteredReadPreparationDrain)
+                    .hasMessage("Original unregistered Native preparation has no confirmed drain");
+            assertThatThrownBy(() -> scope.installReadAdmission((id, first, last, cleanup) ->
+                    CompletableFuture.completedFuture(null))).isInstanceOf(IllegalStateException.class);
+            if (failClose) {
+                actualClose.completeExceptionally(new IllegalStateException("actual unregistered close failed"));
+                assertThatThrownBy(() -> scope.fenceUnregisteredReadPreparation().get(5, TimeUnit.SECONDS))
+                        .hasRootCauseMessage("actual unregistered close failed");
+                assertThatThrownBy(scope::requireUnregisteredReadPreparationDrain)
+                        .hasMessage("Original unregistered Native preparation has no confirmed drain");
+            } else {
+                actualClose.complete(null);
+                scope.fenceUnregisteredReadPreparation().get(5, TimeUnit.SECONDS);
+                scope.requireUnregisteredReadPreparationDrain();
+            }
+        } finally {
+            actualClose.complete(null);
+            try {
+                ledger.close();
+            } catch (ManagedLedgerException expected) {
+                if (!failClose) {
+                    throw expected;
+                }
+            }
+        }
+    }
+
+    private void verifySourceSafeCreateClose(boolean failClose) throws Exception {
+        SourceSafeLedgerOffloader offloader = mock(SourceSafeLedgerOffloader.class);
+        when(offloader.isAppendable()).thenReturn(true);
+        ManagedLedgerConfig config = new ManagedLedgerConfig().setLedgerOffloader(offloader)
+                .setMetadataOperationsTimeoutSeconds(1);
+        ManagedLedgerImpl ledger = (ManagedLedgerImpl) factory.open("source-safe-create-close-" + failClose, config);
+        CompletableFuture<WriteHandle> actualCreate = new CompletableFuture<>();
+        CompletableFuture<Void> actualClose = new CompletableFuture<>();
+        CountDownLatch closeStarted = new CountDownLatch(1);
+        LedgerHandle lateHandle = mock(LedgerHandle.class);
+        when(lateHandle.closeAsync()).thenAnswer(invocation -> {
+            closeStarted.countDown();
+            return actualClose;
+        });
+        BookKeeper heldClient = mock(BookKeeper.class);
+        CreateBuilder builder = mock(CreateBuilder.class, Mockito.RETURNS_SELF);
+        when(heldClient.newCreateLedgerOp()).thenReturn(builder);
+        when(builder.execute()).thenReturn(actualCreate);
+        CompletableFuture<Integer> caller = new CompletableFuture<>();
+        AtomicInteger callbacks = new AtomicInteger();
+        ledger.asyncCreateLedger(heldClient, config, DigestType.CRC32C, (rc, handle, ctx) -> {
+            callbacks.incrementAndGet();
+            ledger.checkAndCompleteLedgerOpTask(rc, handle, ctx);
+            caller.complete(rc);
+        }, Map.of(), ledger.getLogger());
+        assertEquals(caller.get(5, TimeUnit.SECONDS).intValue(), BKException.Code.TimeoutException);
+        Futures.CloseFuture close = new Futures.CloseFuture();
+        ledger.asyncClose(close, null);
+        Futures.CloseFuture repeated = new Futures.CloseFuture();
+        ledger.asyncClose(repeated, null);
+        assertThatThrownBy(() -> close.get(1, TimeUnit.SECONDS)).isInstanceOf(TimeoutException.class);
+        repeated.complete(null);
+        actualCreate.complete(lateHandle);
+        assertTrue(closeStarted.await(5, TimeUnit.SECONDS));
+        assertThat(close).isNotDone();
+        assertEquals(callbacks.get(), 1);
+        if (failClose) {
+            actualClose.completeExceptionally(new IllegalStateException("actual late handle close failed"));
+            assertThatThrownBy(() -> close.get(5, TimeUnit.SECONDS))
+                    .hasRootCauseMessage("actual late handle close failed");
+            Futures.CloseFuture afterFailure = new Futures.CloseFuture();
+            ledger.asyncClose(afterFailure, null);
+            assertThatThrownBy(() -> afterFailure.get(5, TimeUnit.SECONDS))
+                    .hasRootCauseMessage("actual late handle close failed");
+        } else {
+            actualClose.complete(null);
+            close.get(5, TimeUnit.SECONDS);
+        }
     }
 
     /**

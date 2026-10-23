@@ -20,6 +20,7 @@ package org.apache.bookkeeper.mledger.impl;
 
 import static org.apache.bookkeeper.mledger.impl.EntryCountEstimator.estimateEntryCountByBytesSize;
 import static org.apache.bookkeeper.mledger.impl.cache.RangeEntryCacheImpl.BOOKKEEPER_READ_OVERHEAD_PER_ENTRY;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.assertj.core.api.AssertionsForInterfaceTypes.assertThat;
 import static org.mockito.ArgumentMatchers.anyBoolean;
 import static org.mockito.ArgumentMatchers.anyInt;
@@ -132,6 +133,7 @@ import org.apache.pulsar.common.util.FutureUtil;
 import org.apache.pulsar.common.util.collections.BitSetRecyclable;
 import org.apache.pulsar.common.util.collections.LongPairRangeSet;
 import org.apache.pulsar.metadata.api.MetadataStoreException;
+import org.apache.pulsar.metadata.api.Option;
 import org.apache.pulsar.metadata.api.Stat;
 import org.apache.pulsar.metadata.api.extended.SessionEvent;
 import org.apache.pulsar.metadata.impl.FaultInjectionMetadataStore;
@@ -182,6 +184,115 @@ public class ManagedCursorTest extends MockedBookKeeperTestCase {
         closeCursorLedger(c1);
         c1.delete(PositionFactory.create(c1.getReadPosition().getLedgerId(), c1.getReadPosition().getEntryId() + 2));
         ledger.close();
+    }
+
+    @Test(timeOut = 20000)
+    public void testCloseWaitsForCursorMetadataAcknowledgement() throws Exception {
+        verifyCursorCloseAcknowledgement(false);
+    }
+
+    @Test(timeOut = 20000)
+    public void testCloseFailureCannotBecomeRepeatSuccess() throws Exception {
+        verifyCursorCloseAcknowledgement(true);
+    }
+
+    private void verifyCursorCloseAcknowledgement(boolean failAcknowledgement) throws Exception {
+        String name = "native-cursor-close-" + failAcknowledgement;
+        String cursorPath = "/managed-ledgers/" + name + "/retained-cursor";
+        AtomicBoolean holdNext = new AtomicBoolean();
+        CountDownLatch written = new CountDownLatch(1);
+        CompletableFuture<Void> acknowledgement = new CompletableFuture<>();
+        FaultInjectionMetadataStore heldStore = new FaultInjectionMetadataStore(metadataStore) {
+            @Override
+            public CompletableFuture<Stat> put(String path, byte[] value, Optional<Long> expectedVersion,
+                    Set<Option> options) {
+                CompletableFuture<Stat> actual = super.put(path, value, expectedVersion, options);
+                if (path.equals(cursorPath) && holdNext.compareAndSet(true, false)) {
+                    return actual.thenCompose(stat -> {
+                        written.countDown();
+                        return acknowledgement.thenApply(ignored -> stat);
+                    });
+                }
+                return actual;
+            }
+        };
+        ManagedLedgerFactoryImpl localFactory = new ManagedLedgerFactoryImpl(heldStore, bkc);
+        ManagedLedgerImpl ledger = (ManagedLedgerImpl) localFactory.open(name);
+        CompletableFuture<Void> ownerClose = new CompletableFuture<>();
+        try {
+            ManagedCursor cursor = ledger.openCursor("retained-cursor");
+            ledger.addEntry("retained".getBytes(StandardCharsets.UTF_8));
+            holdNext.set(true);
+            Object originalContext = new Object();
+            AtomicReference<Object> originalObserved = new AtomicReference<>();
+            CompletableFuture<Void> first = closeCursorWithContext(cursor, originalContext, originalObserved);
+            assertTrue(written.await(5, TimeUnit.SECONDS));
+            assertTrue(metadataStore.get(cursorPath).get(5, TimeUnit.SECONDS).isPresent());
+            Object repeatedContext = new Object();
+            AtomicReference<Object> repeatedObserved = new AtomicReference<>();
+            CompletableFuture<Void> repeated = closeCursorWithContext(cursor, repeatedContext, repeatedObserved);
+            assertThatThrownBy(() -> repeated.get(1, TimeUnit.SECONDS)).isInstanceOf(TimeoutException.class);
+            assertTrue(closeCursorWithContext(cursor, new Object(), new AtomicReference<>()).cancel(false));
+            CompletableFuture<Void> afterCancelled =
+                    closeCursorWithContext(cursor, new Object(), new AtomicReference<>());
+            assertThat(afterCancelled).isNotDone();
+            ledger.asyncClose(new AsyncCallbacks.CloseCallback() {
+                @Override
+                public void closeComplete(Object ctx) {
+                    ownerClose.complete(null);
+                }
+
+                @Override
+                public void closeFailed(ManagedLedgerException failure, Object ctx) {
+                    ownerClose.completeExceptionally(failure);
+                }
+            }, null);
+            assertThatThrownBy(() -> ownerClose.get(1, TimeUnit.SECONDS)).isInstanceOf(TimeoutException.class);
+            if (failAcknowledgement) {
+                acknowledgement.completeExceptionally(new MetadataStoreException("cursor close acknowledgement lost"));
+                assertThatThrownBy(() -> first.get(5, TimeUnit.SECONDS))
+                        .hasRootCauseMessage("cursor close acknowledgement lost");
+                assertThatThrownBy(() -> repeated.get(5, TimeUnit.SECONDS))
+                        .hasRootCauseMessage("cursor close acknowledgement lost");
+                assertThatThrownBy(() -> afterCancelled.get(5, TimeUnit.SECONDS))
+                        .hasRootCauseMessage("cursor close acknowledgement lost");
+                assertThatThrownBy(() -> ownerClose.get(5, TimeUnit.SECONDS))
+                        .hasRootCauseMessage("cursor close acknowledgement lost");
+                assertThatThrownBy(() -> closeCursorWithContext(cursor, new Object(), new AtomicReference<>()).join())
+                        .hasRootCauseMessage("cursor close acknowledgement lost");
+            } else {
+                acknowledgement.complete(null);
+                first.get(5, TimeUnit.SECONDS);
+                repeated.get(5, TimeUnit.SECONDS);
+                afterCancelled.get(5, TimeUnit.SECONDS);
+                ownerClose.get(5, TimeUnit.SECONDS);
+                closeCursorWithContext(cursor, new Object(), new AtomicReference<>()).get(5, TimeUnit.SECONDS);
+            }
+            assertThat(originalObserved.get()).isSameAs(originalContext);
+            assertThat(repeatedObserved.get()).isSameAs(repeatedContext);
+        } finally {
+            acknowledgement.complete(null);
+            localFactory.shutdown();
+        }
+    }
+
+    private static CompletableFuture<Void> closeCursorWithContext(
+            ManagedCursor cursor, Object context, AtomicReference<Object> observed) {
+        CompletableFuture<Void> result = new CompletableFuture<>();
+        cursor.asyncClose(new AsyncCallbacks.CloseCallback() {
+            @Override
+            public void closeComplete(Object ctx) {
+                observed.set(ctx);
+                result.complete(null);
+            }
+
+            @Override
+            public void closeFailed(ManagedLedgerException failure, Object ctx) {
+                observed.set(ctx);
+                result.completeExceptionally(failure);
+            }
+        }, context);
+        return result;
     }
 
     @Test
@@ -942,6 +1053,56 @@ public class ManagedCursorTest extends MockedBookKeeperTestCase {
         // verify if the markDeletePosition moves from 3:-1 to 5:0
         assertEquals(mc2.getMarkDeletedPosition(), pos);
         assertEquals(mc2.getMarkDeletedPosition().getNext(), mc2.getReadPosition());
+    }
+
+    @Test(timeOut = 20000)
+    void testGuardedResetRejectsChangedSourceBeforeDispatch() throws Exception {
+        var admitted = new CompletableFuture<Void>();
+        var proceed = new CompletableFuture<Void>();
+        var rejected = new CompletableFuture<Throwable>();
+        ((MetaStoreImpl) factory.getMetaStore()).installStoredMutationGuard(new MetaStore.StoredMutationGuard() {
+            @Override
+            public <T> CompletableFuture<T> execute(String ledgerName, String path, byte[] proposed,
+                    Optional<Long> version, java.util.function.Supplier<CompletableFuture<T>> original) {
+                return original.get();
+            }
+
+            @Override
+            public <T> CompletableFuture<T> executeCursorReset(String ledgerName, String cursorName,
+                    MetaStore.CursorResetContext context,
+                    java.util.function.Supplier<CompletableFuture<T>> original) {
+                admitted.complete(null);
+                return proceed.thenCompose(unused -> original.get().whenComplete((value, failure) -> {
+                    if (failure != null) {
+                        rejected.complete(failure);
+                    }
+                }));
+            }
+        });
+        var ledger = factory.open("guarded-reset-source-change");
+        var cursor = ledger.openCursor("cursor");
+        var first = ledger.addEntry("first".getBytes(Encoding));
+        cursor.markDelete(first);
+        var completed = new CompletableFuture<ManagedLedgerException>();
+        cursor.asyncResetCursor(first, false, new AsyncCallbacks.ResetCursorCallback() {
+            @Override
+            public void resetComplete(Object ctx) {
+                completed.complete(null);
+            }
+
+            @Override
+            public void resetFailed(ManagedLedgerException failure, Object ctx) {
+                completed.complete(failure);
+            }
+        });
+        admitted.get(10, TimeUnit.SECONDS);
+        ledger.setProperty("reset-source", "changed");
+        proceed.complete(null);
+        assertNotNull(completed.get(10, TimeUnit.SECONDS));
+        assertTrue(rejected.get(10, TimeUnit.SECONDS) instanceof MetaStore.CursorResetNotDispatchedException);
+        assertEquals(cursor.getMarkDeletedPosition(), first);
+        cursor.close();
+        ledger.close();
     }
 
     @Test(timeOut = 20000)

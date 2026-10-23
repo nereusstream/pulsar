@@ -176,6 +176,7 @@ public class ManagedCursorImpl implements ManagedCursor {
         AtomicIntegerFieldUpdater.newUpdater(ManagedCursorImpl.class, "pendingReadOps");
     @SuppressWarnings("unused")
     private volatile int pendingReadOps = 0;
+    private CompletableFuture<Void> closeFuture;
 
     private static final AtomicLongFieldUpdater<ManagedCursorImpl> MSG_CONSUMED_COUNTER_UPDATER =
             AtomicLongFieldUpdater.newUpdater(ManagedCursorImpl.class, "messagesConsumedCounter");
@@ -1702,27 +1703,98 @@ public class ManagedCursorImpl implements ManagedCursor {
 
     @Override
     public void asyncResetCursor(Position newPos, boolean forceReset, AsyncCallbacks.ResetCursorCallback callback) {
-        final Position newPosition = newPos;
-
-        // order trim and reset operations on a ledger
         ledger.getExecutor().execute(() -> {
-            Position actualPosition = newPosition;
-
-            if (!ledger.isValidPosition(actualPosition)
-                    && !actualPosition.equals(PositionFactory.EARLIEST)
-                    && !actualPosition.equals(PositionFactory.LATEST)
-                    && !forceReset) {
-                actualPosition = ledger.getNextValidPosition(actualPosition);
-
-                if (actualPosition == null) {
-                    // next valid position would only return null when newPos
-                    // is larger than all available positions, then it's latest in effect.
-                    actualPosition = PositionFactory.LATEST;
-                }
+            if (!isDurable()) {
+                resetCursorOnExecutor(newPos, forceReset, callback);
+                return;
             }
+            var guard = ledger.getStore().cursorResetGuard();
+            if (guard == null) {
+                resetCursorOnExecutor(newPos, forceReset, callback);
+                return;
+            }
+            try {
+                var context = cursorResetContext(newPos, forceReset);
+                guard.executeCursorReset(ledger.getName(), name, context, () -> {
+                    var original = new CompletableFuture<Object>();
+                    Runnable admittedReset = () -> {
+                        final MetaStore.CursorResetContext current;
+                        try {
+                            current = cursorResetContext(newPos, forceReset);
+                        } catch (Throwable failure) {
+                            original.completeExceptionally(new MetaStore.CursorResetNotDispatchedException(
+                                    "reset source is unavailable", failure));
+                            return;
+                        }
+                        try {
+                            if (context.parentMetadataVersion() != current.parentMetadataVersion()
+                                    || context.cursorMetadataVersion() != current.cursorMetadataVersion()
+                                    || context.cursorLedgerId() != current.cursorLedgerId()
+                                    || !java.util.Arrays.equals(context.parentLedgerFactsSha256(),
+                                            current.parentLedgerFactsSha256())) {
+                                original.completeExceptionally(new MetaStore.CursorResetNotDispatchedException(
+                                        "reset source changed", null));
+                                return;
+                            }
+                            resetCursorOnExecutor(newPos, forceReset, new AsyncCallbacks.ResetCursorCallback() {
+                                @Override
+                                public void resetComplete(Object ctx) {
+                                    original.complete(ctx);
+                                }
 
-            internalResetCursor(actualPosition, callback);
+                                @Override
+                                public void resetFailed(ManagedLedgerException failure, Object ctx) {
+                                    original.completeExceptionally(failure);
+                                }
+                            });
+                        } catch (Throwable failure) {
+                            original.completeExceptionally(failure);
+                        }
+                    };
+                    try {
+                        ledger.getExecutor().execute(admittedReset);
+                    } catch (java.util.concurrent.RejectedExecutionException failure) {
+                        original.completeExceptionally(new MetaStore.CursorResetNotDispatchedException(
+                                "reset executor is closed", failure));
+                    }
+                    return original;
+                }).whenComplete((ctx, failure) -> {
+                    if (failure == null) {
+                        callback.resetComplete(ctx);
+                    } else {
+                        callback.resetFailed(getManagedLedgerException(failure), newPos);
+                    }
+                });
+            } catch (Throwable failure) {
+                callback.resetFailed(getManagedLedgerException(failure), newPos);
+            }
         });
+    }
+
+    private MetaStore.CursorResetContext cursorResetContext(Position requested, boolean forceReset) {
+        return new MetaStore.CursorResetContext(ledger.ledgersStat.getVersion(), cursorLedgerStat.getVersion(),
+                managedCursorInfo.getCursorsLedgerId(), requested.getLedgerId(), requested.getEntryId(), forceReset,
+                MetaStore.CursorResetContext.ledgerFactsSha256(ledger.getLedgersInfo().values()));
+    }
+
+    private void resetCursorOnExecutor(Position newPosition, boolean forceReset,
+                                       AsyncCallbacks.ResetCursorCallback callback) {
+        Position actualPosition = newPosition;
+
+        if (!ledger.isValidPosition(actualPosition)
+                && !actualPosition.equals(PositionFactory.EARLIEST)
+                && !actualPosition.equals(PositionFactory.LATEST)
+                && !forceReset) {
+            actualPosition = ledger.getNextValidPosition(actualPosition);
+
+            if (actualPosition == null) {
+                // next valid position would only return null when newPos
+                // is larger than all available positions, then it's latest in effect.
+                actualPosition = PositionFactory.LATEST;
+            }
+        }
+
+        internalResetCursor(actualPosition, callback);
     }
 
     @Override
@@ -3055,34 +3127,53 @@ public class ManagedCursorImpl implements ManagedCursor {
 
     @Override
     public void asyncClose(final AsyncCallbacks.CloseCallback callback, final Object ctx) {
+        CompletableFuture<Void> ownedClose;
+        boolean startClose;
+        synchronized (this) {
+            startClose = closeFuture == null;
+            if (startClose) {
+                closeFuture = new CompletableFuture<>();
+            }
+            ownedClose = closeFuture;
+        }
+        ownedClose.whenComplete((ignored, failure) -> {
+            if (failure == null) {
+                callback.closeComplete(ctx);
+            } else {
+                callback.closeFailed(ManagedLedgerException.getManagedLedgerException(
+                        FutureUtil.unwrapCompletionException(failure)), ctx);
+            }
+        });
+        if (!startClose) {
+            return;
+        }
         boolean alreadyClosing = !trySetStateToClosing();
         if (alreadyClosing) {
             log.info("State is already closed");
-            callback.closeComplete(ctx);
+            ownedClose.complete(null);
             return;
         }
         closeWaitingCursor();
         setInactive();
         persistPositionWhenClosing(lastMarkDeleteEntry.newPosition, lastMarkDeleteEntry.properties,
-                new AsyncCallbacks.CloseCallback(){
-
+                new AsyncCallbacks.CloseCallback() {
                     @Override
-                    public void closeComplete(Object ctx) {
+                    public void closeComplete(Object ignored) {
                         if (!STATE_UPDATER.compareAndSet(ManagedCursorImpl.this, State.Closing, State.Closed)) {
                             log.warn().attr("state", state).log("State was modified from closing while closing");
                             state = State.Closed;
                         }
-                        callback.closeComplete(ctx);
+                        ownedClose.complete(null);
                     }
 
                     @Override
-                    public void closeFailed(ManagedLedgerException exception, Object ctx) {
+                    public void closeFailed(ManagedLedgerException exception, Object ignored) {
                         log.warn("Persistent position failure when closing,"
                                 + " the state will remain in state-closing"
                                 + " and will no longer work");
-                        callback.closeFailed(exception, ctx);
+                        ownedClose.completeExceptionally(exception);
                     }
-                }, ctx);
+                }, null);
     }
 
     protected void closeWaitingCursor() {
@@ -3311,8 +3402,13 @@ public class ManagedCursorImpl implements ManagedCursor {
                 return;
             }
 
-            ledger.getExecutor().execute(() -> {
+            ledger.getExecutor().execute(() -> ledger.runNativeCreationCallback(() -> {
                 ledger.mbean.endCursorLedgerCreateOp();
+                if (ledger.nativeCreationClosing()) {
+                    future.completeExceptionally(
+                            new ManagedLedgerException.ManagedLedgerAlreadyClosedException("Native owner closed"));
+                    return;
+                }
                 if (rc != BKException.Code.OK) {
                     log.warn().attr("errorMessage", BKException.getMessage(rc)).log("Error creating cursor ledger");
                     future.completeExceptionally(new ManagedLedgerException(BKException.getMessage(rc)));
@@ -3321,7 +3417,7 @@ public class ManagedCursorImpl implements ManagedCursor {
 
                 log.debug().attr("ledgerId", lh.getId()).log("Created cursor ledger");
                 future.complete(lh);
-            });
+            }));
         }, LedgerMetadataUtils.buildAdditionalMetadataForCursor(name), log);
 
         return future;

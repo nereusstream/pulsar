@@ -20,6 +20,7 @@ package org.apache.bookkeeper.mledger.impl;
 
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import org.apache.bookkeeper.mledger.ManagedLedgerException.MetaStoreException;
 import org.apache.bookkeeper.mledger.proto.ManagedCursorInfo;
@@ -75,6 +76,11 @@ public interface MetaStore {
     void getManagedLedgerInfo(String ledgerName, boolean createIfMissing, Map<String, String> properties,
                               MetaStoreCallback<ManagedLedgerInfo> callback);
 
+    /** Reads exact stored fields and version without creation or recovery timestamp repair. */
+    default void readStoredManagedLedgerInfo(String ledgerName, MetaStoreCallback<ManagedLedgerInfo> callback) {
+        callback.operationFailed(new MetaStoreException("exact stored ManagedLedger metadata reads are unsupported"));
+    }
+
     /**
      * Watch the metadata used by the ManagedLedger.
      * @param ledgerName
@@ -108,7 +114,73 @@ public interface MetaStore {
      * @param ledgerName
      *            the name of the ManagedLedger
      */
+    /** Original native metadata dispatch. An installed guard must retain its accepted backend work independently. */
+    record CursorResetContext(long parentMetadataVersion, long cursorMetadataVersion, long cursorLedgerId,
+                              long requestedLedgerId, long requestedEntryId, boolean forceReset,
+                              byte[] parentLedgerFactsSha256) {
+        public CursorResetContext {
+            if (parentMetadataVersion < 0 || cursorMetadataVersion < 0 || cursorLedgerId < -1
+                    || parentLedgerFactsSha256.length != 32) {
+                throw new IllegalArgumentException("cursor reset lacks its exact Native predecessor");
+            }
+            parentLedgerFactsSha256 = parentLedgerFactsSha256.clone();
+        }
+
+        @Override
+        public byte[] parentLedgerFactsSha256() {
+            return parentLedgerFactsSha256.clone();
+        }
+
+        public static byte[] ledgerFactsSha256(java.util.Collection<ManagedLedgerInfo.LedgerInfo> ledgers) {
+            if (ledgers.size() > 512) {
+                throw new IllegalArgumentException("guarded cursor reset Native chain exceeds its admitted bound");
+            }
+            try {
+                var digest = java.security.MessageDigest.getInstance("SHA-256");
+                digest.update(java.nio.ByteBuffer.allocate(4).putInt(ledgers.size()).array());
+                for (var info : ledgers.stream().sorted(java.util.Comparator.comparingLong(
+                        ManagedLedgerInfo.LedgerInfo::getLedgerId)).toList()) {
+                    byte[] bytes = info.toByteArray();
+                    digest.update(java.nio.ByteBuffer.allocate(4).putInt(bytes.length).array());
+                    digest.update(bytes);
+                }
+                return digest.digest();
+            } catch (java.security.NoSuchAlgorithmException impossible) {
+                throw new IllegalStateException(impossible);
+            }
+        }
+    }
+
+    /** Produced only before invoking the original Native reset, never for a failed BK or metadata write. */
+    class CursorResetNotDispatchedException extends RuntimeException {
+        private static final long serialVersionUID = 1L;
+
+        public CursorResetNotDispatchedException(String message, Throwable cause) {
+            super(message, cause);
+        }
+    }
+
+    interface StoredMutationGuard {
+        <T> CompletableFuture<T> execute(String ledgerName, String path, byte[] proposedStoredBytes,
+                Optional<Long> expectedVersion, java.util.function.Supplier<CompletableFuture<T>> originalDispatch);
+
+        default <T> CompletableFuture<T> executeCursorReset(String ledgerName, String cursorName,
+                CursorResetContext context, java.util.function.Supplier<CompletableFuture<T>> originalDispatch) {
+            return CompletableFuture.failedFuture(new IllegalStateException("cursor reset guard is unsupported"));
+        }
+    }
+
+    default StoredMutationGuard cursorResetGuard() {
+        return null;
+    }
+
     void getCursors(String ledgerName, MetaStoreCallback<List<String>> callback);
+
+    /** Direct backend cursor directory for source-bound observations; cached enumeration is insufficient. */
+    default void readStoredCursorNames(String ledgerName, MetaStoreCallback<List<String>> callback) {
+        callback.operationFailed(new MetaStoreException("direct cursor directory is unsupported"));
+    }
+
 
     /**
      * Get the ledger id associated with a cursor.
@@ -120,6 +192,29 @@ public interface MetaStore {
      * @param callback
      */
     void asyncGetCursorInfo(String ledgerName, String cursorName, MetaStoreCallback<ManagedCursorInfo> callback);
+
+    /** Original stored bytes and parsed cursor metadata from the same versioned SDK response. */
+    record StoredCursorInfo(byte[] storedBytes, byte[] cursorInfoBytes) {
+        public StoredCursorInfo {
+            storedBytes = storedBytes.clone();
+            cursorInfoBytes = cursorInfoBytes.clone();
+        }
+
+        @Override
+        public byte[] storedBytes() {
+            return storedBytes.clone();
+        }
+
+        @Override
+        public byte[] cursorInfoBytes() {
+            return cursorInfoBytes.clone();
+        }
+    }
+
+    default void readStoredCursorInfo(String ledgerName, String cursorName,
+                                     MetaStoreCallback<StoredCursorInfo> callback) {
+        callback.operationFailed(new MetaStoreException("exact stored cursor metadata reads are unsupported"));
+    }
 
     /**
      * Update the persisted position of a cursor.

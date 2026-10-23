@@ -23,6 +23,8 @@ import java.util.Objects;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.BooleanSupplier;
+import java.util.function.Function;
 import java.util.function.Supplier;
 import org.apache.bookkeeper.client.BKException;
 import org.apache.bookkeeper.client.api.LastConfirmedAndEntry;
@@ -33,6 +35,8 @@ import org.apache.bookkeeper.client.api.ReadHandle;
 import org.apache.bookkeeper.mledger.OffloadReadSourceState;
 import org.apache.bookkeeper.mledger.OffloadedLedgerHandle;
 import org.apache.bookkeeper.mledger.SourceSafeLedgerOffloader;
+import org.apache.bookkeeper.mledger.SourceSafeLedgerOffloader.OffloadedReadMemoryBounds;
+import org.apache.bookkeeper.mledger.SourceSafeLedgerOffloader.OffloadedReadSourceIdentity;
 import org.apache.bookkeeper.mledger.SourceSafeLedgerOffloader.ReadFailureKind;
 import org.apache.bookkeeper.mledger.impl.LedgerReadSourcePinRegistry.Pin;
 import org.apache.bookkeeper.mledger.impl.LedgerReadSourcePinRegistry.Source;
@@ -41,6 +45,7 @@ import org.apache.pulsar.common.policies.data.OffloadedReadPriority;
 
 /** Cached sealed-ledger handle that returns each range wholly from one native-authorized source. */
 final class DualSourceReadHandle implements ReadHandle, OffloadedLedgerHandle {
+    private static final BooleanSupplier SOURCE_USE_OPEN = () -> true;
     private final long ledgerId;
     private final SourceSafeLedgerOffloader offloader;
     private final Supplier<OffloadReadSourceState> stateSupplier;
@@ -51,10 +56,22 @@ final class DualSourceReadHandle implements ReadHandle, OffloadedLedgerHandle {
     private final LedgerMetadata ledgerMetadata;
     private final long lastAddConfirmed;
     private final long length;
+    private final boolean objectOnly;
     private final AtomicBoolean closed = new AtomicBoolean();
     private final Object closeMutex = new Object();
     private CompletableFuture<Void> closeFuture;
     private volatile long lastAccessTimestamp = System.currentTimeMillis();
+    private volatile CapturedReadScope readAdmissionScope;
+
+    private record CapturedReadScope(OffloadReadSourceState state, BooleanSupplier sourceUseOpen) { }
+
+    void installReadAdmissionScope(OffloadReadSourceState state, BooleanSupplier sourceUseOpen) {
+        if (readAdmissionScope != null || closed.get() || pins.pinCount() != 0
+                || !Objects.requireNonNull(state).equals(stateSupplier.get())) {
+            throw new IllegalStateException("native composite read admission scope is not current and quiescent");
+        }
+        readAdmissionScope = new CapturedReadScope(state, Objects.requireNonNull(sourceUseOpen));
+    }
 
     static CompletableFuture<ReadHandle> open(
             long ledgerId,
@@ -64,6 +81,18 @@ final class DualSourceReadHandle implements ReadHandle, OffloadedLedgerHandle {
             LedgerReadSourcePinRegistry pins,
             Supplier<CompletableFuture<ReadHandle>> objectFactory,
             Supplier<CompletableFuture<ReadHandle>> bookKeeperFactory) {
+        return open(ledgerId, offloader, stateSupplier, priority, pins, objectFactory, bookKeeperFactory, false);
+    }
+
+    static CompletableFuture<ReadHandle> open(
+            long ledgerId,
+            SourceSafeLedgerOffloader offloader,
+            Supplier<OffloadReadSourceState> stateSupplier,
+            OffloadedReadPriority priority,
+            LedgerReadSourcePinRegistry pins,
+            Supplier<CompletableFuture<ReadHandle>> objectFactory,
+            Supplier<CompletableFuture<ReadHandle>> bookKeeperFactory,
+            boolean objectOnly) {
         Objects.requireNonNull(offloader);
         Objects.requireNonNull(stateSupplier);
         Objects.requireNonNull(priority);
@@ -78,13 +107,17 @@ final class DualSourceReadHandle implements ReadHandle, OffloadedLedgerHandle {
         }
         Source primary;
         try {
-            primary = selectPrimary(state, priority);
+            if (objectOnly && !state.objectEligible()) {
+                throw new SourcePinFencedException("Object-only source is not native-authorized");
+            }
+            primary = objectOnly ? Source.OBJECT : selectPrimary(state, priority);
         } catch (Throwable failure) {
             return CompletableFuture.failedFuture(failure);
         }
         LazyChild eager = primary == Source.OBJECT ? object : bookKeeper;
         LazyChild alternate = primary == Source.OBJECT ? bookKeeper : object;
-        return openMetadataHandle(primary, state, offloader, eager, alternate).thenApply(handle -> {
+        return (objectOnly ? eager.get() : openMetadataHandle(primary, state, offloader, eager, alternate))
+                .thenApply(handle -> {
             if (handle.getId() != ledgerId || !handle.isClosed()) {
                 throw new OffloadReadIntegrityException("eager child does not represent the sealed ledger");
             }
@@ -98,7 +131,8 @@ final class DualSourceReadHandle implements ReadHandle, OffloadedLedgerHandle {
                     bookKeeper,
                     handle.getLedgerMetadata(),
                     handle.getLastAddConfirmed(),
-                    handle.getLength());
+                    handle.getLength(),
+                    objectOnly);
         });
     }
 
@@ -154,7 +188,8 @@ final class DualSourceReadHandle implements ReadHandle, OffloadedLedgerHandle {
             LazyChild bookKeeperChild,
             LedgerMetadata ledgerMetadata,
             long lastAddConfirmed,
-            long length) {
+            long length,
+            boolean objectOnly) {
         this.ledgerId = ledgerId;
         this.offloader = offloader;
         this.stateSupplier = stateSupplier;
@@ -165,10 +200,115 @@ final class DualSourceReadHandle implements ReadHandle, OffloadedLedgerHandle {
         this.ledgerMetadata = ledgerMetadata;
         this.lastAddConfirmed = lastAddConfirmed;
         this.length = length;
+        this.objectOnly = objectOnly;
+    }
+
+    boolean isObjectOnly() {
+        return objectOnly;
     }
 
     @Override
     public CompletableFuture<LedgerEntries> readAsync(long firstEntry, long lastEntry) {
+        CapturedReadScope scope = readAdmissionScope;
+        return scope == null ? readRange(firstEntry, lastEntry, null, SOURCE_USE_OPEN)
+                : readCapturedAsync(firstEntry, lastEntry, scope.state(), scope.sourceUseOpen());
+    }
+
+    CompletableFuture<LedgerEntries> readCapturedAsync(
+            long firstEntry, long lastEntry, OffloadReadSourceState capturedState) {
+        return readCapturedAsync(firstEntry, lastEntry, capturedState, SOURCE_USE_OPEN);
+    }
+
+    CompletableFuture<LedgerEntries> readCapturedAsync(
+            long firstEntry, long lastEntry, OffloadReadSourceState capturedState, BooleanSupplier sourceUseOpen) {
+        if (capturedState == null) {
+            return CompletableFuture.failedFuture(new IllegalArgumentException("captured source state is absent"));
+        }
+        if (sourceUseOpen == null) {
+            return CompletableFuture.failedFuture(new IllegalArgumentException("captured source-use gate is absent"));
+        }
+        CapturedReadScope scope = readAdmissionScope;
+        if (scope != null && !scope.state().equals(capturedState)) {
+            return CompletableFuture.failedFuture(new SourcePinFencedException("native read admission cut differs"));
+        }
+        return readRange(firstEntry, lastEntry, capturedState, scope == null ? sourceUseOpen
+                : () -> sourceUseOpen.getAsBoolean() && scope.sourceUseOpen().getAsBoolean());
+    }
+
+    /** Opens only the cached Object child; the private chain owns its native pin through fact capture. */
+    CompletableFuture<OffloadedReadSourceIdentity> captureOffloadedReadSourceIdentity(
+            OffloadReadSourceState capturedState, BooleanSupplier sourceUseOpen) {
+        return captureObjectFact(capturedState, sourceUseOpen, handle -> {
+            OffloadedReadSourceIdentity identity = Objects.requireNonNull(
+                    offloader.describeOffloadedReadSource(handle), "offloaded source identity");
+            if (identity.ledgerId() != ledgerId || !identity.attemptUuid().equals(capturedState.attemptUuid())) {
+                throw new OffloadReadIntegrityException("opened Object identity differs from the captured source");
+            }
+            return identity;
+        });
+    }
+
+    CompletableFuture<OffloadedReadMemoryBounds> captureOffloadedReadMemoryBounds(
+            OffloadReadSourceState capturedState, BooleanSupplier sourceUseOpen) {
+        return captureObjectFact(capturedState, sourceUseOpen,
+                handle -> Objects.requireNonNull(offloader.describeOffloadedReadMemoryBounds(handle),
+                        "opened Object memory bounds"));
+    }
+
+    CompletableFuture<Void> verifyCapturedObjectSource(OffloadReadSourceState state, BooleanSupplier sourceUseOpen) {
+        return captureObjectFact(state, sourceUseOpen, handle -> handle).thenCompose(handle -> {
+            final Pin pin;
+            try {
+                requireCapturedObjectSource(state, sourceUseOpen);
+                pin = pins.acquire(Source.OBJECT, state);
+            } catch (Throwable failure) {
+                return CompletableFuture.failedFuture(failure);
+            }
+            try {
+                var scope = readAdmissionScope;
+                return offloader.verifyOpenedOffloadedSource(handle, lastAddConfirmed, lastAddConfirmed + 1, length,
+                        () -> sourceUseOpen.getAsBoolean() && (scope == null || scope.sourceUseOpen().getAsBoolean())
+                                && state.equals(stateSupplier.get()))
+                        .whenComplete((ignored, failure) -> pin.close());
+            } catch (Throwable failure) {
+                pin.close();
+                return CompletableFuture.failedFuture(failure);
+            }
+        });
+    }
+
+    private <T> CompletableFuture<T> captureObjectFact(OffloadReadSourceState capturedState,
+                                                     BooleanSupplier sourceUseOpen, Function<ReadHandle, T> capture) {
+        final Pin pin;
+        try {
+            requireCapturedObjectSource(capturedState, sourceUseOpen);
+            pin = pins.acquire(Source.OBJECT, capturedState);
+            try {
+                requireCapturedObjectSource(capturedState, sourceUseOpen);
+            } catch (Throwable failure) {
+                pin.close();
+                throw failure;
+            }
+        } catch (Throwable failure) {
+            return CompletableFuture.failedFuture(failure);
+        }
+        return objectChild.get().thenApply(handle -> {
+            requireCapturedObjectSource(capturedState, sourceUseOpen);
+            return capture.apply(handle);
+        }).whenComplete((ignored, failure) -> pin.close()).copy();
+    }
+
+    private void requireCapturedObjectSource(OffloadReadSourceState capturedState, BooleanSupplier sourceUseOpen) {
+        Objects.requireNonNull(capturedState, "capturedState");
+        Objects.requireNonNull(sourceUseOpen, "sourceUseOpen");
+        if (closed.get() || !capturedState.objectEligible() || !sourceUseOpen.getAsBoolean()
+                || !capturedState.equals(stateSupplier.get())) {
+            throw new SourcePinFencedException("captured Object source identity is stale or closed");
+        }
+    }
+
+    private CompletableFuture<LedgerEntries> readRange(
+            long firstEntry, long lastEntry, OffloadReadSourceState capturedState, BooleanSupplier sourceUseOpen) {
         if (firstEntry < 0 || lastEntry < firstEntry || lastEntry > lastAddConfirmed) {
             return CompletableFuture.failedFuture(new IllegalArgumentException("invalid sealed-ledger range"));
         }
@@ -177,11 +317,19 @@ final class DualSourceReadHandle implements ReadHandle, OffloadedLedgerHandle {
         }
         OffloadReadSourceState state;
         try {
+            if (!sourceUseOpen.getAsBoolean()) {
+                throw new SourcePinFencedException("captured source use is closed");
+            }
             state = Objects.requireNonNull(stateSupplier.get());
+            if (capturedState != null && !capturedState.equals(state)) {
+                throw new SourcePinFencedException("captured native source is stale");
+            }
         } catch (Throwable failure) {
             return CompletableFuture.failedFuture(failure);
         }
-        return readFrom(selectPrimary(state, priority), state, firstEntry, lastEntry, true, null);
+        return readFrom(objectOnly ? Source.OBJECT : selectPrimary(state, priority), state, firstEntry, lastEntry,
+                !objectOnly, null, capturedState,
+                sourceUseOpen);
     }
 
     private CompletableFuture<LedgerEntries> readFrom(
@@ -190,23 +338,34 @@ final class DualSourceReadHandle implements ReadHandle, OffloadedLedgerHandle {
             long firstEntry,
             long lastEntry,
             boolean allowFallback,
-            Throwable primaryFailure) {
+            Throwable primaryFailure,
+            OffloadReadSourceState capturedState,
+            BooleanSupplier sourceUseOpen) {
         Pin pin;
         try {
-            if (!eligible(state, source) || closed.get()) {
+            if ((objectOnly && source != Source.OBJECT) || !eligible(state, source)
+                    || closed.get() || !sourceUseOpen.getAsBoolean()) {
                 throw new SourcePinFencedException("source is not native-authorized");
             }
             pin = pins.acquire(source, state);
-            OffloadReadSourceState afterPin = Objects.requireNonNull(stateSupplier.get());
-            if (!state.equals(afterPin) || !eligible(afterPin, source)) {
+            try {
+                OffloadReadSourceState afterPin = Objects.requireNonNull(stateSupplier.get());
+                if (!state.equals(afterPin) || !eligible(afterPin, source) || !sourceUseOpen.getAsBoolean()) {
+                    throw new SourcePinFencedException("native source state changed during pin admission");
+                }
+            } catch (Throwable admissionFailure) {
                 pin.close();
-                throw new SourcePinFencedException("native source state changed during pin admission");
+                throw admissionFailure;
             }
         } catch (SourcePinFencedException failure) {
+            if (capturedState != null) {
+                return CompletableFuture.failedFuture(primaryFailure == null ? failure : primaryFailure);
+            }
             Source alternate = alternate(source);
             OffloadReadSourceState current = stateSupplier.get();
             if (allowFallback && current != null && eligible(current, alternate)) {
-                return readFrom(alternate, current, firstEntry, lastEntry, false, primaryFailure);
+                return readFrom(alternate, current, firstEntry, lastEntry, false,
+                        primaryFailure, null, SOURCE_USE_OPEN);
             }
             return CompletableFuture.failedFuture(primaryFailure == null ? failure : primaryFailure);
         } catch (Throwable failure) {
@@ -219,8 +378,6 @@ final class DualSourceReadHandle implements ReadHandle, OffloadedLedgerHandle {
                     if (readFailure == null) {
                         try {
                             validate(entries, source, firstEntry, lastEntry);
-                            lastAccessTimestamp = System.currentTimeMillis();
-                            result.complete(new PinnedLedgerEntries(entries, pin));
                         } catch (Throwable invalidRange) {
                             closeEntriesAndPin(entries, pin);
                             handleFailure(
@@ -231,7 +388,15 @@ final class DualSourceReadHandle implements ReadHandle, OffloadedLedgerHandle {
                                     lastEntry,
                                     allowFallback,
                                     primaryFailure,
-                                    invalidRange);
+                                    invalidRange,
+                                    capturedState,
+                                    sourceUseOpen);
+                            return;
+                        }
+                        lastAccessTimestamp = System.currentTimeMillis();
+                        LedgerEntries ownedEntries = new PinnedLedgerEntries(entries, pin);
+                        if (!result.complete(ownedEntries)) {
+                            ownedEntries.close();
                         }
                     } else {
                         pin.close();
@@ -243,7 +408,9 @@ final class DualSourceReadHandle implements ReadHandle, OffloadedLedgerHandle {
                                 lastEntry,
                                 allowFallback,
                                 primaryFailure,
-                                unwrap(readFailure));
+                                unwrap(readFailure),
+                                capturedState,
+                                sourceUseOpen);
                     }
                 });
         return result;
@@ -257,7 +424,9 @@ final class DualSourceReadHandle implements ReadHandle, OffloadedLedgerHandle {
             long lastEntry,
             boolean allowFallback,
             Throwable existingPrimary,
-            Throwable failure) {
+            Throwable failure,
+            OffloadReadSourceState capturedState,
+            BooleanSupplier sourceUseOpen) {
         Throwable primary = existingPrimary == null ? failure : existingPrimary;
         if (existingPrimary != null && failure != existingPrimary) {
             primary.addSuppressed(failure);
@@ -268,6 +437,9 @@ final class DualSourceReadHandle implements ReadHandle, OffloadedLedgerHandle {
                 offloader.recordOffloadedReadIntegrityFailure(ledgerId, originalState.attemptUuid(), failure);
             }
         }
+        if (capturedState != null && result.isDone()) {
+            return;
+        }
         OffloadReadSourceState current;
         try {
             current = Objects.requireNonNull(stateSupplier.get());
@@ -276,14 +448,30 @@ final class DualSourceReadHandle implements ReadHandle, OffloadedLedgerHandle {
             result.completeExceptionally(primary);
             return;
         }
+        if (capturedState != null && !capturedState.equals(current)) {
+            primary.addSuppressed(new SourcePinFencedException("captured native source is stale"));
+            result.completeExceptionally(primary);
+            return;
+        }
+        try {
+            if (!sourceUseOpen.getAsBoolean()) {
+                throw new SourcePinFencedException("captured source use is closed");
+            }
+        } catch (Throwable gateFailure) {
+            primary.addSuppressed(gateFailure);
+            result.completeExceptionally(primary);
+            return;
+        }
         if (!allowFallback || !fallbackAllowed(source, failure, originalState, current)) {
             result.completeExceptionally(primary);
             return;
         }
-        readFrom(alternate(source), current, firstEntry, lastEntry, false, primary)
+        readFrom(alternate(source), current, firstEntry, lastEntry, false, primary, capturedState, sourceUseOpen)
                 .whenComplete((entries, secondaryFailure) -> {
                     if (secondaryFailure == null) {
-                        result.complete(entries);
+                        if (!result.complete(entries)) {
+                            entries.close();
+                        }
                     } else {
                         Throwable secondary = unwrap(secondaryFailure);
                         if (secondary != primary) {
@@ -349,12 +537,12 @@ final class DualSourceReadHandle implements ReadHandle, OffloadedLedgerHandle {
     public CompletableFuture<Void> closeAsync() {
         synchronized (closeMutex) {
             if (closeFuture != null) {
-                return closeFuture;
+                return closeFuture.copy();
             }
             closed.set(true);
             closeFuture = pins.fenceBoth()
                     .thenCompose(ignored -> CompletableFuture.allOf(objectChild.close(), bookKeeperChild.close()));
-            return closeFuture;
+            return closeFuture.copy();
         }
     }
 
@@ -402,6 +590,18 @@ final class DualSourceReadHandle implements ReadHandle, OffloadedLedgerHandle {
     @Override
     public LedgerMetadata getLedgerMetadata() {
         return ledgerMetadata;
+    }
+
+    OffloadedReadPriority readPriority() {
+        return priority;
+    }
+
+    SourceSafeLedgerOffloader sourceOffloader() {
+        return offloader;
+    }
+
+    boolean isReadAdmissionOpen() {
+        return !closed.get();
     }
 
     @Override

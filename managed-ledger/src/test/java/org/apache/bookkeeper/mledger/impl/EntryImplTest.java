@@ -27,12 +27,40 @@ import static org.testng.Assert.assertSame;
 import static org.testng.Assert.assertTrue;
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.Unpooled;
+import java.util.concurrent.atomic.AtomicInteger;
 import org.apache.bookkeeper.mledger.Entry;
 import org.apache.bookkeeper.mledger.Position;
 import org.apache.bookkeeper.mledger.PositionFactory;
 import org.testng.annotations.Test;
 
 public class EntryImplTest {
+
+    @Test
+    public void testDataBufferReleaseWaitsForEntryAndBufferDuplicates() {
+        ByteBuf data = Unpooled.buffer(8);
+        data.writeBytes(new byte[] {1, 2, 3, 4, 5});
+        data.readerIndex(1);
+        EntryImpl entry = EntryImpl.create(0, 0, data);
+        AtomicInteger released = new AtomicInteger();
+        entry.onDataBufferReleased(() -> {
+            assertEquals(data.refCnt(), 1);
+            released.incrementAndGet();
+        });
+        assertEquals(entry.getDataBuffer().readerIndex(), 1);
+        assertEquals(entry.getDataBuffer().writerIndex(), 5);
+        assertEquals(entry.getDataBuffer().capacity(), 8);
+        EntryImpl copy = EntryImpl.create(entry);
+        ByteBuf alias = entry.getDataBuffer().retainedDuplicate();
+        entry.release();
+        assertEquals(released.get(), 0);
+        copy.release();
+        assertEquals(released.get(), 0);
+        assertEquals(alias.getByte(0), 1);
+        assertEquals(alias.getByte(1), 2);
+        alias.release();
+        assertEquals(released.get(), 1);
+        data.release();
+    }
 
     @Test
     public void testCreateWithLedgerIdEntryIdAndByteBuf() {

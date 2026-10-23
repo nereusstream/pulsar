@@ -43,7 +43,7 @@ import org.apache.pulsar.common.util.collections.OpenLongPairRangeSet;
  */
 @InterfaceAudience.LimitedPrivate
 @InterfaceStability.Stable
-public class ManagedLedgerConfig {
+public class ManagedLedgerConfig implements Cloneable {
 
     private boolean createIfMissing = true;
     private int maxUnackedRangesToPersist = 10000;
@@ -66,6 +66,7 @@ public class ManagedLedgerConfig {
     private double throttleMarkDelete = 0;
     private Semaphore ledgerDeletionSemaphore;
     private ExecutorService ledgerDeleteExecutor;
+    private boolean retentionFrozen;
     private long retentionTimeMs = 0;
     private long retentionSizeInMB = 0;
     private boolean autoSkipNonRecoverableData;
@@ -441,6 +442,20 @@ public class ManagedLedgerConfig {
     }
 
     /**
+     * Copy all configuration fields while freezing retention values and the clock reference in the copy.
+     * Other referenced objects retain their existing ownership; this is not a deep copy of SDK resources.
+     */
+    public ManagedLedgerConfig copyWithFrozenRetention() {
+        try {
+            ManagedLedgerConfig copy = (ManagedLedgerConfig) super.clone();
+            copy.retentionFrozen = true;
+            return copy;
+        } catch (CloneNotSupportedException impossible) {
+            throw new AssertionError(impossible);
+        }
+    }
+
+    /**
      * Set the retention time for the ManagedLedger.
      * <p>
      * Retention time and retention size ({@link #setRetentionSizeInMB(long)}) are together used to retain the
@@ -458,6 +473,9 @@ public class ManagedLedgerConfig {
      *            time unit for retention time
      */
     public ManagedLedgerConfig setRetentionTime(int retentionTime, TimeUnit unit) {
+        if (retentionFrozen) {
+            throw new IllegalStateException("Retention and clock are frozen in this configuration snapshot");
+        }
         this.retentionTimeMs = unit.toMillis(retentionTime);
         return this;
     }
@@ -486,6 +504,9 @@ public class ManagedLedgerConfig {
      *            quota for message retention
      */
     public ManagedLedgerConfig setRetentionSizeInMB(long retentionSizeInMB) {
+        if (retentionFrozen) {
+            throw new IllegalStateException("Retention and clock are frozen in this configuration snapshot");
+        }
         this.retentionSizeInMB = retentionSizeInMB;
         return this;
     }
@@ -635,6 +656,9 @@ public class ManagedLedgerConfig {
      * @param clock the clock to use
      */
     public ManagedLedgerConfig setClock(Clock clock) {
+        if (retentionFrozen) {
+            throw new IllegalStateException("Retention and clock are frozen in this configuration snapshot");
+        }
         this.clock = clock;
         return this;
     }

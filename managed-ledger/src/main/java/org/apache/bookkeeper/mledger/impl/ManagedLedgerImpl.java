@@ -32,12 +32,16 @@ import io.netty.buffer.ByteBuf;
 import io.netty.buffer.Unpooled;
 import io.netty.util.Recycler;
 import io.netty.util.Recycler.Handle;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 import java.time.Clock;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.HexFormat;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
@@ -49,6 +53,8 @@ import java.util.Random;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
+import java.util.concurrent.CompletionStage;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedDeque;
 import java.util.concurrent.ConcurrentLinkedQueue;
@@ -65,6 +71,8 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLongFieldUpdater;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.atomic.AtomicReferenceFieldUpdater;
+import java.util.function.BooleanSupplier;
+import java.util.function.Consumer;
 import java.util.function.IntSupplier;
 import java.util.function.Predicate;
 import java.util.function.Supplier;
@@ -78,6 +86,7 @@ import org.apache.bookkeeper.client.BKException.Code;
 import org.apache.bookkeeper.client.BookKeeper;
 import org.apache.bookkeeper.client.BookKeeper.DigestType;
 import org.apache.bookkeeper.client.LedgerHandle;
+import org.apache.bookkeeper.client.api.LedgerEntries;
 import org.apache.bookkeeper.client.api.LedgerEntry;
 import org.apache.bookkeeper.client.api.LedgerMetadata;
 import org.apache.bookkeeper.client.api.ReadHandle;
@@ -124,6 +133,9 @@ import org.apache.bookkeeper.mledger.Position;
 import org.apache.bookkeeper.mledger.PositionBound;
 import org.apache.bookkeeper.mledger.PositionFactory;
 import org.apache.bookkeeper.mledger.SourceSafeLedgerOffloader;
+import org.apache.bookkeeper.mledger.SourceSafeLedgerOffloader.NativeReadAdmission;
+import org.apache.bookkeeper.mledger.SourceSafeLedgerOffloader.OffloadedReadMemoryBounds;
+import org.apache.bookkeeper.mledger.SourceSafeLedgerOffloader.OffloadedReadSourceIdentity;
 import org.apache.bookkeeper.mledger.WaitingEntryCallBack;
 import org.apache.bookkeeper.mledger.impl.ManagedCursorImpl.VoidCallback;
 import org.apache.bookkeeper.mledger.impl.MetaStore.MetaStoreCallback;
@@ -191,6 +203,20 @@ public class ManagedLedgerImpl implements ManagedLedger, CreateCallback {
                     .concurrencyLevel(1)
                     .build();
     private final Set<Long> sourceSafeBookKeeperDeletions = ConcurrentHashMap.newKeySet();
+    // Guarded by this monitor; failed closes retain ownership until the ledger is discarded.
+    private final Map<CompletableFuture<Void>, Long> readHandleCloses = new HashMap<>();
+    private final Set<CompletableFuture<Void>> offloadOperations = new HashSet<>();
+    private final Set<CompletableFuture<Void>> ordinaryReadOperations = new HashSet<>();
+    private final Set<CompletableFuture<Void>> nativeCreationOperations = new HashSet<>();
+    private final Futures.CloseFuture closeFuture = new Futures.CloseFuture();
+    // Guarded by this monitor; fenced owners retain their Fenced state while cleanup drains.
+    private volatile boolean closeStarted;
+    private volatile boolean offloadReadAdmissionClosed;
+    private CompletableFuture<Void> offloadReadFenceFuture;
+    private volatile NativeReadAdmission nativeReadAdmission;
+    private volatile CapturedNativeReadView nativeReadPreparationView;
+    // Guarded by this monitor; only this registered view retains close authority after its read cut changes.
+    private CapturedNativeReadView nativeReadAdmissionView;
     protected final NavigableMap<Long, LedgerInfo> ledgers = new ConcurrentSkipListMap<>();
     protected volatile Stat ledgersStat;
 
@@ -632,8 +658,12 @@ public class ManagedLedgerImpl implements ManagedLedger, CreateCallback {
                 return;
             }
 
-            executor.execute(() -> {
+            executor.execute(() -> runNativeCreationCallback(() -> {
                 mbean.endDataLedgerCreateOp();
+                if (nativeCreationClosing()) {
+                    callback.initializeFailed(new ManagedLedgerAlreadyClosedException("Managed ledger is closing"));
+                    return;
+                }
                 if (rc != BKException.Code.OK) {
                     log.error().attr("rc", rc).attr("message", BKException.getMessage(rc)).log("Error creating ledger");
                     callback.initializeFailed(createManagedLedgerException(rc));
@@ -666,7 +696,7 @@ public class ManagedLedgerImpl implements ManagedLedger, CreateCallback {
 
                 // Save it back to ensure all nodes exist
                 store.asyncUpdateLedgerIds(name, getManagedLedgerInfo(), ledgersStat, storeLedgersCb);
-            });
+            }));
         }, ledgerMetadata, log);
     }
 
@@ -1659,29 +1689,37 @@ public class ManagedLedgerImpl implements ManagedLedger, CreateCallback {
     @Override
     public synchronized void asyncClose(final CloseCallback callback, final Object ctx) {
         State state = STATE_UPDATER.get(this);
-        if (state.isFenced()) {
-            cancelScheduledTasks();
-            factory.close(this);
-            callback.closeFailed(new ManagedLedgerFencedException(), ctx);
-            return;
-        } else if (state == State.Closed) {
-            log.debug("Ignoring request to close a closed managed ledger");
-            callback.closeComplete(ctx);
+        closeFuture.whenComplete((ignored, failure) -> {
+            if (failure == null) {
+                callback.closeComplete(ctx);
+            } else {
+                callback.closeFailed(ManagedLedgerException.getManagedLedgerException(failure), ctx);
+            }
+        });
+        if (closeStarted || state == State.Closed) {
             return;
         }
+        synchronized (nativeCreationOperations) {
+            closeStarted = true;
+        }
+        final ManagedLedgerException ownerFailure = state.isFenced() ? new ManagedLedgerFencedException() : null;
 
         log.info("Closing managed ledger");
 
         factory.close(this);
-        STATE_UPDATER.set(this, State.Closed);
-        clearPendingAddEntries(new ManagedLedgerAlreadyClosedException("Managed ledger is closed"));
+        if (!state.isFenced()) {
+            STATE_UPDATER.set(this, State.Closed);
+        }
+        clearPendingAddEntries(ownerFailure != null ? ownerFailure
+                : new ManagedLedgerAlreadyClosedException("Managed ledger is closed"));
         cancelScheduledTasks();
+        ledgerCache.forEach((ledgerId, readHandle) -> invalidateReadHandle(ledgerId));
 
         LedgerHandle lh = currentLedger;
 
         if (lh == null) {
             // No ledger to close, proceed with next step
-            closeAllCursors(callback, ctx);
+            closeAllCursors(ownerFailure);
             return;
         }
 
@@ -1691,35 +1729,58 @@ public class ManagedLedgerImpl implements ManagedLedger, CreateCallback {
         lh.asyncClose((rc, lh1, ctx1) -> {
             log.debug().attr("ledgerId", lh.getId()).attr("rc", rc).log("Close complete for ledger");
             mbean.endDataLedgerCloseOp();
+            ManagedLedgerException failure = ownerFailure;
             if (rc != BKException.Code.OK) {
-                callback.closeFailed(createManagedLedgerException(rc), ctx);
-                return;
+                ManagedLedgerException writerFailure = createManagedLedgerException(rc);
+                if (failure == null) {
+                    failure = writerFailure;
+                } else {
+                    failure.addSuppressed(writerFailure);
+                }
             }
-
-            ledgerCache.forEach((ledgerId, readHandle) -> {
-                invalidateReadHandle(ledgerId);
-            });
-
-            closeAllCursors(callback, ctx);
+            closeAllCursors(failure);
         }, null);
 
 
     }
 
-    private void closeAllCursors(CloseCallback callback, final Object ctx) {
+    private void closeAllCursors(ManagedLedgerException primaryFailure) {
         // Close all cursors in parallel
         List<CompletableFuture<Void>> futures = new ArrayList<>();
+        synchronized (this) {
+            futures.addAll(readHandleCloses.keySet());
+            futures.addAll(offloadOperations);
+            futures.addAll(ordinaryReadOperations);
+            if (offloadReadFenceFuture != null) {
+                futures.add(offloadReadFenceFuture);
+            }
+        }
+        synchronized (nativeCreationOperations) {
+            futures.addAll(nativeCreationOperations);
+        }
         for (ManagedCursor cursor : cursors) {
             Futures.CloseFuture closeFuture = new Futures.CloseFuture();
             cursor.asyncClose(closeFuture, null);
             futures.add(closeFuture);
         }
 
-        Futures.waitForAll(futures)
-                .thenRun(() -> callback.closeComplete(ctx))
-                .exceptionally(exception -> {
-            callback.closeFailed(ManagedLedgerException.getManagedLedgerException(exception.getCause()), ctx);
-            return null;
+        // Close acknowledgement must wait for every accepted child, including when one fails first.
+        CompletableFuture.allOf(futures.toArray(CompletableFuture[]::new)).whenComplete((ignored, failure) -> {
+            ManagedLedgerException result = primaryFailure;
+            if (failure != null) {
+                ManagedLedgerException childFailure = ManagedLedgerException.getManagedLedgerException(
+                        FutureUtil.unwrapCompletionException(failure));
+                if (result == null) {
+                    result = childFailure;
+                } else if (result != childFailure) {
+                    result.addSuppressed(childFailure);
+                }
+            }
+            if (result == null) {
+                closeFuture.closeComplete(null);
+            } else {
+                closeFuture.closeFailed(result, null);
+            }
         });
     }
 
@@ -2104,7 +2165,7 @@ public class ManagedLedgerImpl implements ManagedLedger, CreateCallback {
 
     void asyncReadEntries(OpReadEntry opReadEntry) {
         final State state = STATE_UPDATER.get(this);
-        if (state.isFenced() || state == State.Closed) {
+        if (offloadReadAdmissionClosed || state.isFenced() || state == State.Closed) {
             opReadEntry.readEntriesFailed(new ManagedLedgerFencedException(), opReadEntry.ctx);
             return;
         }
@@ -2139,6 +2200,11 @@ public class ManagedLedgerImpl implements ManagedLedger, CreateCallback {
                 opReadEntry.updateReadPosition(
                     PositionFactory.create(Objects.requireNonNullElseGet(nextLedgerId, () -> ledgerId + 1), 0));
                 opReadEntry.checkReadCompletion();
+                return;
+            }
+
+            if (hasPreferredReadSource(ledgerId)) {
+                internalReadFromLedger(ledgerId, ledgerInfo.getEntries() - 1, null, opReadEntry);
                 return;
             }
 
@@ -2228,15 +2294,1482 @@ public class ManagedLedgerImpl implements ManagedLedger, CreateCallback {
 
     public CompletableFuture<ReadHandle> reopenReadHandle(long ledgerId) {
         invalidateReadHandle(ledgerId);
-        return getLedgerHandle(ledgerId);
+        return getLedgerHandle(ledgerId).copy();
+    }
+
+    /** Captures all Native data ledgers and the confirmed tail frontier against a fresh stored metadata cut. */
+    public synchronized CompletableFuture<CapturedNativeReadView> captureNativeReadView() {
+        try {
+            requireOffloadReadOwner();
+            if (closeStarted || ledgersStat == null
+                    || !(config.getLedgerOffloader() instanceof SourceSafeLedgerOffloader offloader)) {
+                throw new IllegalStateException("native read view requires an open source-safe owner");
+            }
+            Map<Long, LedgerInfo> infos = new java.util.TreeMap<>();
+            ledgers.forEach((id, info) -> {
+                LedgerInfo copy = new LedgerInfo();
+                copy.copyFrom(info);
+                infos.put(id, copy);
+            });
+            var candidate = new CapturedNativeReadView(ledgersStat.getVersion(), Map.copyOf(propertiesMap),
+                    Collections.unmodifiableMap(infos), currentLedger,
+                    PositionFactory.create(lastConfirmedEntry.getLedgerId(), lastConfirmedEntry.getEntryId()),
+                    offloader, new byte[0]);
+            return candidate.readStoredMetadata().thenApply(stored -> new CapturedNativeReadView(
+                    candidate.metadataVersion, candidate.properties, candidate.infos, candidate.tail,
+                    candidate.confirmedPosition, candidate.offloader, stored)).copy();
+        } catch (Throwable failure) {
+            return CompletableFuture.failedFuture(failure);
+        }
+    }
+
+    /** Immutable Native coverage and confirmed frontier; no M4 owner or source generation is assigned here. */
+    public final class CapturedNativeReadView {
+        private final long metadataVersion;
+        private final Map<String, String> properties;
+        private final Map<Long, LedgerInfo> infos;
+        private final LedgerHandle tail;
+        private final boolean activeTail;
+        private final Position confirmedPosition;
+        private final SourceSafeLedgerOffloader offloader;
+        private final byte[] storedMetadata;
+
+        private CapturedNativeReadView(long metadataVersion, Map<String, String> properties,
+                                       Map<Long, LedgerInfo> infos, LedgerHandle tail, Position confirmedPosition,
+                                       SourceSafeLedgerOffloader offloader, byte[] storedMetadata) {
+            this.metadataVersion = metadataVersion;
+            this.properties = properties;
+            this.infos = infos;
+            this.tail = tail;
+            activeTail = tail != null && !tail.isClosed();
+            this.confirmedPosition = confirmedPosition;
+            this.offloader = offloader;
+            this.storedMetadata = storedMetadata.clone();
+        }
+
+        public long metadataVersion() {
+            return metadataVersion;
+        }
+
+        public Map<String, String> managedLedgerProperties() {
+            return properties;
+        }
+
+        public String managedLedgerName() {
+            return name;
+        }
+
+        public List<Long> ledgerIds() {
+            return List.copyOf(infos.keySet());
+        }
+
+        public Position confirmedPosition() {
+            return confirmedPosition;
+        }
+
+        public byte[] storedMetadataBytes() {
+            return storedMetadata.clone();
+        }
+
+        public byte[] ledgerInfoBytes(long ledgerId) {
+            return requireInfo(ledgerId).toByteArray();
+        }
+
+        public boolean offloadComplete(long ledgerId) {
+            LedgerInfo info = requireInfo(ledgerId);
+            return info.hasOffloadContext() && info.getOffloadContext().isComplete();
+        }
+
+        /**
+         * Captures only this exact Native metadata cut, opening no old BK or Object source. The caller must
+         * establish M4 release and fence this owner's actual reads before either metadata transition.
+         */
+        public NativeBookKeeperSourceDeletion captureBookKeeperDeletion(long ledgerId) {
+            synchronized (ManagedLedgerImpl.this) {
+                LedgerInfo info = requireInfo(ledgerId);
+                if (!isCurrent() || activeTail(ledgerId) || !isSourceSafeBookKeeperDeletion(info)
+                        || !info.getOffloadContext().isComplete() || info.getEntries() <= 0 || info.getSize() <= 0
+                        || !info.getOffloadContext().hasUidMsb() || !info.getOffloadContext().hasUidLsb()
+                        || !info.getOffloadContext().hasDriverMetadata()
+                        || !info.getOffloadContext().getDriverMetadata().hasName()
+                        || !Objects.equals(info.getOffloadContext().getDriverMetadata().getName(),
+                                offloader.getOffloadDriverName())
+                        || info.getOffloadContext().getBookkeeperRetentionClass()
+                                != BookKeeperRetentionClass.DELETE_AFTER_VERIFIED) {
+                    throw new IllegalStateException("Native BK deletion requires its exact complete sealed source");
+                }
+                return new NativeBookKeeperSourceDeletion(this, info);
+            }
+        }
+
+        public boolean activeTail(long ledgerId) {
+            requireInfo(ledgerId);
+            return activeTail && tail.getId() == ledgerId;
+        }
+
+        public long lastEntry(long ledgerId) {
+            return activeTail(ledgerId)
+                    ? (confirmedPosition.getLedgerId() == ledgerId ? confirmedPosition.getEntryId() : -1)
+                    : requireInfo(ledgerId).getEntries() - 1;
+        }
+
+        public long sealedLength(long ledgerId) {
+            if (activeTail(ledgerId)) {
+                throw new IllegalStateException("active tail has no sealed source length");
+            }
+            return requireInfo(ledgerId).getSize();
+        }
+
+        public boolean usesBookKeeper(BookKeeper expected) {
+            return bookKeeper == expected;
+        }
+
+        /** Low-frequency qualification configuration from this actual Native owner. */
+        public Map<String, String> readAdmissionConfiguration() {
+            final String passwordDigest;
+            try {
+                passwordDigest = HexFormat.of().formatHex(
+                        MessageDigest.getInstance("SHA-256").digest(config.getPassword()));
+            } catch (NoSuchAlgorithmException failure) {
+                throw new IllegalStateException("SHA-256 is unavailable", failure);
+            }
+            return Map.of(
+                    "ensemble", Integer.toString(config.getEnsembleSize()),
+                    "writeQuorum", Integer.toString(config.getWriteQuorumSize()),
+                    "ackQuorum", Integer.toString(config.getAckQuorumSize()),
+                    "digest", config.getDigestType().name(),
+                    "passwordSha256", passwordDigest,
+                    "readTimeoutSeconds", Long.toString(config.getReadEntryTimeoutSeconds()),
+                    "readPriority", offloader.getOffloadPolicies().getManagedLedgerOffloadedReadPriority().name());
+        }
+
+        public boolean usesOffloader(SourceSafeLedgerOffloader expected) {
+            return offloader == expected;
+        }
+
+        public boolean isCurrent() {
+            synchronized (ManagedLedgerImpl.this) {
+                try {
+                    requireOffloadReadOwner();
+                    if (closeStarted || ledgersStat == null || metadataVersion != ledgersStat.getVersion()
+                            || !properties.equals(propertiesMap) || currentLedger != tail
+                            || (activeTail && tail.isClosed())
+                            || config.getLedgerOffloader() != offloader
+                            || lastConfirmedEntry.compareTo(confirmedPosition) < 0 || infos.size() != ledgers.size()) {
+                        return false;
+                    }
+                    return infos.entrySet().stream().allMatch(entry -> {
+                        LedgerInfo current = ledgers.get(entry.getKey());
+                        return current != null && Arrays.equals(entry.getValue().toByteArray(), current.toByteArray());
+                    });
+                } catch (ManagedLedgerException failure) {
+                    return false;
+                }
+            }
+        }
+
+        /** Actual cursor metadata data only; stability is not writer closure or a deletion proof. */
+        public CompletableFuture<CapturedCursorCatalogue> captureStoredCursorCatalogue(int maximumCursors,
+                                                                                       long maximumBytes) {
+            if (maximumCursors <= 0 || maximumCursors > 4096 || maximumBytes <= 0
+                    || maximumBytes > 16L * 1024 * 1024) {
+                return CompletableFuture.failedFuture(new IllegalArgumentException("cursor catalogue bounds differ"));
+            }
+            var original = readStoredMetadata().thenCompose(unused -> storedCursorNames()).thenCompose(names -> {
+                if (names.size() > maximumCursors) {
+                    return CompletableFuture.failedFuture(new IllegalArgumentException("cursor catalogue exceeds cap"));
+                }
+                CompletableFuture<List<CapturedStoredCursor>> reads =
+                        CompletableFuture.completedFuture(new ArrayList<>());
+                for (String cursor : names) {
+                    reads = reads.thenCompose(rows -> readStoredCursor(cursor).thenApply(row -> {
+                        rows.add(row);
+                        long bytes = 0;
+                        for (var value : rows) {
+                            bytes = Math.addExact(bytes, Math.addExact(value.storedBytes().length,
+                                    value.cursorInfoBytes().length));
+                            bytes = Math.addExact(bytes,
+                                    value.cursorName().getBytes(java.nio.charset.StandardCharsets.UTF_8).length);
+                        }
+                        if (bytes > maximumBytes) {
+                            throw new IllegalArgumentException("cursor catalogue bytes exceed cap");
+                        }
+                        return rows;
+                    }));
+                }
+                return reads.thenCompose(rows -> {
+                    CompletableFuture<Void> stable = CompletableFuture.completedFuture(null);
+                    for (var row : rows) {
+                        stable = stable.thenCompose(unused -> readStoredCursor(row.cursorName()).thenAccept(last -> {
+                            if (row.metadataVersion() != last.metadataVersion()
+                                    || !Arrays.equals(row.storedBytes(), last.storedBytes())
+                                    || !Arrays.equals(row.cursorInfoBytes(), last.cursorInfoBytes())) {
+                                throw new IllegalStateException("cursor metadata changed during catalogue capture");
+                            }
+                        }));
+                    }
+                    return stable.thenCompose(unused -> storedCursorNames()).thenCompose(lastNames -> {
+                        if (!lastNames.equals(names)) {
+                            throw new IllegalStateException("cursor directory changed during catalogue capture");
+                        }
+                        return readStoredMetadata().thenApply(unused ->
+                                new CapturedCursorCatalogue(name, metadataVersion, storedMetadata, rows));
+                    });
+                });
+            });
+            return original.copy();
+        }
+
+        /** Read-only actual durable cursor checkpoints; never opens with recovery or fences a writer. */
+        public CapturedCursorCheckpointOperation captureCursorCheckpoints(int maximumCursors, int maximumBytes) {
+            var operation = new CapturedCursorCheckpointOperation();
+            var work = captureStoredCursorCatalogue(maximumCursors, maximumBytes).thenCompose(catalogue -> {
+                CompletableFuture<List<CapturedCursorCheckpoint>> reads =
+                        CompletableFuture.completedFuture(new ArrayList<>());
+                for (var cursor : catalogue.cursors()) {
+                    reads = reads.thenCompose(rows -> readCursorCheckpoint(cursor, maximumBytes, operation)
+                            .thenApply(checkpoint -> {
+                                rows.add(checkpoint);
+                                long bytes = catalogue.storedMetadataBytes().length;
+                                for (var row : catalogue.cursors()) {
+                                    bytes = Math.addExact(bytes,
+                                            Math.addExact(row.storedBytes().length, row.cursorInfoBytes().length));
+                                }
+                                for (var row : rows) {
+                                    bytes = Math.addExact(bytes, row.positionInfoBytes().length);
+                                }
+                                if (bytes > maximumBytes) {
+                                    throw new IllegalArgumentException("actual cursor checkpoint bytes exceed cap");
+                                }
+                                return rows;
+                            }));
+                }
+                return reads.thenCompose(rows -> captureStoredCursorCatalogue(maximumCursors, maximumBytes)
+                        .thenApply(last -> {
+                            if (last.cursors().size() != catalogue.cursors().size()) {
+                                throw new IllegalStateException("cursor directory changed during checkpoint capture");
+                            }
+                            for (int i = 0; i < last.cursors().size(); i++) {
+                                var first = catalogue.cursors().get(i);
+                                var next = last.cursors().get(i);
+                                if (!first.cursorName().equals(next.cursorName())
+                                        || first.metadataVersion() != next.metadataVersion()
+                                        || !Arrays.equals(first.storedBytes(), next.storedBytes())) {
+                                    throw new IllegalStateException(
+                                            "cursor metadata changed during checkpoint capture");
+                                }
+                            }
+                            return new CapturedCursorCheckpointCatalogue(catalogue, rows);
+                        }));
+            });
+            work.whenComplete((value, failure) -> {
+                operation.workEnded.complete(null);
+                operation.finishKnownDrain();
+                if (failure == null) {
+                    operation.result.complete(value);
+                } else {
+                    operation.result.completeExceptionally(failure);
+                }
+            });
+            return operation;
+        }
+
+        private CompletableFuture<CapturedCursorCheckpoint> readCursorCheckpoint(CapturedStoredCursor cursor,
+                int maximumBytes, CapturedCursorCheckpointOperation operation) {
+            var info = new org.apache.bookkeeper.mledger.proto.ManagedCursorInfo();
+            try {
+                info.parseFrom(cursor.cursorInfoBytes());
+                if (info.getCursorsLedgerId() == -1) {
+                    if (!info.hasMarkDeleteLedgerId() || !info.hasMarkDeleteEntryId()) {
+                        throw new IllegalStateException("cursor has no durable metadata position");
+                    }
+                    return CompletableFuture.completedFuture(
+                            new CapturedCursorCheckpoint(cursor.cursorName(), -1, -1, new byte[0]));
+                }
+                if (info.getCursorsLedgerId() < 0 || !isCurrent()) {
+                    throw new IllegalStateException("cursor checkpoint Native identity changed");
+                }
+                var read = bookKeeper.newOpenLedgerOp().withRecovery(false)
+                        .withLedgerId(info.getCursorsLedgerId()).withDigestType(config.getDigestType())
+                        .withPassword(config.getPassword()).execute().thenCompose(handle -> {
+                            operation.keepHandle(handle);
+                            long lac = handle.getLastAddConfirmed();
+                            if (handle.getId() != info.getCursorsLedgerId() || lac < 0) {
+                                return CompletableFuture.<CapturedCursorCheckpoint>failedFuture(
+                                        new IllegalStateException("cursor ledger has no confirmed checkpoint"));
+                            }
+                            return handle.readAsync(lac, lac).thenApply(entries -> {
+                                operation.keepEntries(entries);
+                                var entry = entries.getEntry(lac);
+                                if (entry.getLength() <= 0 || entry.getLength() > maximumBytes) {
+                                    throw new IllegalArgumentException("cursor checkpoint entry exceeds cap");
+                                }
+                                byte[] bytes = entry.getEntryBytes();
+                                var position = new org.apache.bookkeeper.mledger.proto.PositionInfo();
+                                position.parseFrom(bytes);
+                                if (!position.hasLedgerId() || !position.hasEntryId()
+                                        || position.getLedgerId() < -1 || position.getEntryId() < -1
+                                        || handle.getLastAddConfirmed() != lac) {
+                                    throw new IllegalStateException("cursor checkpoint is invalid or changed");
+                                }
+                                return new CapturedCursorCheckpoint(cursor.cursorName(), handle.getId(), lac, bytes);
+                            });
+                        });
+                return read.handle((value, failure) -> new Object[]{value, failure})
+                        .thenCompose(outcome -> operation.closeOriginal().thenApply(unused -> {
+                            if (outcome[1] != null) {
+                                throw new CompletionException((Throwable) outcome[1]);
+                            }
+                            return (CapturedCursorCheckpoint) outcome[0];
+                        }));
+            } catch (Throwable failure) {
+                return CompletableFuture.failedFuture(failure);
+            }
+        }
+
+        private CompletableFuture<List<String>> storedCursorNames() {
+            var original = new CompletableFuture<List<String>>();
+            try {
+                if (!isCurrent()) {
+                    throw new ManagedLedgerFencedException("cursor catalogue Native view changed");
+                }
+                store.readStoredCursorNames(name, new MetaStoreCallback<List<String>>() {
+                    @Override
+                    public void operationComplete(List<String> cursors, Stat stat) {
+                        try {
+                            var sorted = cursors.stream().sorted().toList();
+                            if (sorted.stream().distinct().count() != sorted.size()
+                                    || sorted.stream().anyMatch(value -> value.isEmpty() || value.contains("/")
+                                            || value.indexOf('\0') >= 0
+                                            || value.getBytes(java.nio.charset.StandardCharsets.UTF_8).length > 1024)) {
+                                throw new IllegalStateException("cursor catalogue name is invalid");
+                            }
+                            original.complete(List.copyOf(sorted));
+                        } catch (Throwable failure) {
+                            original.completeExceptionally(failure);
+                        }
+                    }
+
+                    @Override
+                    public void operationFailed(MetaStoreException failure) {
+                        original.completeExceptionally(failure);
+                    }
+                });
+            } catch (Throwable failure) {
+                original.completeExceptionally(failure);
+            }
+            return original;
+        }
+
+        private CompletableFuture<CapturedStoredCursor> readStoredCursor(String cursor) {
+            var original = new CompletableFuture<CapturedStoredCursor>();
+            try {
+                if (!isCurrent()) {
+                    throw new ManagedLedgerFencedException("cursor catalogue Native view changed");
+                }
+                store.readStoredCursorInfo(name, cursor, new MetaStoreCallback<MetaStore.StoredCursorInfo>() {
+                    @Override
+                    public void operationComplete(MetaStore.StoredCursorInfo value, Stat stat) {
+                        if (stat == null || stat.getVersion() < 0) {
+                            original.completeExceptionally(
+                                    new IllegalStateException("cursor metadata version missing"));
+                        } else {
+                            original.complete(new CapturedStoredCursor(cursor, stat.getVersion(),
+                                    value.storedBytes(), value.cursorInfoBytes()));
+                        }
+                    }
+
+                    @Override
+                    public void operationFailed(MetaStoreException failure) {
+                        original.completeExceptionally(failure);
+                    }
+                });
+            } catch (Throwable failure) {
+                original.completeExceptionally(failure);
+            }
+            return original;
+        }
+
+        public CompletableFuture<Void> verifyStoredMetadata() {
+            return readStoredMetadata().thenApply(ignored -> (Void) null).copy();
+        }
+
+        public CompletableFuture<Void> fenceOwnerReadAdmission() {
+            // Revoking new source use must still drain accepted work when this registered read cut has advanced.
+            return fenceCapturedReadOwner(() -> nativeReadAdmission == null
+                    ? isCurrent() : nativeReadAdmissionView == this);
+        }
+
+        /** One preparation owns accepted source opens before a read actor is registered. */
+        public void installReadPreparation() {
+            synchronized (ManagedLedgerImpl.this) {
+                if (!isCurrent() || nativeReadPreparationView != null || nativeReadAdmission != null
+                        || !ordinaryReadOperations.isEmpty() || !readHandleCloses.isEmpty()
+                        || !sourceSafeBookKeeperDeletions.isEmpty()
+                        || ledgerCache.values().stream().anyMatch(
+                                future -> !future.isDone() || future.isCompletedExceptionally() || future.isCancelled())
+                        || offloadReadSourcePins.values().stream().anyMatch(pins -> pins.pinCount() != 0)) {
+                    throw new IllegalStateException("Native source preparation requires its quiescent current owner");
+                }
+                nativeReadPreparationView = this;
+            }
+        }
+
+        /** This exact installed preparation keeps close authority through cut changes and accepted SDK opens. */
+        public CompletableFuture<Void> fenceReadPreparation() {
+            return fenceCapturedReadOwner(() -> nativeReadPreparationView == this);
+        }
+
+        /** Atomically closes this original preparation only if no Native read owner was ever installed. */
+        public CompletableFuture<Void> fenceUnregisteredReadPreparation() {
+            synchronized (ManagedLedgerImpl.this) {
+                if (nativeReadPreparationView != this || nativeReadAdmission != null) {
+                    return CompletableFuture.failedFuture(new IllegalStateException(
+                            "Native preparation is not its original unregistered read scope"));
+                }
+                return fenceCapturedReadOwner(() -> nativeReadPreparationView == this
+                        && nativeReadAdmission == null);
+            }
+        }
+
+        /** Observes the actual private SDK fence; modifying a returned observer cannot establish this fact. */
+        public void requireUnregisteredReadPreparationDrain() {
+            synchronized (ManagedLedgerImpl.this) {
+                if (nativeReadPreparationView != this || nativeReadAdmission != null
+                        || !offloadReadAdmissionClosed || offloadReadFenceFuture == null
+                        || !offloadReadFenceFuture.isDone() || offloadReadFenceFuture.isCompletedExceptionally()
+                        || offloadReadFenceFuture.isCancelled()) {
+                    throw new IllegalStateException("Original unregistered Native preparation has no confirmed drain");
+                }
+            }
+        }
+
+        /** Installs one current owner after accepted reads/pins/handle cleanup drain; this grants no M4 authority. */
+        public void installReadAdmission(NativeReadAdmission admission) {
+            synchronized (ManagedLedgerImpl.this) {
+                Objects.requireNonNull(admission, "admission");
+                if (!isCurrent() || nativeReadAdmission != null || !ordinaryReadOperations.isEmpty()
+                        || !sourceSafeBookKeeperDeletions.isEmpty()
+                        || !readHandleCloses.isEmpty()
+                        || ledgerCache.values().stream().anyMatch(
+                                future -> !future.isDone() || future.isCompletedExceptionally() || future.isCancelled())
+                        || offloadReadSourcePins.values().stream().anyMatch(pins -> pins.pinCount() != 0)) {
+                    throw new IllegalStateException("native read admission requires a current quiescent owner");
+                }
+                ledgerCache.forEach((ledgerId, cached) -> {
+                    if (cached.getNow(null) instanceof DualSourceReadHandle handle) {
+                        LedgerInfo info = infos.get(ledgerId);
+                        if (info == null || !info.hasOffloadContext()) {
+                            throw new IllegalStateException("native registered composite is outside its captured cut");
+                        }
+                        var context = info.getOffloadContext();
+                        var attempt = new UUID(context.getUidMsb(), context.getUidLsb());
+                        handle.installReadAdmissionScope(currentOffloadReadSourceState(ledgerId, attempt),
+                                () -> isCurrent() && admission.sourceUseOpen());
+                    }
+                });
+                nativeReadAdmissionView = this;
+                nativeReadAdmission = admission;
+            }
+        }
+
+        private CompletableFuture<byte[]> readStoredMetadata() {
+            CompletableFuture<byte[]> result = new CompletableFuture<>();
+            try {
+                if (!isCurrent()) {
+                    throw new ManagedLedgerFencedException("captured native read view is stale");
+                }
+                store.readStoredManagedLedgerInfo(name, new MetaStoreCallback<ManagedLedgerInfo>() {
+                    @Override
+                    public void operationComplete(ManagedLedgerInfo stored, Stat stat) {
+                        try {
+                            Map<String, String> observedProperties = new HashMap<>();
+                            stored.getPropertiesList().forEach(property ->
+                                    observedProperties.put(property.getKey(), property.getValue()));
+                            Map<Long, LedgerInfo> observedInfos = new HashMap<>();
+                            stored.getLedgerInfosList().forEach(info -> observedInfos.put(info.getLedgerId(), info));
+                            synchronized (ManagedLedgerImpl.this) {
+                                if (!isCurrent() || stat.getVersion() != metadataVersion
+                                        || !properties.equals(observedProperties)
+                                        || observedProperties.size() != stored.getPropertiesCount()
+                                        || observedInfos.size() != infos.size()
+                                        || observedInfos.size() != stored.getLedgerInfosCount()
+                                        || infos.entrySet().stream().anyMatch(entry -> {
+                                            LedgerInfo observed = observedInfos.get(entry.getKey());
+                                            return observed == null || !Arrays.equals(
+                                                    entry.getValue().toByteArray(), observed.toByteArray());
+                                        })) {
+                                    throw new ManagedLedgerFencedException(
+                                            "captured native read view differs from stored metadata");
+                                }
+                            }
+                            result.complete(stored.toByteArray());
+                        } catch (Throwable failure) {
+                            result.completeExceptionally(failure);
+                        }
+                    }
+
+                    @Override
+                    public void operationFailed(MetaStoreException failure) {
+                        result.completeExceptionally(failure);
+                    }
+                });
+            } catch (Throwable failure) {
+                result.completeExceptionally(failure);
+            }
+            return result.copy();
+        }
+
+        /** Borrows the same owner's plain BK handle; an active writer handle is never opened with recovery. */
+        public CompletableFuture<CapturedBookKeeperReadSource> captureBookKeeperSource(long ledgerId) {
+            synchronized (ManagedLedgerImpl.this) {
+                try {
+                    LedgerInfo info = requireInfo(ledgerId);
+                    if (!isCurrent() || offloadComplete(ledgerId) || (info.hasOffloadContext()
+                            && (info.getOffloadContext().isBookkeeperDeleted()
+                            || info.getOffloadContext().getBookkeeperDeleteState()
+                            != BookKeeperDeleteState.BK_DELETE_NONE))) {
+                        throw new ManagedLedgerFencedException(
+                                "captured plain BookKeeper source is stale or ineligible");
+                    }
+                    boolean active = activeTail(ledgerId);
+                    long lastEntry = lastEntry(ledgerId);
+                    CompletableFuture<ReadHandle> opened = active
+                            ? CompletableFuture.completedFuture(tail) : getOrOpenLedgerHandle(ledgerId);
+                    return opened.thenApply(handle -> {
+                        if (!isCurrent() || handle instanceof DualSourceReadHandle || handle.getId() != ledgerId
+                                || handle.getLastAddConfirmed() < lastEntry || (!active && (!handle.isClosed()
+                                || handle.getLastAddConfirmed() != lastEntry
+                                || handle.getLength() != info.getSize()))) {
+                            throw new CompletionException(new ManagedLedgerFencedException(
+                                    "captured plain BookKeeper handle differs from Native source"));
+                        }
+                        return new CapturedBookKeeperReadSource(this, handle, lastEntry, active, info.getSize());
+                    }).copy();
+                } catch (Throwable failure) {
+                    return CompletableFuture.failedFuture(failure);
+                }
+            }
+        }
+
+        private LedgerInfo requireInfo(long ledgerId) {
+            LedgerInfo info = infos.get(ledgerId);
+            if (info == null) {
+                throw new IllegalArgumentException("ledger is outside captured native read view");
+            }
+            return info;
+        }
+    }
+
+    /** Confirmed-range route over a plain BK handle. The owner keeps every accepted SDK read until buffer cleanup. */
+    public final class CapturedBookKeeperReadSource {
+        private final CapturedNativeReadView view;
+        private final ReadHandle handle;
+        private final long lastEntry;
+        private final boolean active;
+        private final long sealedLength;
+
+        private CapturedBookKeeperReadSource(CapturedNativeReadView view, ReadHandle handle, long lastEntry,
+                                             boolean active, long sealedLength) {
+            this.view = view;
+            this.handle = handle;
+            this.lastEntry = lastEntry;
+            this.active = active;
+            this.sealedLength = sealedLength;
+        }
+
+        public long ledgerId() {
+            return handle.getId();
+        }
+
+        public long lastAddConfirmed() {
+            return lastEntry;
+        }
+
+        public boolean activeTail() {
+            return active;
+        }
+
+        public boolean isCurrent() {
+            synchronized (ManagedLedgerImpl.this) {
+                if (!view.isCurrent() || (active ? handle.isClosed() : !handle.isClosed())) {
+                    return false;
+                }
+                if (active) {
+                    return currentLedger == handle;
+                }
+                CompletableFuture<ReadHandle> cached = ledgerCache.get(ledgerId());
+                return cached != null && cached.isDone() && !cached.isCompletedExceptionally()
+                        && cached.getNow(null) == handle;
+            }
+        }
+
+        /** Only closed ledgers have a captured logical length; this does not describe a mutable tail prefix. */
+        public long sealedLength() {
+            if (active) {
+                throw new IllegalStateException("active tail has no sealed source length");
+            }
+            return sealedLength;
+        }
+
+        public CompletableFuture<CapturedReadBatch> readOwnedAsync(
+                long firstEntry, long lastEntry, CapturedReadLimits limits, BooleanSupplier sourceUseOpen) {
+            return readOwnedOperation(firstEntry, lastEntry, limits, sourceUseOpen).result();
+        }
+
+        public CapturedReadOperation readOwnedOperation(
+                long firstEntry, long lastEntry, CapturedReadLimits limits, BooleanSupplier sourceUseOpen) {
+            CapturedReadOperation operation = new CapturedReadOperation();
+            boolean admitted = false;
+            try {
+                requireOwnedRange(firstEntry, lastEntry, this.lastEntry, limits, sourceUseOpen);
+                synchronized (ManagedLedgerImpl.this) {
+                    if (!isCurrent()) {
+                        throw new ManagedLedgerFencedException("captured plain BookKeeper source is stale");
+                    }
+                    if (!sourceUseOpen.getAsBoolean()) {
+                        throw new ManagedLedgerFencedException("captured source use is closed");
+                    }
+                    trackOwnedReadDrain(operation.actualDrain);
+                    admitted = true;
+                    dispatchRegisteredRead(ledgerId(), firstEntry, lastEntry, operation.actualDrain, () -> {
+                        try {
+                            if (!isCurrent()) {
+                                failOwnedReadStart(operation,
+                                        new ManagedLedgerFencedException("captured plain BookKeeper source is stale"),
+                                        false);
+                                return;
+                            }
+                            if (!operation.sourceUseOpen.get() || !sourceUseOpen.getAsBoolean()) {
+                                failOwnedReadStart(operation,
+                                        new ManagedLedgerFencedException("captured source use is closed"), false);
+                                return;
+                            }
+                            handle.readAsync(firstEntry, lastEntry).whenComplete((entries, failure) -> finishOwnedRead(
+                                    operation, ledgerId(), new OffloadReadSourceState(view.metadataVersion, null, false,
+                                            OffloadReadSourceState.BookKeeperDeleteState.NONE),
+                                    entries, failure, firstEntry, lastEntry, limits));
+                        } catch (Throwable dispatchFailure) {
+                            failOwnedReadStart(operation, dispatchFailure, true);
+                        }
+                    }, failure -> failOwnedReadStart(operation, failure, false), limits);
+                }
+            } catch (Throwable failure) {
+                failOwnedReadStart(operation, failure, admitted);
+            }
+            return operation;
+        }
+
+    }
+
+    /** Captures one complete native offload source without replacing its owner-managed composite handle. */
+    public synchronized CompletableFuture<CapturedOffloadReadSource> captureOffloadReadSource(long ledgerId) {
+        return captureOffloadReadSource(ledgerId, false);
+    }
+
+    /** Opens and reads only the complete Object source, including when its original BK metadata is absent. */
+    public synchronized CompletableFuture<CapturedOffloadReadSource> captureOffloadObjectReadSource(long ledgerId) {
+        return captureOffloadReadSource(ledgerId, true);
+    }
+
+    /** Exact published Object versions; current HEAD or a different already-cached child cannot replace them. */
+    public synchronized CompletableFuture<CapturedOffloadReadSource> captureOffloadObjectReadSource(
+            long ledgerId, OffloadedReadSourceIdentity expected) {
+        if (expected == null || expected.ledgerId() != ledgerId) {
+            return CompletableFuture.failedFuture(new IllegalArgumentException("published offload ledger differs"));
+        }
+        return captureOffloadReadSource(ledgerId, true, expected);
+    }
+
+    private CompletableFuture<CapturedOffloadReadSource> captureOffloadReadSource(long ledgerId, boolean objectOnly) {
+        return captureOffloadReadSource(ledgerId, objectOnly, null);
+    }
+
+    private CompletableFuture<CapturedOffloadReadSource> captureOffloadReadSource(
+            long ledgerId, boolean objectOnly, OffloadedReadSourceIdentity expected) {
+        try {
+            requireOffloadReadOwner();
+            LedgerInfo info = ledgers.get(ledgerId);
+            if (ledgerId < 0 || ledgersStat == null || info == null || !isSourceSafeBookKeeperDeletion(info)
+                    || !info.getOffloadContext().isComplete()
+                    || !(config.getLedgerOffloader() instanceof SourceSafeLedgerOffloader)) {
+                throw new IllegalStateException("native source capture requires a complete source-safe offload");
+            }
+            UUID uid = new UUID(info.getOffloadContext().getUidMsb(), info.getOffloadContext().getUidLsb());
+            if (expected != null && !uid.equals(expected.attemptUuid())) {
+                throw new IllegalArgumentException("published offload attempt differs from Native metadata");
+            }
+            OffloadReadSourceState state = currentOffloadReadSourceState(ledgerId, uid);
+            long lastEntry = info.getEntries() - 1;
+            long length = info.getSize();
+            Map<String, String> driverMetadata = OffloadUtils.getOffloadDriverMetadata(info);
+            driverMetadata.put("ManagedLedgerName", name);
+            Map<String, String> capturedMetadata = Map.copyOf(driverMetadata);
+            Map<String, String> capturedProperties = Map.copyOf(propertiesMap);
+            byte[] capturedLedgerMetadata = info.toByteArray();
+            return getOrOpenLedgerHandle(ledgerId, objectOnly, expected).thenApply(handle -> {
+                if (!(handle instanceof DualSourceReadHandle composite) || !handle.isClosed()
+                        || objectOnly != composite.isObjectOnly()
+                        || handle.getId() != ledgerId || handle.getLastAddConfirmed() != lastEntry
+                        || handle.getLength() != length) {
+                    throw new IllegalStateException("native source capture differs from its sealed composite");
+                }
+                CapturedOffloadReadSource captured = new CapturedOffloadReadSource(
+                        ledgerId, state, lastEntry, length, capturedMetadata, capturedProperties,
+                        capturedLedgerMetadata, composite);
+                if (!captured.isCurrent()) {
+                    throw new CompletionException(new ManagedLedgerFencedException("captured native source is stale"));
+                }
+                return captured;
+            }).thenCompose(captured -> expected == null ? CompletableFuture.completedFuture(captured)
+                    : captured.captureOffloadedReadSourceIdentity().thenApply(actual -> {
+                        if (!actual.equals(expected)) {
+                            throw new IllegalStateException("cached Object source differs from published versions");
+                        }
+                        return captured;
+                    })).copy();
+        } catch (Throwable failure) {
+            return CompletableFuture.failedFuture(failure);
+        }
+    }
+
+    private void requireOffloadReadOwner() throws ManagedLedgerException {
+        if (offloadReadAdmissionClosed) {
+            throw new ManagedLedgerFencedException("Native owner read admission is closed");
+        }
+        State state = STATE_UPDATER.get(this);
+        if (state == State.Closed) {
+            throw new ManagedLedgerAlreadyClosedException("Managed ledger is closed");
+        }
+        if (state.isFenced()) {
+            throw new ManagedLedgerFencedException();
+        }
+    }
+
+    public record CapturedStoredCursor(String cursorName, long metadataVersion,
+                                       byte[] storedBytes, byte[] cursorInfoBytes) {
+        public CapturedStoredCursor {
+            storedBytes = storedBytes.clone();
+            cursorInfoBytes = cursorInfoBytes.clone();
+        }
+
+        @Override
+        public byte[] storedBytes() {
+            return storedBytes.clone();
+        }
+
+        @Override
+        public byte[] cursorInfoBytes() {
+            return cursorInfoBytes.clone();
+        }
+    }
+
+    public record CapturedCursorCatalogue(String managedLedgerName, long metadataVersion,
+                                          byte[] storedMetadataBytes, List<CapturedStoredCursor> cursors) {
+        public CapturedCursorCatalogue {
+            storedMetadataBytes = storedMetadataBytes.clone();
+            cursors = List.copyOf(cursors);
+        }
+
+        @Override
+        public byte[] storedMetadataBytes() {
+            return storedMetadataBytes.clone();
+        }
+    }
+
+    public record CapturedCursorCheckpoint(String cursorName, long cursorLedgerId, long checkpointEntryId,
+                                            byte[] positionInfoBytes) {
+        public CapturedCursorCheckpoint {
+            positionInfoBytes = positionInfoBytes.clone();
+        }
+
+        @Override
+        public byte[] positionInfoBytes() {
+            return positionInfoBytes.clone();
+        }
+    }
+
+    public record CapturedCursorCheckpointCatalogue(CapturedCursorCatalogue metadata,
+                                                     List<CapturedCursorCheckpoint> checkpoints) {
+        public CapturedCursorCheckpointCatalogue {
+            checkpoints = List.copyOf(checkpoints);
+        }
+    }
+
+    /** A failed close retains the original handle/entries; reconciliation cannot issue another open/read. */
+    public static final class CapturedCursorCheckpointOperation {
+        private final CompletableFuture<CapturedCursorCheckpointCatalogue> result = new CompletableFuture<>();
+        private final CompletableFuture<Void> workEnded = new CompletableFuture<>();
+        private final CompletableFuture<Void> actualDrain = new CompletableFuture<>();
+        private ReadHandle handle;
+        private LedgerEntries entries;
+        private CompletableFuture<Void> closing;
+
+        private CapturedCursorCheckpointOperation() {
+        }
+
+        public CompletableFuture<CapturedCursorCheckpointCatalogue> result() {
+            return result.copy();
+        }
+
+        public CompletableFuture<Void> drained() {
+            return actualDrain.copy();
+        }
+
+        public CompletableFuture<Void> reconcileCleanup() {
+            return workEnded.thenCompose(unused -> closeOriginal()).thenRun(this::finishKnownDrain).copy();
+        }
+
+        private synchronized void keepHandle(ReadHandle value) {
+            if (handle != null || entries != null) {
+                throw new IllegalStateException("original cursor checkpoint handle is still live");
+            }
+            handle = value;
+            closing = null;
+        }
+
+        private synchronized void keepEntries(LedgerEntries value) {
+            entries = value;
+        }
+
+        private synchronized CompletableFuture<Void> closeOriginal() {
+            if (closing != null && !closing.isCompletedExceptionally()) {
+                return closing.copy();
+            }
+            try {
+                if (entries != null) {
+                    entries.close();
+                    entries = null;
+                }
+                if (handle == null) {
+                    return CompletableFuture.completedFuture(null);
+                }
+                ReadHandle original = handle;
+                closing = original.closeAsync().thenRun(() -> {
+                    synchronized (this) {
+                        if (handle == original) {
+                            handle = null;
+                        }
+                    }
+                });
+            } catch (Throwable failure) {
+                closing = CompletableFuture.failedFuture(failure);
+            }
+            return closing.copy();
+        }
+
+        private synchronized void finishKnownDrain() {
+            if (workEnded.isDone() && handle == null && entries == null) {
+                actualDrain.complete(null);
+            }
+        }
+    }
+
+    /** Caller-admitted bounds; a full requested range must fit before any source I/O starts. */
+    public record CapturedReadLimits(int maximumEntries, long maximumEntryBytes, long maximumBatchBytes) {
+        public CapturedReadLimits {
+            if (maximumEntries <= 0 || maximumEntryBytes <= 0 || maximumEntryBytes > Integer.MAX_VALUE
+                    || maximumBatchBytes < maximumEntryBytes) {
+                throw new IllegalArgumentException("captured read limits are invalid");
+            }
+        }
+    }
+
+    /** A heap-owned entry with no retained SDK buffer or source pin. */
+    public static final class CapturedReadEntry {
+        private final long entryId;
+        private final byte[] payload;
+
+        private CapturedReadEntry(long entryId, byte[] payload) {
+            this.entryId = entryId;
+            this.payload = payload;
+        }
+
+        public long entryId() {
+            return entryId;
+        }
+
+        public byte[] payload() {
+            return payload.clone();
+        }
+    }
+
+    /** Exact captured native range after its borrowed SDK entries have been closed. Not a release proof. */
+    public static final class CapturedReadBatch {
+        private final long ledgerId;
+        private final OffloadReadSourceState sourceState;
+        private final List<CapturedReadEntry> entries;
+        private final long bytes;
+
+        private CapturedReadBatch(long ledgerId, OffloadReadSourceState sourceState,
+                                  List<CapturedReadEntry> entries, long bytes) {
+            this.ledgerId = ledgerId;
+            this.sourceState = sourceState;
+            this.entries = List.copyOf(entries);
+            this.bytes = bytes;
+        }
+
+        public long ledgerId() {
+            return ledgerId;
+        }
+
+        public OffloadReadSourceState sourceState() {
+            return sourceState;
+        }
+
+        public List<CapturedReadEntry> entries() {
+            return entries;
+        }
+
+        public long bytes() {
+            return bytes;
+        }
+    }
+
+    /** Separate public data observations from actual SDK/entry cleanup. Neither is a global M4 terminal proof. */
+    public static final class CapturedReadOperation {
+        private final CompletableFuture<CapturedReadBatch> result = new CompletableFuture<>();
+        private final CompletableFuture<Void> actualDrain = new CompletableFuture<>();
+        private final AtomicBoolean sourceUseOpen = new AtomicBoolean(true);
+
+        private CapturedReadOperation() {
+        }
+
+        public CompletableFuture<CapturedReadBatch> result() {
+            CompletableFuture<CapturedReadBatch> observer = result.copy();
+            observer.whenComplete((ignored, failure) -> sourceUseOpen.set(false));
+            return observer;
+        }
+
+        /** Failure retains an uncertain cleanup; caller mutation cannot complete the private drain. */
+        public CompletableFuture<Void> drained() {
+            return actualDrain.copy();
+        }
+
+        public static CapturedReadOperation rejected(Throwable failure) {
+            CapturedReadOperation operation = new CapturedReadOperation();
+            operation.sourceUseOpen.set(false);
+            operation.actualDrain.complete(null);
+            operation.result.completeExceptionally(failure);
+            return operation;
+        }
+    }
+
+    public static final class CapturedSourceVerification {
+        private final CompletableFuture<Void> result = new CompletableFuture<>();
+        private final CompletableFuture<Void> actualDrain = new CompletableFuture<>();
+        private final AtomicBoolean sourceUseOpen = new AtomicBoolean(true);
+
+        private CapturedSourceVerification() { }
+
+        public static CapturedSourceVerification rejected(Throwable failure) {
+            var operation = new CapturedSourceVerification();
+            operation.result.completeExceptionally(failure);
+            operation.actualDrain.complete(null);
+            return operation;
+        }
+
+        public CompletableFuture<Void> result() {
+            var observer = result.copy();
+            observer.whenComplete((ignored, failure) -> {
+                if (!result.isDone()) {
+                    sourceUseOpen.set(false);
+                }
+            });
+            return observer;
+        }
+
+        public CompletableFuture<Void> drained() {
+            return actualDrain.copy();
+        }
+    }
+
+    /**
+     * Immutable source facts plus a borrowed owner-managed composite. This grants no protection-release authority.
+     * Callers own returned ranges and must close them. A stale capture never reopens or substitutes another source.
+     */
+    public final class CapturedOffloadReadSource {
+        private final long ledgerId;
+        private final OffloadReadSourceState sourceState;
+        private final long lastAddConfirmed;
+        private final long length;
+        private final Map<String, String> driverMetadata;
+        private final Map<String, String> managedLedgerProperties;
+        private final byte[] ledgerMetadata;
+        private final DualSourceReadHandle handle;
+
+        private CapturedOffloadReadSource(long ledgerId, OffloadReadSourceState sourceState, long lastAddConfirmed,
+                                         long length, Map<String, String> driverMetadata,
+                                         Map<String, String> managedLedgerProperties, byte[] ledgerMetadata,
+                                         DualSourceReadHandle handle) {
+            this.ledgerId = ledgerId;
+            this.sourceState = sourceState;
+            this.lastAddConfirmed = lastAddConfirmed;
+            this.length = length;
+            this.driverMetadata = driverMetadata;
+            this.managedLedgerProperties = managedLedgerProperties;
+            this.ledgerMetadata = ledgerMetadata;
+            this.handle = handle;
+        }
+
+        public long ledgerId() {
+            return ledgerId;
+        }
+
+        public OffloadReadSourceState sourceState() {
+            return sourceState;
+        }
+
+        public long lastAddConfirmed() {
+            return lastAddConfirmed;
+        }
+
+        public long length() {
+            return length;
+        }
+
+        public Map<String, String> driverMetadata() {
+            return driverMetadata;
+        }
+
+        public Map<String, String> managedLedgerProperties() {
+            return managedLedgerProperties;
+        }
+
+        /** Exact sealed LedgerInfo from this capture, independent of later native metadata changes. */
+        public byte[] sealedLedgerInfoBytes() {
+            return ledgerMetadata.clone();
+        }
+
+        public boolean usesOffloader(SourceSafeLedgerOffloader expected) {
+            return handle.sourceOffloader() == expected;
+        }
+
+        public boolean isObjectOnly() {
+            return handle.isObjectOnly();
+        }
+
+        public boolean usesBookKeeper(BookKeeper expected) {
+            return bookKeeper == expected;
+        }
+
+        /** One-way local owner fence; this is no M4 terminal or physical-delete authority. */
+        public CompletableFuture<Void> fenceOwnerReadAdmission() {
+            return fenceCapturedReadOwner(this::isCurrent);
+        }
+
+        /** Verifies a fresh stored metadata cut; cached properties and an unacknowledged write are not proof. */
+        public CompletableFuture<Void> verifyStoredMetadata() {
+            CompletableFuture<Void> result = new CompletableFuture<>();
+            try {
+                synchronized (ManagedLedgerImpl.this) {
+                    requireOffloadReadOwner();
+                    if (!isCurrent()) {
+                        throw new ManagedLedgerFencedException("captured native source is stale");
+                    }
+                }
+                store.getManagedLedgerInfo(name, false, new MetaStoreCallback<ManagedLedgerInfo>() {
+                    @Override
+                    public void operationComplete(ManagedLedgerInfo stored, Stat stat) {
+                        try {
+                            Map<String, String> properties = new HashMap<>();
+                            for (int i = 0; i < stored.getPropertiesCount(); i++) {
+                                KeyValue property = stored.getPropertyAt(i);
+                                properties.put(property.getKey(), property.getValue());
+                            }
+                            byte[] storedLedger = null;
+                            for (int i = 0; i < stored.getLedgerInfosCount(); i++) {
+                                LedgerInfo info = stored.getLedgerInfoAt(i);
+                                if (info.getLedgerId() == ledgerId) {
+                                    storedLedger = info.toByteArray();
+                                    break;
+                                }
+                            }
+                            synchronized (ManagedLedgerImpl.this) {
+                                requireOffloadReadOwner();
+                                if (!isCurrent() || stat.getVersion() != sourceState.metadataVersion()
+                                        || !managedLedgerProperties.equals(properties)
+                                        || !Arrays.equals(ledgerMetadata, storedLedger)) {
+                                    throw new ManagedLedgerFencedException(
+                                            "captured native metadata differs from stored source");
+                                }
+                            }
+                            result.complete(null);
+                        } catch (Throwable failure) {
+                            result.completeExceptionally(failure);
+                        }
+                    }
+
+                    @Override
+                    public void operationFailed(MetaStoreException failure) {
+                        result.completeExceptionally(failure);
+                    }
+                });
+            } catch (Throwable failure) {
+                result.completeExceptionally(failure);
+            }
+            return result.copy();
+        }
+
+        public OffloadedReadPriority readPriority() {
+            return handle.readPriority();
+        }
+
+        /** Captures facts from this composite's actual cached Object child, never from a replacement HEAD. */
+        public CompletableFuture<OffloadedReadSourceIdentity> captureOffloadedReadSourceIdentity() {
+            synchronized (ManagedLedgerImpl.this) {
+                try {
+                    requireOffloadReadOwner();
+                    if (!isCurrent()) {
+                        throw new ManagedLedgerFencedException("captured native source is stale");
+                    }
+                    return handle.captureOffloadedReadSourceIdentity(sourceState, this::isCurrent);
+                } catch (Throwable failure) {
+                    return CompletableFuture.failedFuture(failure);
+                }
+            }
+        }
+
+        public CompletableFuture<OffloadedReadMemoryBounds> captureOffloadedReadMemoryBounds() {
+            synchronized (ManagedLedgerImpl.this) {
+                try {
+                    requireOffloadReadOwner();
+                    if (!isCurrent()) {
+                        throw new ManagedLedgerFencedException("captured native source is stale");
+                    }
+                    return handle.captureOffloadedReadMemoryBounds(sourceState, this::isCurrent);
+                } catch (Throwable failure) {
+                    return CompletableFuture.failedFuture(failure);
+                }
+            }
+        }
+
+        /** Verifies this exact cached Object source under registered owner admission and private SDK drain. */
+        public CapturedSourceVerification verifyOwnedObjectSource() {
+            var operation = new CapturedSourceVerification();
+            boolean admissionInvoked = false;
+            synchronized (ManagedLedgerImpl.this) {
+                try {
+                    requireOffloadReadOwner();
+                    if (!isCurrent() || nativeReadAdmission == null) {
+                        throw new ManagedLedgerFencedException("Native verification requires its current read owner");
+                    }
+                    trackOwnedReadDrain(operation.actualDrain);
+                    admissionInvoked = true;
+                    nativeReadAdmission.admitVerification(ledgerId, operation.actualDrain.copy())
+                            .whenComplete((ignored, admissionFailure) -> {
+                                if (admissionFailure != null) {
+                                    operation.actualDrain.complete(null);
+                                    operation.result.completeExceptionally(admissionFailure);
+                                    return;
+                                }
+                                if (!operation.sourceUseOpen.get() || !isCurrent()) {
+                                    operation.actualDrain.complete(null);
+                                    operation.result.completeExceptionally(new ManagedLedgerFencedException(
+                                            "Native verification source use is closed"));
+                                    return;
+                                }
+                                try {
+                                    handle.verifyCapturedObjectSource(sourceState,
+                                            () -> operation.sourceUseOpen.get() && isCurrent())
+                                            .whenComplete((nothing, failure) -> {
+                                                operation.actualDrain.complete(null);
+                                                if (failure == null) {
+                                                    operation.result.complete(null);
+                                                } else {
+                                                    operation.result.completeExceptionally(failure);
+                                                }
+                                            });
+                                } catch (Throwable dispatchFailure) {
+                                    operation.actualDrain.completeExceptionally(dispatchFailure);
+                                    operation.result.completeExceptionally(dispatchFailure);
+                                }
+                            });
+                } catch (Throwable failure) {
+                    if (admissionInvoked) {
+                        operation.actualDrain.completeExceptionally(failure);
+                    } else {
+                        operation.actualDrain.complete(null);
+                    }
+                    operation.result.completeExceptionally(failure);
+                }
+            }
+            return operation;
+        }
+
+        public boolean isCurrent() {
+            synchronized (ManagedLedgerImpl.this) {
+                try {
+                    requireOffloadReadOwner();
+                    LedgerInfo info = ledgers.get(ledgerId);
+                    CompletableFuture<ReadHandle> cached = ledgerCache.get(ledgerId);
+                    return info != null && info.getEntries() - 1 == lastAddConfirmed && info.getSize() == length
+                            && managedLedgerProperties.equals(propertiesMap)
+                            && sourceState.equals(currentOffloadReadSourceState(ledgerId, sourceState.attemptUuid()))
+                            && config.getLedgerOffloader() == handle.sourceOffloader()
+                            && handle.isReadAdmissionOpen()
+                            && handle.readPriority() == config.getLedgerOffloader().getOffloadPolicies()
+                            .getManagedLedgerOffloadedReadPriority()
+                            && cached != null && cached.isDone() && !cached.isCompletedExceptionally()
+                            && cached.getNow(null) == handle;
+                } catch (ManagedLedgerException | RuntimeException stale) {
+                    return false;
+                }
+            }
+        }
+
+        public CompletableFuture<LedgerEntries> readAsync(long firstEntry, long lastEntry) {
+            return readAsync(firstEntry, lastEntry, () -> true);
+        }
+
+        /** The nonblocking gate may be read on SDK callback threads; it only governs new source attempts. */
+        public CompletableFuture<LedgerEntries> readAsync(
+                long firstEntry, long lastEntry, BooleanSupplier sourceUseOpen) {
+            if (nativeReadAdmission != null || nativeReadPreparationView != null) {
+                return CompletableFuture.failedFuture(new ManagedLedgerFencedException(
+                        "registered read owner requires an owned source operation"));
+            }
+            return readCapturedRange(firstEntry, lastEntry, sourceUseOpen);
+        }
+
+        private CompletableFuture<LedgerEntries> readCapturedRange(
+                long firstEntry, long lastEntry, BooleanSupplier sourceUseOpen) {
+            synchronized (ManagedLedgerImpl.this) {
+                try {
+                    requireOffloadReadOwner();
+                    if (!isCurrent()) {
+                        throw new ManagedLedgerFencedException("captured native source is stale");
+                    }
+                    Objects.requireNonNull(sourceUseOpen, "sourceUseOpen");
+                    return handle.readCapturedAsync(firstEntry, lastEntry, sourceState,
+                            () -> sourceUseOpen.getAsBoolean() && isCurrent());
+                } catch (Throwable failure) {
+                    return CompletableFuture.failedFuture(failure);
+                }
+            }
+        }
+
+        public CompletableFuture<CapturedReadBatch> readOwnedAsync(
+                long firstEntry, long lastEntry, CapturedReadLimits limits) {
+            return readOwnedAsync(firstEntry, lastEntry, limits, () -> true);
+        }
+
+        /**
+         * Copies one whole P4 range before releasing its original pin. Public cancellation/completion closes new
+         * source use but never cancels the private SDK completion/cleanup. It is not a source-termination signal.
+         */
+        public CompletableFuture<CapturedReadBatch> readOwnedAsync(
+                long firstEntry, long lastEntry, CapturedReadLimits limits, BooleanSupplier sourceUseOpen) {
+            return readOwnedOperation(firstEntry, lastEntry, limits, sourceUseOpen).result();
+        }
+
+        public CapturedReadOperation readOwnedOperation(
+                long firstEntry, long lastEntry, CapturedReadLimits limits, BooleanSupplier sourceUseOpen) {
+            CapturedReadOperation operation = new CapturedReadOperation();
+            boolean admitted = false;
+            try {
+                requireOwnedRange(firstEntry, lastEntry, lastAddConfirmed, limits, sourceUseOpen);
+                synchronized (ManagedLedgerImpl.this) {
+                    requireOffloadReadOwner();
+                    if (!isCurrent()) {
+                        throw new ManagedLedgerFencedException("captured native source is stale");
+                    }
+                    trackOwnedReadDrain(operation.actualDrain);
+                    admitted = true;
+                    dispatchRegisteredRead(ledgerId, firstEntry, lastEntry, operation.actualDrain, () -> {
+                        try {
+                            readCapturedRange(firstEntry, lastEntry,
+                                    () -> operation.sourceUseOpen.get() && sourceUseOpen.getAsBoolean())
+                                    .whenComplete((entries, failure) -> finishOwnedRead(
+                                            operation, ledgerId, sourceState,
+                                            entries, failure, firstEntry, lastEntry, limits));
+                        } catch (Throwable dispatchFailure) {
+                            failOwnedReadStart(operation, dispatchFailure, true);
+                        }
+                    }, failure -> failOwnedReadStart(operation, failure, false), limits);
+                }
+            } catch (Throwable failure) {
+                failOwnedReadStart(operation, failure, admitted);
+            }
+            return operation;
+        }
+
+    }
+
+    private static void requireOwnedRange(long firstEntry, long lastEntry, long confirmedEntry,
+                                          CapturedReadLimits limits, BooleanSupplier sourceUseOpen) {
+        Objects.requireNonNull(limits, "limits");
+        Objects.requireNonNull(sourceUseOpen, "sourceUseOpen");
+        long count = Math.addExact(Math.subtractExact(lastEntry, firstEntry), 1);
+        if (firstEntry < 0 || lastEntry < firstEntry || lastEntry > confirmedEntry
+                || count > limits.maximumEntries()
+                || count > limits.maximumBatchBytes() / limits.maximumEntryBytes()) {
+            throw new IllegalArgumentException("captured range exceeds its admitted bounds");
+        }
+    }
+
+    private void trackOwnedReadDrain(CompletableFuture<Void> actualDrain) {
+        ordinaryReadOperations.add(actualDrain);
+        actualDrain.whenComplete((ignored, failure) -> {
+            synchronized (this) {
+                if (failure == null && !closeStarted && !offloadReadAdmissionClosed) {
+                    ordinaryReadOperations.remove(actualDrain);
+                }
+            }
+        });
+    }
+
+    private static void failOwnedReadStart(CapturedReadOperation operation, Throwable failure, boolean admitted) {
+        operation.sourceUseOpen.set(false);
+        if (admitted) {
+            // A synchronous SDK dispatch failure cannot assert that no source work was accepted.
+            operation.actualDrain.completeExceptionally(failure);
+        } else {
+            operation.actualDrain.complete(null);
+        }
+        operation.result.completeExceptionally(failure);
+    }
+
+    private static void finishOwnedRead(CapturedReadOperation operation, long ledgerId, OffloadReadSourceState state,
+                                        LedgerEntries entries, Throwable readFailure, long firstEntry, long lastEntry,
+                                        CapturedReadLimits limits) {
+        CapturedReadBatch copied = null;
+        Throwable failure = readFailure;
+        Throwable cleanupFailure = null;
+        try {
+            if (failure == null && operation.sourceUseOpen.get()) {
+                copied = copyOwnedRange(ledgerId, state, entries, firstEntry, lastEntry, limits);
+            }
+        } catch (Throwable copyFailure) {
+            failure = copyFailure;
+        } finally {
+            if (entries != null) {
+                try {
+                    entries.close();
+                } catch (Throwable closeFailure) {
+                    cleanupFailure = closeFailure;
+                    if (failure == null) {
+                        failure = closeFailure;
+                    } else if (failure != closeFailure) {
+                        failure.addSuppressed(closeFailure);
+                    }
+                }
+            }
+        }
+        if (cleanupFailure == null) {
+            operation.actualDrain.complete(null);
+        } else {
+            operation.actualDrain.completeExceptionally(cleanupFailure);
+        }
+        if (failure != null) {
+            operation.result.completeExceptionally(FutureUtil.unwrapCompletionException(failure));
+        } else if (copied != null) {
+            operation.result.complete(copied);
+        } else {
+            operation.result.completeExceptionally(new java.util.concurrent.CancellationException(
+                    "captured source observation no longer admits a result"));
+        }
+    }
+
+    private CompletableFuture<Void> fenceCapturedReadOwner(BooleanSupplier captureCurrent) {
+        synchronized (this) {
+            if (offloadReadFenceFuture != null) {
+                return offloadReadFenceFuture.copy();
+            }
+            try {
+                requireOffloadReadOwner();
+                if (!captureCurrent.getAsBoolean()) {
+                    throw new ManagedLedgerFencedException("captured native source is stale");
+                }
+                offloadReadAdmissionClosed = true;
+                offloadReadFenceFuture = new CompletableFuture<>();
+                List<CompletableFuture<Void>> accepted = new ArrayList<>(ordinaryReadOperations);
+                ledgerCache.forEach((id, ignored) -> invalidateReadHandle(id));
+                accepted.addAll(readHandleCloses.keySet());
+                CompletableFuture.allOf(accepted.toArray(CompletableFuture[]::new))
+                        .whenComplete((ignored, failure) -> {
+                            if (failure == null) {
+                                offloadReadFenceFuture.complete(null);
+                            } else {
+                                offloadReadFenceFuture.completeExceptionally(failure);
+                            }
+                        });
+                return offloadReadFenceFuture.copy();
+            } catch (Throwable failure) {
+                return CompletableFuture.failedFuture(failure);
+            }
+        }
+    }
+
+    private static CapturedReadBatch copyOwnedRange(
+            long ledgerId, OffloadReadSourceState sourceState, LedgerEntries entries,
+            long firstEntry, long lastEntry, CapturedReadLimits limits) {
+        List<CapturedReadEntry> copied = new ArrayList<>();
+        long expected = firstEntry;
+        long bytes = 0;
+        for (LedgerEntry entry : entries) {
+            // BK's authenticated header length is cumulative ledger length, not this entry's payload size.
+            long length = entry.getEntryBuffer().readableBytes();
+            bytes = Math.addExact(bytes, length);
+            if (entry.getLedgerId() != ledgerId || entry.getEntryId() != expected || expected > lastEntry
+                    || length > limits.maximumEntryBytes() || bytes > limits.maximumBatchBytes()) {
+                throw new IllegalStateException("captured range differs from its identity or byte bounds");
+            }
+            byte[] payload = new byte[Math.toIntExact(length)];
+            entry.getEntryBuffer().getBytes(entry.getEntryBuffer().readerIndex(), payload);
+            copied.add(new CapturedReadEntry(expected, payload));
+            expected = Math.addExact(expected, 1);
+        }
+        if (expected != Math.addExact(lastEntry, 1)) {
+            throw new IllegalStateException("captured range is incomplete");
+        }
+        return new CapturedReadBatch(ledgerId, sourceState, copied, bytes);
     }
 
     CompletableFuture<ReadHandle> getLedgerHandle(long ledgerId) {
+        if (offloadReadAdmissionClosed) {
+            return CompletableFuture.failedFuture(
+                    new ManagedLedgerFencedException("Native owner read admission is closed"));
+        }
+        if (STATE_UPDATER.get(this) == State.Closed) {
+            return CompletableFuture.failedFuture(new ManagedLedgerAlreadyClosedException("Managed ledger is closed"));
+        }
         CompletableFuture<ReadHandle> ledgerHandle = ledgerCache.get(ledgerId);
         if (ledgerHandle != null) {
             return ledgerHandle;
         }
 
+        if (nativeReadAdmission != null) {
+            return CompletableFuture.failedFuture(new ManagedLedgerFencedException(
+                    "registered read owner requires a captured source handle"));
+        }
+
+        return getOrOpenLedgerHandle(ledgerId);
+    }
+
+    private synchronized CompletableFuture<ReadHandle> getOrOpenLedgerHandle(long ledgerId) {
+        return getOrOpenLedgerHandle(ledgerId, false);
+    }
+
+    private synchronized CompletableFuture<ReadHandle> getOrOpenLedgerHandle(long ledgerId, boolean objectOnly) {
+        return getOrOpenLedgerHandle(ledgerId, objectOnly, null);
+    }
+
+    private synchronized CompletableFuture<ReadHandle> getOrOpenLedgerHandle(
+            long ledgerId, boolean objectOnly, OffloadedReadSourceIdentity expected) {
+        CapturedNativeReadView preparation = nativeReadPreparationView;
+        if (preparation != null && nativeReadAdmission == null
+                && (!preparation.isCurrent() || !preparation.infos.containsKey(ledgerId))) {
+            return CompletableFuture.failedFuture(
+                    new ManagedLedgerFencedException("Native source opening is outside its prepared cut"));
+        }
+        if (offloadReadAdmissionClosed) {
+            return CompletableFuture.failedFuture(
+                    new ManagedLedgerFencedException("Native owner read admission is closed"));
+        }
+        if (STATE_UPDATER.get(this) == State.Closed) {
+            return CompletableFuture.failedFuture(new ManagedLedgerAlreadyClosedException("Managed ledger is closed"));
+        }
         // If not present try again and create if necessary
         return ledgerCache.computeIfAbsent(ledgerId, lid -> {
             // Open the ledger for reading if it was not already opened
@@ -2253,7 +3786,10 @@ public class ManagedLedgerImpl implements ManagedLedger, CreateCallback {
                     && info.getOffloadContext().isComplete()
                     && isSourceSafeBookKeeperDeletion(info)
                     && config.getLedgerOffloader() instanceof SourceSafeLedgerOffloader sourceSafeOffloader) {
-                openFuture = openSourceSafeReadHandle(ledgerId, info, sourceSafeOffloader);
+                openFuture = openSourceSafeReadHandle(ledgerId, info, sourceSafeOffloader, objectOnly, expected);
+            } else if (objectOnly) {
+                openFuture = CompletableFuture.failedFuture(new ManagedLedgerFencedException(
+                        "Object-only capture requires a complete source-safe offload"));
             } else if (config.getLedgerOffloader() != null
                     && config.getLedgerOffloader().getOffloadPolicies() != null
                     && config.getLedgerOffloader().getOffloadPolicies()
@@ -2295,7 +3831,8 @@ public class ManagedLedgerImpl implements ManagedLedger, CreateCallback {
     }
 
     private CompletableFuture<ReadHandle> openSourceSafeReadHandle(
-            long ledgerId, LedgerInfo info, SourceSafeLedgerOffloader offloader) {
+            long ledgerId, LedgerInfo info, SourceSafeLedgerOffloader offloader, boolean objectOnly,
+            OffloadedReadSourceIdentity expected) {
         UUID uid = new UUID(info.getOffloadContext().getUidMsb(), info.getOffloadContext().getUidLsb());
         Map<String, String> offloadDriverMetadata = OffloadUtils.getOffloadDriverMetadata(info);
         offloadDriverMetadata.put("ManagedLedgerName", name);
@@ -2308,14 +3845,16 @@ public class ManagedLedgerImpl implements ManagedLedger, CreateCallback {
                 () -> currentOffloadReadSourceState(ledgerId, uid),
                 priority,
                 pinRegistry,
-                () -> offloader.readOffloaded(ledgerId, uid, offloadDriverMetadata),
+                () -> expected == null ? offloader.readOffloaded(ledgerId, uid, offloadDriverMetadata)
+                        : offloader.readOffloadedCaptured(ledgerId, uid, offloadDriverMetadata, expected),
                 () -> bookKeeper.newOpenLedgerOp()
                         .withRecovery(!isReadOnly())
                         .withLedgerId(ledgerId)
                         .withDigestType(config.getDigestType())
                         .withPassword(config.getPassword())
                         .withLoggerContext(log)
-                        .execute());
+                        .execute(),
+                objectOnly);
     }
 
     private synchronized OffloadReadSourceState currentOffloadReadSourceState(long ledgerId, UUID expectedUid) {
@@ -2350,29 +3889,38 @@ public class ManagedLedgerImpl implements ManagedLedger, CreateCallback {
         return new OffloadReadSourceState(metadataVersion, currentUid, context.isComplete(), deleteState);
     }
 
-    void invalidateReadHandle(long ledgerId) {
+    synchronized void invalidateReadHandle(long ledgerId) {
         CompletableFuture<ReadHandle> rhf = ledgerCache.remove(ledgerId);
         LedgerReadSourcePinRegistry pinRegistry = offloadReadSourcePins.get(ledgerId);
         if (rhf != null) {
-            rhf.thenCompose(r -> {
-                if (r instanceof OffloadedLedgerHandle) {
-                    log.info().attr("ledgerId", ledgerId)
-                            .attr("driver", config.getLedgerOffloader().getOffloadDriverName())
-                            .log("Closing ledger from offload driver");
-                }
-                return r.closeAsync().exceptionally(ex -> {
-                    log.warn().attr("ledgerId", ledgerId)
-                            .attr("type", r.getClass().getName()).exception(ex)
-                            .log("Failed to close ledger ReadHandle");
-                    return null;
-                });
-            }).exceptionally(ex -> {
-                log.warn().attr("ledgerId", ledgerId).exception(ex).log("Failed to close Ledger ReadHandle");
-                return null;
-            }).whenComplete((ignored, failure) -> releasePinRegistryAfterInvalidation(ledgerId, pinRegistry));
+            closeReadHandle(ledgerId, rhf, pinRegistry);
         } else {
             releasePinRegistryAfterInvalidation(ledgerId, pinRegistry);
         }
+    }
+
+    private synchronized CompletableFuture<Void> closeReadHandle(long ledgerId,
+            CompletableFuture<ReadHandle> handleFuture, LedgerReadSourcePinRegistry pinRegistry) {
+        CompletableFuture<Void> result = new CompletableFuture<>();
+        readHandleCloses.put(result, ledgerId);
+        handleFuture.handle((handle, openFailure) -> {
+            if (openFailure != null) {
+                return CompletableFuture.<Void>completedFuture(null);
+            }
+            return handle.closeAsync();
+        }).thenCompose(future -> future).whenComplete((ignored, failure) -> {
+            if (failure == null) {
+                synchronized (this) {
+                    readHandleCloses.remove(result);
+                    releasePinRegistryAfterInvalidation(ledgerId, pinRegistry);
+                }
+                result.complete(null);
+            } else {
+                log.warn().attr("ledgerId", ledgerId).exception(failure).log("Failed to close ledger ReadHandle");
+                result.completeExceptionally(failure);
+            }
+        });
+        return result;
     }
 
     private synchronized void releasePinRegistryAfterInvalidation(
@@ -2380,6 +3928,7 @@ public class ManagedLedgerImpl implements ManagedLedger, CreateCallback {
         if (pinRegistry == null
                 || pinRegistry.pinCount() != 0
                 || ledgerCache.get(ledgerId) != null
+                || readHandleCloses.containsValue(ledgerId)
                 || sourceSafeBookKeeperDeletions.contains(ledgerId)) {
             return;
         }
@@ -2393,19 +3942,19 @@ public class ManagedLedgerImpl implements ManagedLedger, CreateCallback {
         offloadReadSourcePins.remove(ledgerId, pinRegistry);
     }
 
-    public void invalidateLedgerHandle(ReadHandle ledgerHandle) {
+    public synchronized void invalidateLedgerHandle(ReadHandle ledgerHandle) {
         long ledgerId = ledgerHandle.getId();
         LedgerHandle currentLedger = this.currentLedger;
 
-        if (currentLedger != null && ledgerId != currentLedger.getId()) {
+        if (currentLedger == null || ledgerId != currentLedger.getId()) {
             // remove handle from ledger cache since we got a (read) error
-            ledgerCache.remove(ledgerId);
-            log.debug().attr("ledgerId", ledgerId).log("Removed ledger read handle from cache");
-            ledgerHandle.closeAsync()
-                    .exceptionally(ex -> {
-                        log.warn().exception(ex).log("Failed to close a Ledger ReadHandle");
-                        return null;
-                    });
+            CompletableFuture<ReadHandle> cached = ledgerCache.get(ledgerId);
+            if (cached != null && cached.isDone() && !cached.isCompletedExceptionally()
+                    && cached.getNow(null) == ledgerHandle && ledgerCache.remove(ledgerId, cached)) {
+                log.debug().attr("ledgerId", ledgerId).log("Removed ledger read handle from cache");
+            }
+            closeReadHandle(ledgerId, CompletableFuture.completedFuture(ledgerHandle),
+                    offloadReadSourcePins.get(ledgerId));
         } else {
             log.debug("Ledger that encountered read error is current ledger");
         }
@@ -2413,10 +3962,20 @@ public class ManagedLedgerImpl implements ManagedLedger, CreateCallback {
 
     @Override
     public void asyncReadEntry(Position position, ReadEntryCallback callback, Object ctx) {
+        if (offloadReadAdmissionClosed) {
+            callback.readEntryFailed(new ManagedLedgerFencedException("Native owner read admission is closed"), ctx);
+            return;
+        }
+        if (STATE_UPDATER.get(this) == State.Closed) {
+            callback.readEntryFailed(new ManagedLedgerAlreadyClosedException("Managed ledger is closed"), ctx);
+            return;
+        }
         LedgerHandle currentLedger = this.currentLedger;
         log.debug().attr("ledgerId", position.getLedgerId())
                 .attr("entryId", position.getEntryId()).log("Reading entry");
-        if (position.getLedgerId() == currentLedger.getId()) {
+        if (ledgers.containsKey(position.getLedgerId()) && hasPreferredReadSource(position.getLedgerId())) {
+            asyncReadEntry(null, position, callback, ctx);
+        } else if (position.getLedgerId() == currentLedger.getId()) {
             asyncReadEntry(currentLedger, position, callback, ctx);
         } else if (ledgers.containsKey(position.getLedgerId())) {
             getLedgerHandle(position.getLedgerId()).thenAccept(ledger -> asyncReadEntry(ledger, position, callback,
@@ -2438,6 +3997,11 @@ public class ManagedLedgerImpl implements ManagedLedger, CreateCallback {
     }
 
     private void internalReadFromLedger(ReadHandle ledger, OpReadEntry opReadEntry) {
+        internalReadFromLedger(ledger.getId(), ledger.getLastAddConfirmed(), ledger, opReadEntry);
+    }
+
+    private void internalReadFromLedger(long ledgerId, long lastAddConfirmed, ReadHandle ledger,
+                                        OpReadEntry opReadEntry) {
 
         if (opReadEntry.readPosition.compareTo(opReadEntry.maxPosition) > 0) {
             opReadEntry.checkReadCompletion();
@@ -2449,34 +4013,34 @@ public class ManagedLedgerImpl implements ManagedLedger, CreateCallback {
 
         Position lastPosition = lastConfirmedEntry;
 
-        if (ledger.getId() == lastPosition.getLedgerId()) {
+        if (ledgerId == lastPosition.getLedgerId()) {
             // For the current ledger, we only give read visibility to the last entry we have received a confirmation in
             // the managed ledger layer
             lastEntryInLedger = lastPosition.getEntryId();
         } else {
             // For other ledgers, already closed the BK lastAddConfirmed is appropriate
-            lastEntryInLedger = ledger.getLastAddConfirmed();
+            lastEntryInLedger = lastAddConfirmed;
         }
 
         // can read max position entryId
-        if (ledger.getId() == opReadEntry.maxPosition.getLedgerId()) {
+        if (ledgerId == opReadEntry.maxPosition.getLedgerId()) {
             lastEntryInLedger = min(opReadEntry.maxPosition.getEntryId(), lastEntryInLedger);
         }
 
         if (firstEntry > lastEntryInLedger) {
-            log.debug().attr("ledgerId", ledger.getId())
+            log.debug().attr("ledgerId", ledgerId)
                     .attr("lastEntry", lastEntryInLedger)
                     .attr("readEntry", firstEntry)
                     .log("No more messages to read from ledger");
 
-            if (currentLedger == null || ledger.getId() != currentLedger.getId()) {
+            if (currentLedger == null || ledgerId != currentLedger.getId()) {
                 // Cursor was placed past the end of one ledger, move it to the
                 // beginning of the next ledger
-                Long nextLedgerId = ledgers.ceilingKey(ledger.getId() + 1);
+                Long nextLedgerId = ledgers.ceilingKey(ledgerId + 1);
                 if (nextLedgerId != null) {
                     opReadEntry.updateReadPosition(PositionFactory.create(nextLedgerId, 0));
                 } else {
-                    opReadEntry.updateReadPosition(PositionFactory.create(ledger.getId() + 1, 0));
+                    opReadEntry.updateReadPosition(PositionFactory.create(ledgerId + 1, 0));
                 }
             } else {
                 opReadEntry.updateReadPosition(opReadEntry.readPosition);
@@ -2486,7 +4050,17 @@ public class ManagedLedgerImpl implements ManagedLedger, CreateCallback {
             return;
         }
 
-        long lastEntry = min(firstEntry + opReadEntry.getNumberOfEntriesToRead() - 1, lastEntryInLedger);
+        int count = opReadEntry.getNumberOfEntriesToRead();
+        NativeReadAdmission admission = nativeReadAdmission;
+        if (admission != null) {
+            count = min(count, admission.maximumReadEntries());
+            if (count <= 0) {
+                opReadEntry.readEntriesFailed(new ManagedLedgerFencedException("Native read capacity is unavailable"),
+                        opReadEntry.ctx);
+                return;
+            }
+        }
+        long lastEntry = min(firstEntry + count - 1, lastEntryInLedger);
 
         // Filer out and skip unnecessary read entry
         if (opReadEntry.skipCondition != null) {
@@ -2494,7 +4068,7 @@ public class ManagedLedgerImpl implements ManagedLedger, CreateCallback {
             long lastValidEntry = -1L;
             long entryId = firstEntry;
             for (; entryId <= lastEntry; entryId++) {
-                if (opReadEntry.skipCondition.test(PositionFactory.create(ledger.getId(), entryId))) {
+                if (opReadEntry.skipCondition.test(PositionFactory.create(ledgerId, entryId))) {
                     if (firstValidEntry != -1L) {
                         break;
                     }
@@ -2510,7 +4084,7 @@ public class ManagedLedgerImpl implements ManagedLedger, CreateCallback {
             // If all messages in [firstEntry...lastEntry] are filter out,
             // then manual call internalReadEntriesComplete to advance read position.
             if (firstValidEntry == -1L) {
-                final var nextReadPosition = PositionFactory.create(ledger.getId(), lastEntry).getNext();
+                final var nextReadPosition = PositionFactory.create(ledgerId, lastEntry).getNext();
                 opReadEntry.updateReadPosition(nextReadPosition);
                 opReadEntry.checkReadCompletion();
                 return;
@@ -2520,14 +4094,22 @@ public class ManagedLedgerImpl implements ManagedLedger, CreateCallback {
             lastEntry = lastValidEntry;
         }
 
-        log.debug().attr("ledgerId", ledger.getId())
+        log.debug().attr("ledgerId", ledgerId)
                 .attr("firstEntry", firstEntry)
                 .attr("lastEntry", lastEntry)
                 .log("Reading entries from ledger");
-        asyncReadEntry(ledger, firstEntry, lastEntry, opReadEntry, opReadEntry.ctx);
+        if (ledger != null) {
+            asyncReadEntry(ledger, firstEntry, lastEntry, opReadEntry, opReadEntry.ctx);
+        } else {
+            asyncReadEntry(ledgerId, null, firstEntry, lastEntry, opReadEntry, opReadEntry.ctx);
+        }
     }
 
     protected void asyncReadEntry(ReadHandle ledger, Position position, ReadEntryCallback callback, Object ctx) {
+        if (STATE_UPDATER.get(this) == State.Closed) {
+            callback.readEntryFailed(new ManagedLedgerAlreadyClosedException("Managed ledger is closed"), ctx);
+            return;
+        }
         mbean.addEntriesRead(1);
         if (config.getReadEntryTimeoutSeconds() > 0) {
             // set readOpCount to uniquely validate if ReadEntryCallbackWrapper is already recycled
@@ -2536,25 +4118,339 @@ public class ManagedLedgerImpl implements ManagedLedger, CreateCallback {
             ReadEntryCallbackWrapper readCallback = ReadEntryCallbackWrapper.create(name, position.getLedgerId(),
                     position.getEntryId(), callback, readOpCount, createdTime, ctx);
             lastReadCallback = readCallback;
-            entryCache.asyncReadEntry(ledger, position, readCallback, readOpCount);
+            readOrdinaryEntry(ledger, position, readCallback, readOpCount);
         } else {
-            entryCache.asyncReadEntry(ledger, position, callback, ctx);
+            readOrdinaryEntry(ledger, position, callback, ctx);
         }
     }
 
     protected void asyncReadEntry(ReadHandle ledger, long firstEntry, long lastEntry, OpReadEntry opReadEntry,
             Object ctx) {
+        asyncReadEntry(ledger.getId(), ledger, firstEntry, lastEntry, opReadEntry, ctx);
+    }
+
+    private void asyncReadEntry(long ledgerId, ReadHandle ledger, long firstEntry, long lastEntry,
+                                OpReadEntry opReadEntry, Object ctx) {
+        if (STATE_UPDATER.get(this) == State.Closed) {
+            opReadEntry.readEntriesFailed(new ManagedLedgerAlreadyClosedException("Managed ledger is closed"), ctx);
+            return;
+        }
         IntSupplier expectedReadCount = opReadEntry.cursor::getNumberOfCursorsAtSamePositionOrBefore;
         if (config.getReadEntryTimeoutSeconds() > 0) {
             // set readOpCount to uniquely validate if ReadEntryCallbackWrapper is already recycled
             long readOpCount = READ_OP_COUNT_UPDATER.incrementAndGet(this);
             long createdTime = System.nanoTime();
-            ReadEntryCallbackWrapper readCallback = ReadEntryCallbackWrapper.create(name, ledger.getId(), firstEntry,
+            ReadEntryCallbackWrapper readCallback = ReadEntryCallbackWrapper.create(name, ledgerId, firstEntry,
                     opReadEntry, readOpCount, createdTime, ctx);
             lastReadCallback = readCallback;
-            entryCache.asyncReadEntry(ledger, firstEntry, lastEntry, expectedReadCount, readCallback, readOpCount);
+            readOrdinaryEntries(ledgerId, ledger, firstEntry, lastEntry, expectedReadCount, readCallback, readOpCount);
         } else {
-            entryCache.asyncReadEntry(ledger, firstEntry, lastEntry, expectedReadCount, opReadEntry, ctx);
+            readOrdinaryEntries(ledgerId, ledger, firstEntry, lastEntry, expectedReadCount, opReadEntry, ctx);
+        }
+    }
+
+    private void readOrdinaryEntry(ReadHandle ledger, Position position, ReadEntryCallback callback, Object ctx) {
+        OrdinaryReadOperation operation = null;
+        try {
+            operation = admitOrdinaryRead(callback, null);
+            if (operation == null) {
+                entryCache.asyncReadEntry(ledger, position, callback, ctx);
+            } else {
+                OrdinaryReadOperation accepted = operation;
+                dispatchRegisteredRead(position.getLedgerId(), position.getEntryId(), position.getEntryId(),
+                        accepted.result,
+                        () -> {
+                            if (hasPreferredReadSource(position.getLedgerId())) {
+                                readPreferredOrdinary(position.getLedgerId(), position.getEntryId(),
+                                        position.getEntryId(),
+                                        accepted, ctx, () -> 1);
+                            } else {
+                                entryCache.asyncReadEntry(ledger, position, accepted, ctx);
+                            }
+                        },
+                        failure -> accepted.readEntryFailed(
+                                ManagedLedgerException.getManagedLedgerException(failure), ctx));
+            }
+        } catch (Throwable failure) {
+            (operation == null ? callback : operation).readEntryFailed(
+                    ManagedLedgerException.getManagedLedgerException(failure), ctx);
+        }
+    }
+
+    private void readOrdinaryEntries(long ledgerId, ReadHandle ledger, long firstEntry, long lastEntry,
+                                     IntSupplier expectedReadCount, ReadEntriesCallback callback, Object ctx) {
+        OrdinaryReadOperation operation = null;
+        try {
+            operation = admitOrdinaryRead(null, callback);
+            if (operation == null) {
+                entryCache.asyncReadEntry(ledger, firstEntry, lastEntry, expectedReadCount, callback, ctx);
+            } else {
+                OrdinaryReadOperation accepted = operation;
+                dispatchRegisteredRead(ledgerId, firstEntry, lastEntry, accepted.result,
+                        () -> {
+                            if (hasPreferredReadSource(ledgerId)) {
+                                readPreferredOrdinary(ledgerId, firstEntry, lastEntry, accepted, ctx,
+                                        expectedReadCount);
+                            } else {
+                                entryCache.asyncReadEntry(ledger, firstEntry, lastEntry,
+                                        expectedReadCount, accepted, ctx);
+                            }
+                        },
+                        failure -> accepted.readEntriesFailed(
+                                ManagedLedgerException.getManagedLedgerException(failure), ctx));
+            }
+        } catch (Throwable failure) {
+            (operation == null ? callback : operation).readEntriesFailed(
+                    ManagedLedgerException.getManagedLedgerException(failure), ctx);
+        }
+    }
+
+    private boolean hasPreferredReadSource(long ledgerId) {
+        NativeReadAdmission admission = nativeReadAdmission;
+        return admission != null && admission.hasPreferredReadSource(ledgerId);
+    }
+
+    private void readPreferredOrdinary(long ledgerId, long firstEntry, long lastEntry,
+                                       OrdinaryReadOperation accepted, Object ctx, IntSupplier expectedReadCount) {
+        NativeReadAdmission admission = Objects.requireNonNull(nativeReadAdmission, "preferred Native owner");
+        var operation = admission.readPreferred(ledgerId, firstEntry, lastEntry,
+                (first, last) -> readRetainedPreferredRange(ledgerId, first, last, expectedReadCount));
+        accepted.backendDrain = operation.drained().toCompletableFuture();
+        operation.result().whenComplete((entries, failure) -> {
+            if (failure != null) {
+                failPreferredOrdinary(accepted, failure, ctx);
+                return;
+            }
+            try {
+                Objects.requireNonNull(entries, "preferred Native entries");
+                if (entries.size() != lastEntry - firstEntry + 1) {
+                    throw new IllegalStateException("preferred Native range is incomplete");
+                }
+                for (int i = 0; i < entries.size(); i++) {
+                    Entry entry = entries.get(i);
+                    if (!(entry instanceof EntryImpl) || entry.getLedgerId() != ledgerId
+                            || entry.getEntryId() != firstEntry + i) {
+                        throw new IllegalStateException("preferred Native range changed its position");
+                    }
+                }
+                synchronized (this) {
+                    requireOffloadReadOwner();
+                    if (closeStarted || nativeReadAdmission != admission || !admission.sourceUseOpen()) {
+                        throw new ManagedLedgerFencedException("preferred Native owner stopped during read");
+                    }
+                }
+            } catch (Throwable rejected) {
+                if (entries != null) {
+                    entries.forEach(Entry::release);
+                }
+                failPreferredOrdinary(accepted, rejected, ctx);
+                return;
+            }
+            if (accepted.entryCallback != null) {
+                accepted.readEntryComplete(entries.get(0), ctx);
+            } else {
+                accepted.readEntriesComplete(entries, ctx);
+            }
+        });
+    }
+
+    private static void failPreferredOrdinary(OrdinaryReadOperation accepted, Throwable failure, Object ctx) {
+        var error = ManagedLedgerException.getManagedLedgerException(FutureUtil.unwrapCompletionException(failure));
+        if (accepted.entryCallback != null) {
+            accepted.readEntryFailed(error, ctx);
+        } else {
+            accepted.readEntriesFailed(error, ctx);
+        }
+    }
+
+    /** Retained segments use the existing Native cache/SDK path under the already admitted outer operation. */
+    private CompletionStage<List<Entry>> readRetainedPreferredRange(long ledgerId, long firstEntry, long lastEntry,
+                                                                   IntSupplier expectedReadCount) {
+        var result = new CompletableFuture<List<Entry>>();
+        LedgerHandle writer = currentLedger;
+        CompletableFuture<ReadHandle> opened = writer != null && writer.getId() == ledgerId
+                ? CompletableFuture.completedFuture(writer) : getLedgerHandle(ledgerId);
+        opened.whenComplete((handle, openFailure) -> {
+            if (openFailure != null) {
+                result.completeExceptionally(FutureUtil.unwrapCompletionException(openFailure));
+                return;
+            }
+            try {
+                synchronized (this) {
+                    requireOffloadReadOwner();
+                    if (closeStarted) {
+                        throw new ManagedLedgerAlreadyClosedException("Managed ledger is closing");
+                    }
+                }
+                entryCache.asyncReadEntry(handle, firstEntry, lastEntry, expectedReadCount, new ReadEntriesCallback() {
+                    @Override
+                    public void readEntriesComplete(List<Entry> entries, Object ignored) {
+                        if (!result.complete(entries)) {
+                            entries.forEach(Entry::release);
+                        }
+                    }
+
+                    @Override
+                    public void readEntriesFailed(ManagedLedgerException failure, Object ignored) {
+                        result.completeExceptionally(failure);
+                    }
+                }, null);
+            } catch (Throwable failure) {
+                result.completeExceptionally(failure);
+            }
+        });
+        return result.minimalCompletionStage();
+    }
+
+    private void dispatchRegisteredRead(long ledgerId, long firstEntry, long lastEntry,
+                                        CompletableFuture<Void> actualCleanup, Runnable dispatch,
+                                        Consumer<Throwable> rejected) {
+        dispatchRegisteredRead(ledgerId, firstEntry, lastEntry, actualCleanup, dispatch, rejected, null);
+    }
+
+    private void dispatchRegisteredRead(long ledgerId, long firstEntry, long lastEntry,
+                                        CompletableFuture<Void> actualCleanup, Runnable dispatch,
+                                        Consumer<Throwable> rejected, CapturedReadLimits ownedLimits) {
+        NativeReadAdmission admission = nativeReadAdmission;
+        if (admission == null) {
+            if (nativeReadPreparationView != null) {
+                rejected.accept(new ManagedLedgerFencedException("Native source preparation has no read grant"));
+                return;
+            }
+            dispatch.run();
+            return;
+        }
+        try {
+            CompletionStage<Void> admitted = ownedLimits == null
+                    ? admission.admitRead(ledgerId, firstEntry, lastEntry, actualCleanup.copy())
+                    : admission.admitOwnedRead(ledgerId, firstEntry, lastEntry, ownedLimits.maximumEntryBytes(),
+                            ownedLimits.maximumBatchBytes(), actualCleanup.copy());
+            Objects.requireNonNull(admitted,
+                    "native read admission stage").whenComplete((ignored, failure) -> {
+                if (failure != null) {
+                    rejected.accept(FutureUtil.unwrapCompletionException(failure));
+                    return;
+                }
+                try {
+                    synchronized (this) {
+                        requireOffloadReadOwner();
+                        if (closeStarted) {
+                            throw new ManagedLedgerAlreadyClosedException("Managed ledger is closing");
+                        }
+                    }
+                    dispatch.run();
+                } catch (Throwable dispatchFailure) {
+                    rejected.accept(dispatchFailure);
+                }
+            });
+        } catch (Throwable failure) {
+            rejected.accept(failure);
+        }
+    }
+
+    private synchronized OrdinaryReadOperation admitOrdinaryRead(
+            ReadEntryCallback entryCallback, ReadEntriesCallback entriesCallback) throws ManagedLedgerException {
+        if (!(config.getLedgerOffloader() instanceof SourceSafeLedgerOffloader)) {
+            return null;
+        }
+        requireOffloadReadOwner();
+        if (closeStarted) {
+            throw new ManagedLedgerAlreadyClosedException("Managed ledger is closing");
+        }
+        OrdinaryReadOperation operation = new OrdinaryReadOperation(entryCallback, entriesCallback);
+        ordinaryReadOperations.add(operation.result);
+        operation.result.whenComplete((ignored, failure) -> {
+            synchronized (ManagedLedgerImpl.this) {
+                // Writer close may defer the child snapshot until after this callback returns or fails.
+                if (!closeStarted && !offloadReadAdmissionClosed) {
+                    ordinaryReadOperations.remove(operation.result);
+                }
+            }
+        });
+        return operation;
+    }
+
+    private final class OrdinaryReadOperation implements ReadEntryCallback, ReadEntriesCallback {
+        private final ReadEntryCallback entryCallback;
+        private final ReadEntriesCallback entriesCallback;
+        private final CompletableFuture<Void> result = new CompletableFuture<>();
+        private final AtomicBoolean delivered = new AtomicBoolean();
+        private CompletableFuture<Void> backendDrain = CompletableFuture.completedFuture(null);
+
+        private OrdinaryReadOperation(ReadEntryCallback entryCallback, ReadEntriesCallback entriesCallback) {
+            this.entryCallback = entryCallback;
+            this.entriesCallback = entriesCallback;
+        }
+
+        @Override
+        public void readEntryComplete(Entry entry, Object ctx) {
+            deliver(List.of(entry), ctx, () -> entryCallback.readEntryComplete(entry, ctx));
+        }
+
+        @Override
+        public void readEntriesComplete(List<Entry> entries, Object ctx) {
+            deliver(entries, ctx, () -> entriesCallback.readEntriesComplete(entries, ctx));
+        }
+
+        @Override
+        public void readEntryFailed(ManagedLedgerException failure, Object ctx) {
+            deliver(List.of(), ctx, () -> entryCallback.readEntryFailed(failure, ctx));
+        }
+
+        @Override
+        public void readEntriesFailed(ManagedLedgerException failure, Object ctx) {
+            deliver(List.of(), ctx, () -> entriesCallback.readEntriesFailed(failure, ctx));
+        }
+
+        private void deliver(List<Entry> entries, Object ctx, Runnable callback) {
+            if (!delivered.compareAndSet(false, true)) {
+                entries.forEach(Entry::release);
+                return;
+            }
+            List<CompletableFuture<Void>> buffers = new ArrayList<>(entries.size());
+            List<Entry> retained = new ArrayList<>(entries.size());
+            Throwable failure = null;
+            boolean callbackEntered = false;
+            try {
+                for (Entry entry : entries) {
+                    // Keep the Entry alive while its callback may release its transferred reference.
+                    ((EntryImpl) entry).retain();
+                    retained.add(entry);
+                    CompletableFuture<Void> released = new CompletableFuture<>();
+                    ((EntryImpl) entry).onDataBufferReleased(() -> released.complete(null));
+                    buffers.add(released);
+                }
+                callbackEntered = true;
+                callback.run();
+            } catch (Throwable error) {
+                failure = error;
+                if (!callbackEntered) {
+                    entries.forEach(Entry::release);
+                    try {
+                        ManagedLedgerException readFailure = ManagedLedgerException.getManagedLedgerException(error);
+                        if (entryCallback != null) {
+                            entryCallback.readEntryFailed(readFailure, ctx);
+                        } else {
+                            entriesCallback.readEntriesFailed(readFailure, ctx);
+                        }
+                    } catch (Throwable notificationFailure) {
+                        error.addSuppressed(notificationFailure);
+                    }
+                }
+            } finally {
+                retained.forEach(Entry::release);
+                Throwable callbackFailure = failure;
+                buffers.add(backendDrain);
+                CompletableFuture.allOf(buffers.toArray(CompletableFuture[]::new)).whenComplete((ignored, error) -> {
+                    if (callbackFailure != null) {
+                        result.completeExceptionally(callbackFailure);
+                    } else if (error != null) {
+                        result.completeExceptionally(error);
+                    } else {
+                        result.complete(null);
+                    }
+                });
+            }
         }
     }
 
@@ -3673,6 +5569,10 @@ public class ManagedLedgerImpl implements ManagedLedger, CreateCallback {
         driverMetadata.put("ManagedLedgerName", name);
         LedgerReadSourcePinRegistry pinRegistry;
         synchronized (this) {
+            if (nativeReadPreparationView != null || nativeReadAdmission != null) {
+                return CompletableFuture.failedFuture(new OffloadConflict(
+                        "M5 source-managed Native deletion requires physical authority"));
+            }
             if (!sourceSafeBookKeeperDeletions.add(ledgerId)) {
                 return CompletableFuture.failedFuture(new OffloadConflict(
                         "Source-safe BookKeeper deletion is already running for ledger " + ledgerId));
@@ -3729,21 +5629,33 @@ public class ManagedLedgerImpl implements ManagedLedger, CreateCallback {
         return bounded;
     }
 
-    private CompletableFuture<Void> closeCachedBookKeeperSource(long ledgerId) {
+    private synchronized CompletableFuture<Void> closeCachedBookKeeperSource(long ledgerId) {
+        List<CompletableFuture<Void>> closes = new ArrayList<>();
+        readHandleCloses.forEach((close, id) -> {
+            if (id == ledgerId) {
+                closes.add(close);
+            }
+        });
+        return Futures.waitForAll(closes).thenCompose(ignored -> closeCurrentCachedBookKeeperSource(ledgerId));
+    }
+
+    private synchronized CompletableFuture<Void> closeCurrentCachedBookKeeperSource(long ledgerId) {
         CompletableFuture<ReadHandle> cached = ledgerCache.get(ledgerId);
         if (cached == null) {
             return CompletableFuture.completedFuture(null);
         }
         return cached.handle((handle, openFailure) -> {
-            if (openFailure != null) {
+            synchronized (this) {
+                if (openFailure != null) {
+                    ledgerCache.remove(ledgerId, cached);
+                    return CompletableFuture.<Void>completedFuture(null);
+                }
+                if (handle instanceof DualSourceReadHandle dualSource) {
+                    return dualSource.closeBookKeeperSource();
+                }
                 ledgerCache.remove(ledgerId, cached);
-                return CompletableFuture.<Void>completedFuture(null);
+                return closeReadHandle(ledgerId, cached, offloadReadSourcePins.get(ledgerId));
             }
-            if (handle instanceof DualSourceReadHandle dualSource) {
-                return dualSource.closeBookKeeperSource();
-            }
-            ledgerCache.remove(ledgerId, cached);
-            return handle.closeAsync();
         }).thenCompose(future -> future);
     }
 
@@ -3768,6 +5680,229 @@ public class ManagedLedgerImpl implements ManagedLedger, CreateCallback {
                     return CompletableFuture.<Void>failedFuture(failure);
                 })
                 .thenCompose(future -> future);
+    }
+
+    /** Native metadata transitions only; this handle supplies no M4 or physical-delete authority. */
+    public final class NativeBookKeeperSourceDeletion {
+        private final long ledgerId;
+        private final OffloadReadSourceState sourceState;
+        private final long lastAddConfirmed;
+        private final long length;
+        private final Map<String, String> driverMetadata;
+        private final Map<String, String> managedLedgerProperties;
+        private final byte[] ledgerMetadata;
+        private final SourceSafeLedgerOffloader offloader;
+        private NativeBookKeeperDeleteTransition intent;
+        private NativeBookKeeperDeleteTransition done;
+
+        private NativeBookKeeperSourceDeletion(CapturedNativeReadView view, LedgerInfo info) {
+            ledgerId = info.getLedgerId();
+            var context = info.getOffloadContext();
+            sourceState = currentOffloadReadSourceState(ledgerId,
+                    new UUID(context.getUidMsb(), context.getUidLsb()));
+            lastAddConfirmed = info.getEntries() - 1;
+            length = info.getSize();
+            var metadata = OffloadUtils.getOffloadDriverMetadata(info);
+            metadata.put("ManagedLedgerName", name);
+            driverMetadata = Map.copyOf(metadata);
+            managedLedgerProperties = view.properties;
+            ledgerMetadata = info.toByteArray();
+            offloader = view.offloader;
+        }
+
+        public long ledgerId() {
+            return ledgerId;
+        }
+
+        public OffloadReadSourceState sourceState() {
+            return sourceState;
+        }
+
+        /** The returned observer cannot cancel this original Native CAS or change its unknown candidate. */
+        public synchronized CompletableFuture<Void> prepareIntent() {
+            if (intent == null) {
+                intent = new NativeBookKeeperDeleteTransition(this, false);
+            }
+            return intent.execute();
+        }
+
+        /** Authoritative SDK absence is mandatory, even when the caller has a separate M5 DONE receipt. */
+        public synchronized CompletableFuture<Void> completeDone() {
+            if (done == null) {
+                done = new NativeBookKeeperDeleteTransition(this, true);
+            }
+            return done.execute();
+        }
+    }
+
+    /** One original Native metadata CAS; an uncertain reply can only be observed, never redispatched. */
+    private final class NativeBookKeeperDeleteTransition {
+        private final NativeBookKeeperSourceDeletion source;
+        private final boolean done;
+        private CompletableFuture<Void> attempt;
+        private ManagedLedgerInfo candidate;
+        private LedgerInfo candidateLedger;
+        private Stat predecessor;
+        private long candidateVersion;
+
+        private NativeBookKeeperDeleteTransition(NativeBookKeeperSourceDeletion source, boolean done) {
+            this.source = source;
+            this.done = done;
+        }
+
+        private synchronized CompletableFuture<Void> execute() {
+            if (attempt != null && !attempt.isCompletedExceptionally()) {
+                return attempt.copy();
+            }
+            var original = new CompletableFuture<Void>();
+            attempt = original;
+            synchronized (ManagedLedgerImpl.this) {
+                ordinaryReadOperations.add(original);
+            }
+            original.whenComplete((ignored, failure) -> {
+                synchronized (ManagedLedgerImpl.this) {
+                    ordinaryReadOperations.remove(original);
+                }
+            });
+            try {
+                if (candidate != null) {
+                    observe().whenComplete((ignored, failure) -> complete(original, failure));
+                } else {
+                    requireDrainedSource();
+                    boolean alreadyRecorded = source.sourceState.bookKeeperDeleteState()
+                            == OffloadReadSourceState.BookKeeperDeleteState.DONE
+                            || !done && source.sourceState.bookKeeperDeleteState()
+                                    == OffloadReadSourceState.BookKeeperDeleteState.INTENT;
+                    CompletableFuture<Void> eligibility = done
+                            ? verifyBookKeeperLedgerAbsent(source.ledgerId)
+                            : alreadyRecorded ? CompletableFuture.completedFuture(null)
+                            : source.offloader.revalidateOffloadedForSourceDeletion(
+                                    source.ledgerId, source.sourceState.attemptUuid(), source.driverMetadata,
+                                    source.lastAddConfirmed, source.lastAddConfirmed + 1, source.length);
+                    eligibility
+                            .thenCompose(ignored -> alreadyRecorded
+                                    ? CompletableFuture.completedFuture(null) : persist())
+                            .whenComplete((ignored, failure) -> complete(original, failure));
+                }
+            } catch (Throwable failure) {
+                original.completeExceptionally(failure);
+            }
+            return original.copy();
+        }
+
+        private void complete(CompletableFuture<Void> original, Throwable failure) {
+            if (failure == null) {
+                original.complete(null);
+            } else {
+                original.completeExceptionally(FutureUtil.unwrapCompletionException(failure));
+            }
+        }
+
+        private void requireDrainedSource() throws ManagedLedgerException {
+            synchronized (ManagedLedgerImpl.this) {
+                LedgerInfo current = ledgers.get(source.ledgerId);
+                if (closeStarted || !offloadReadAdmissionClosed || offloadReadFenceFuture == null
+                        || !offloadReadFenceFuture.isDone() || offloadReadFenceFuture.isCompletedExceptionally()
+                        || offloadReadFenceFuture.isCancelled() || !readHandleCloses.isEmpty()
+                        || offloadReadSourcePins.values().stream().anyMatch(pins -> pins.pinCount() != 0)
+                        || ledgersStat == null || ledgersStat.getVersion() != source.sourceState.metadataVersion()
+                        || current == null || !Arrays.equals(current.toByteArray(), source.ledgerMetadata)
+                        || !propertiesMap.equals(source.managedLedgerProperties)
+                        || config.getLedgerOffloader() != source.offloader) {
+                    throw new OffloadConflict("Native BK delete transition lacks its original confirmed source drain");
+                }
+                var expected = switch (source.sourceState.bookKeeperDeleteState()) {
+                    case NONE -> BookKeeperDeleteState.BK_DELETE_NONE;
+                    case INTENT -> BookKeeperDeleteState.BK_DELETE_INTENT;
+                    case DONE -> BookKeeperDeleteState.BK_DELETE_DONE;
+                };
+                if (done && expected == BookKeeperDeleteState.BK_DELETE_NONE) {
+                    throw new OffloadConflict("Native BK DONE requires a persisted INTENT");
+                }
+                validateSourceSafeDeleteState(current, source.sourceState.attemptUuid(), expected,
+                        "native-delete-transition");
+            }
+        }
+
+        private CompletableFuture<Void> persist() {
+            synchronized (ManagedLedgerImpl.this) {
+                try {
+                    requireDrainedSource();
+                    if (!metadataMutex.tryLock()) {
+                        return CompletableFuture.failedFuture(new OffloadConflict("Native metadata CAS is busy"));
+                    }
+                    var result = new CompletableFuture<Void>();
+                    result.whenComplete((ignored, failure) -> metadataMutex.unlock());
+                    try {
+                        predecessor = ledgersStat;
+                        candidateVersion = Math.addExact(predecessor.getVersion(), 1);
+                        candidateLedger = new LedgerInfo().copyFrom(ledgers.get(source.ledgerId));
+                        candidateLedger.getOffloadContext().setBookkeeperDeleted(true).setBookkeeperDeleteState(
+                                done ? BookKeeperDeleteState.BK_DELETE_DONE : BookKeeperDeleteState.BK_DELETE_INTENT);
+                        var next = new HashMap<>(ledgers);
+                        next.put(source.ledgerId, candidateLedger);
+                        candidate = buildManagedLedgerInfo(next);
+                        store.asyncUpdateLedgerIds(name, candidate, predecessor, new MetaStoreCallback<Void>() {
+                            @Override
+                            public void operationComplete(Void ignored, Stat stat) {
+                                try {
+                                    accept(stat);
+                                    result.complete(null);
+                                } catch (Throwable failure) {
+                                    result.completeExceptionally(failure);
+                                }
+                            }
+
+                            @Override
+                            public void operationFailed(MetaStoreException failure) {
+                                observe().whenComplete((ignored, observedFailure) -> complete(result, observedFailure));
+                            }
+                        });
+                    } catch (Throwable failure) {
+                        result.completeExceptionally(failure);
+                    }
+                    return result;
+                } catch (Throwable failure) {
+                    return CompletableFuture.failedFuture(failure);
+                }
+            }
+        }
+
+        private CompletableFuture<Void> observe() {
+            var result = new CompletableFuture<Void>();
+            store.readStoredManagedLedgerInfo(name, new MetaStoreCallback<ManagedLedgerInfo>() {
+                @Override
+                public void operationComplete(ManagedLedgerInfo actual, Stat stat) {
+                    try {
+                        if (!Arrays.equals(candidate.toByteArray(), actual.toByteArray())) {
+                            throw new OffloadConflict("Original Native BK delete CAS remains unresolved or changed");
+                        }
+                        accept(stat);
+                        result.complete(null);
+                    } catch (Throwable failure) {
+                        result.completeExceptionally(failure);
+                    }
+                }
+
+                @Override
+                public void operationFailed(MetaStoreException failure) {
+                    result.completeExceptionally(failure);
+                }
+            });
+            return result;
+        }
+
+        private void accept(Stat stat) throws OffloadConflict {
+            synchronized (ManagedLedgerImpl.this) {
+                if (stat == null || stat.getVersion() != candidateVersion
+                        || ledgersStat.getVersion() != predecessor.getVersion()
+                        && ledgersStat.getVersion() != candidateVersion) {
+                    throw new OffloadConflict("Original Native BK delete CAS version changed");
+                }
+                ledgersStat = stat;
+                ledgers.put(source.ledgerId, candidateLedger);
+            }
+        }
     }
 
     private CompletableFuture<Void> markBookKeeperDeleteIntent(long ledgerId, UUID attemptUuid) {
@@ -3995,6 +6130,8 @@ public class ManagedLedgerImpl implements ManagedLedger, CreateCallback {
         }
 
         Position firstUnoffloaded;
+        CompletableFuture<Void> offloadDrained = new CompletableFuture<>();
+        boolean offloadStarted;
 
         Queue<LedgerInfo> ledgersToOffload = new ConcurrentLinkedQueue<>();
         synchronized (this) {
@@ -4034,6 +6171,10 @@ public class ManagedLedgerImpl implements ManagedLedger, CreateCallback {
                 }
             }
             firstUnoffloaded = PositionFactory.create(firstLedgerRetained, 0);
+            offloadStarted = !ledgersToOffload.isEmpty() && offloadMutex.tryLock();
+            if (offloadStarted) {
+                offloadOperations.add(offloadDrained);
+            }
         }
 
         if (ledgersToOffload.isEmpty()) {
@@ -4042,18 +6183,25 @@ public class ManagedLedgerImpl implements ManagedLedger, CreateCallback {
             return;
         }
 
-        if (offloadMutex.tryLock()) {
+        if (offloadStarted) {
             log.info().attr("ledgers", ledgersToOffload.stream()
                             .map(LedgerInfo::getLedgerId).collect(Collectors.toList()))
                     .log("Going to offload ledgers");
 
             CompletableFuture<Position> promise = new CompletableFuture<>();
             promise.whenComplete((result, exception) -> {
-                offloadMutex.unlock();
-                if (exception != null) {
-                    callback.offloadFailed(ManagedLedgerException.getManagedLedgerException(exception), ctx);
-                } else {
-                    callback.offloadComplete(result, ctx);
+                try {
+                    offloadMutex.unlock();
+                    if (exception != null) {
+                        callback.offloadFailed(ManagedLedgerException.getManagedLedgerException(exception), ctx);
+                    } else {
+                        callback.offloadComplete(result, ctx);
+                    }
+                } finally {
+                    synchronized (ManagedLedgerImpl.this) {
+                        offloadOperations.remove(offloadDrained);
+                    }
+                    offloadDrained.complete(null);
                 }
             });
             offloadLoop(promise, ledgersToOffload, firstUnoffloaded, Optional.empty());
@@ -4066,11 +6214,6 @@ public class ManagedLedgerImpl implements ManagedLedger, CreateCallback {
     void offloadLoop(CompletableFuture<Position> promise, Queue<LedgerInfo> ledgersToOffload,
             Position firstUnoffloaded, Optional<Throwable> firstError) {
         State currentState = getState();
-        if (currentState == State.Closed) {
-            promise.completeExceptionally(new ManagedLedgerAlreadyClosedException(
-                    String.format("managed ledger [%s] has already closed", name)));
-            return;
-        }
         if (currentState.isFenced()) {
             promise.completeExceptionally(new ManagedLedgerFencedException(
                     String.format("managed ledger [%s] is fenced", name)));
@@ -4084,6 +6227,11 @@ public class ManagedLedgerImpl implements ManagedLedger, CreateCallback {
                 promise.complete(firstUnoffloaded);
             }
         } else {
+            if (currentState == State.Closed) {
+                promise.completeExceptionally(firstError.orElseGet(() -> new ManagedLedgerAlreadyClosedException(
+                        String.format("managed ledger [%s] has already closed", name))));
+                return;
+            }
             long ledgerId = info.getLedgerId();
             UUID uuid = UUID.randomUUID();
             Map<String, String> extraMetadata = Map.of("ManagedLedgerName", name);
@@ -4993,6 +7141,79 @@ public class ManagedLedgerImpl implements ManagedLedger, CreateCallback {
         }
     }
 
+    void runNativeCreationCallback(Runnable transfer) {
+        if (config.getLedgerOffloader() instanceof SourceSafeLedgerOffloader) {
+            synchronized (this) {
+                transfer.run();
+            }
+        } else {
+            transfer.run();
+        }
+    }
+
+    boolean nativeCreationClosing() {
+        return closeStarted && config.getLedgerOffloader() instanceof SourceSafeLedgerOffloader;
+    }
+
+    private final class NativeCreationOperation {
+        private final CompletableFuture<Void> drained = new CompletableFuture<>();
+        private volatile LedgerHandle handle;
+
+        private NativeCreationOperation() {
+            nativeCreationOperations.add(drained);
+        }
+
+        private void complete(Throwable failure) {
+            if (failure == null) {
+                synchronized (nativeCreationOperations) {
+                    nativeCreationOperations.remove(drained);
+                }
+                drained.complete(null);
+            } else {
+                // Failed cleanup retains the original SDK ownership and cannot establish an owner terminal.
+                drained.completeExceptionally(failure);
+            }
+        }
+
+        private void closeHandle(Throwable primaryFailure) {
+            try {
+                handle.closeAsync().whenComplete((ignored, closeFailure) -> {
+                    if (primaryFailure != null && closeFailure != null && primaryFailure != closeFailure) {
+                        primaryFailure.addSuppressed(closeFailure);
+                    }
+                    complete(primaryFailure != null ? primaryFailure : closeFailure);
+                });
+            } catch (Throwable failure) {
+                if (primaryFailure != null && primaryFailure != failure) {
+                    primaryFailure.addSuppressed(failure);
+                }
+                complete(primaryFailure != null ? primaryFailure : failure);
+            }
+        }
+
+        private void callbackComplete() {
+            // Initial data/cursor callbacks transfer their handle on this existing executor. Stay enrolled until
+            // those queued callbacks have observed close, or transferred the handle to the Native owner.
+            try {
+                executor.execute(() -> {
+                    synchronized (ManagedLedgerImpl.this) {
+                        if (closeStarted && handle != null) {
+                            closeHandle(null);
+                        } else {
+                            complete(null);
+                        }
+                    }
+                });
+            } catch (Throwable failure) {
+                if (handle != null) {
+                    closeHandle(failure);
+                } else {
+                    complete(failure);
+                }
+            }
+        }
+    }
+
     /**
      * Create ledger async and schedule a timeout task to check ledger-creation is complete else it fails the callback
      * with TimeoutException.
@@ -5024,6 +7245,20 @@ public class ManagedLedgerImpl implements ManagedLedger, CreateCallback {
             }
         }
         createdLedgerCustomMetadata = finalMetadata;
+        final NativeCreationOperation creation;
+        if (config.getLedgerOffloader() instanceof SourceSafeLedgerOffloader) {
+            synchronized (nativeCreationOperations) {
+                creation = closeStarted ? null : new NativeCreationOperation();
+            }
+            if (creation == null) {
+                cb.createComplete(Code.TimeoutException, null, ledgerFutureHook);
+                ledgerFutureHook.completeExceptionally(
+                        new ManagedLedgerAlreadyClosedException("Native owner closed"));
+                return;
+            }
+        } else {
+            creation = null;
+        }
         try {
             bookKeeper.newCreateLedgerOp()
                     .withEnsembleSize(config.getEnsembleSize())
@@ -5035,16 +7270,53 @@ public class ManagedLedgerImpl implements ManagedLedger, CreateCallback {
                     .withLoggerContext(ctxLogger)
                     .execute()
                     .whenComplete((writeHandle, ex) -> {
-                        if (ex != null) {
-                            cb.createComplete(BKException.getExceptionCode(ex), null, ledgerFutureHook);
-                        } else {
-                            cb.createComplete(Code.OK, (LedgerHandle) writeHandle, ledgerFutureHook);
+                        if (creation == null) {
+                            if (ex != null) {
+                                cb.createComplete(BKException.getExceptionCode(ex), null, ledgerFutureHook);
+                            } else {
+                                cb.createComplete(Code.OK, (LedgerHandle) writeHandle, ledgerFutureHook);
+                            }
+                            return;
+                        }
+                        creation.handle = (LedgerHandle) writeHandle;
+                        boolean abandoned = closeStarted || ledgerFutureHook.isCompletedExceptionally();
+                        if (abandoned) {
+                            if (!ledgerFutureHook.isDone()) {
+                                cb.createComplete(Code.TimeoutException, null, ledgerFutureHook);
+                                ledgerFutureHook.completeExceptionally(
+                                        new ManagedLedgerAlreadyClosedException("Native owner closed"));
+                            }
+                            if (writeHandle != null) {
+                                // Retain late M5 resources for birth/orphan reconciliation; do not delete them here.
+                                creation.closeHandle(null);
+                            } else {
+                                creation.complete(null);
+                            }
+                            return;
+                        }
+                        try {
+                            if (ex != null) {
+                                cb.createComplete(BKException.getExceptionCode(ex), null, ledgerFutureHook);
+                            } else {
+                                cb.createComplete(Code.OK, (LedgerHandle) writeHandle, ledgerFutureHook);
+                            }
+                            creation.callbackComplete();
+                        } catch (Throwable callbackFailure) {
+                            if (writeHandle != null) {
+                                creation.closeHandle(callbackFailure);
+                            } else {
+                                creation.complete(callbackFailure);
+                            }
+                            throw callbackFailure;
                         }
                     });
         } catch (Throwable cause) {
             log.error().exception(cause).log("Encountered unexpected error when creating ledger");
             ledgerFutureHook.completeExceptionally(cause);
             cb.createComplete(Code.UnexpectedConditionException, null, ledgerFutureHook);
+            if (creation != null) {
+                creation.complete(cause);
+            }
             return;
         }
 
