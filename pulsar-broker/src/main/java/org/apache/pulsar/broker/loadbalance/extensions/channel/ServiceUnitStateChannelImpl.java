@@ -1643,13 +1643,18 @@ public class ServiceUnitStateChannelImpl implements ServiceUnitStateChannel {
                                                       boolean gracefully) {
 
         final var version = getNextVersionId(orphanData);
-        if (qualifiedRegistry().isPresent()) {
+        var nativeRegistry = qualifiedRegistry();
+        if (nativeRegistry.isPresent()) {
             if (gracefully && isTargetBroker(inactiveBroker)
                     && orphanData.state() == Owned && isTargetBroker(orphanData.dstBroker())) {
                 return publishOverrideEventAsync(serviceUnit,
                         new ServiceUnitStateData(Releasing, null, inactiveBroker, true, version));
             }
-            return CompletableFuture.failedFuture(unqualifiedOwner(serviceUnit));
+            if (gracefully || inactiveBroker == null || orphanData.state() != Owned
+                    || !inactiveBroker.equals(orphanData.dstBroker()) || !orphanData.hasNereusOwnershipIdentity()) {
+                return CompletableFuture.failedFuture(unqualifiedOwner(serviceUnit));
+            }
+            return assignNativeOrphan(serviceUnit, orphanData, nativeRegistry.orElseThrow());
         }
         return selectBroker(serviceUnit, inactiveBroker)
                 .thenApply(selectedOpt ->
@@ -1692,6 +1697,26 @@ public class ServiceUnitStateChannelImpl implements ServiceUnitStateChannel {
                             inactiveBroker, serviceUnit, orphanData, override);
                     return publishOverrideEventAsync(serviceUnit, override);
                 });
+    }
+
+    private CompletableFuture<Void> assignNativeOrphan(
+            String serviceUnit, ServiceUnitStateData predecessor, BrokerRegistryImpl registry) {
+        var transitions = registry.nativeOwnership().orElseThrow();
+        return selectBroker(serviceUnit, predecessor.dstBroker()).thenCompose(selected -> {
+            if (selected.isEmpty()) {
+                return CompletableFuture.failedFuture(unqualifiedOwner(serviceUnit));
+            }
+            var candidate = new ServiceUnitStateData(Assigning, selected.orElseThrow(), predecessor.dstBroker(),
+                    true, getNextVersionId(predecessor));
+            return transitions.prepareOrphanAssignment(predecessor, candidate, registry::readNativeIncarnation)
+                    .thenCompose(prepared -> transitions.publish(prepared, exact -> {
+                        if (!predecessor.equals(tableview.get(serviceUnit))) {
+                            return CompletableFuture.failedFuture(unqualifiedOwner(serviceUnit));
+                        }
+                        return ((ServiceUnitStateMetadataStoreTableViewImpl) tableview)
+                                .putQualified(serviceUnit, exact);
+                    }));
+        });
     }
 
     private void waitForCleanups(String broker, boolean excludeSystemTopics, int maxWaitTimeInMillis) {

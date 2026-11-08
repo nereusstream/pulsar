@@ -112,6 +112,46 @@ public final class NereusP1OwnershipTransitions implements AutoCloseable {
     public CompletableFuture<Prepared> prepare(
             ServiceUnitStateData previous, ServiceUnitStateData candidate,
             Function<String, CompletableFuture<Optional<NereusOwnershipId>>> authoritativeBrokerLookup) {
+        if (ServiceUnitStateData.state(previous) == ServiceUnitState.Owned
+                && candidate.state() == ServiceUnitState.Assigning) {
+            return CompletableFuture.failedFuture(
+                    new IllegalStateException("native P1 orphan assignment requires an exact registration check"));
+        }
+        return prepareTransition(previous, candidate, authoritativeBrokerLookup);
+    }
+
+    /**
+     * A dead native owner's registration cannot authorize release. Select a fresh acquisition only if that exact
+     * incarnation is no longer registered, on both sides of selecting the target.
+     */
+    public CompletableFuture<Prepared> prepareOrphanAssignment(
+            ServiceUnitStateData previous, ServiceUnitStateData candidate,
+            Function<String, CompletableFuture<Optional<NereusOwnershipId>>> authoritativeBrokerLookup) {
+        if (ServiceUnitStateData.state(previous) != ServiceUnitState.Owned || !previous.hasNereusOwnershipIdentity()
+                || candidate.state() != ServiceUnitState.Assigning || !candidate.force()
+                || !java.util.Objects.equals(previous.dstBroker(), candidate.sourceBroker())
+                || java.util.Objects.equals(previous.dstBroker(), candidate.dstBroker())) {
+            return CompletableFuture.failedFuture(new IllegalArgumentException("invalid native P1 orphan assignment"));
+        }
+        var oldIncarnation = new NereusOwnershipId(previous.brokerIncarnationId());
+        return requireRegistrationGone(previous.dstBroker(), oldIncarnation, authoritativeBrokerLookup)
+                .thenCompose(unused -> prepareTransition(previous, candidate, authoritativeBrokerLookup))
+                .thenCompose(prepared -> requireRegistrationGone(previous.dstBroker(), oldIncarnation,
+                        authoritativeBrokerLookup).thenApply(unused -> prepared));
+    }
+
+    private static CompletableFuture<Void> requireRegistrationGone(String broker, NereusOwnershipId oldIncarnation,
+            Function<String, CompletableFuture<Optional<NereusOwnershipId>>> authoritativeBrokerLookup) {
+        return authoritativeBrokerLookup.apply(broker).thenAccept(actual -> {
+            if (actual.filter(oldIncarnation::equals).isPresent()) {
+                throw new IllegalStateException("native P1 orphan predecessor is still registered");
+            }
+        });
+    }
+
+    private CompletableFuture<Prepared> prepareTransition(
+            ServiceUnitStateData previous, ServiceUnitStateData candidate,
+            Function<String, CompletableFuture<Optional<NereusOwnershipId>>> authoritativeBrokerLookup) {
         return CompletableFuture.completedFuture(store.ownershipContinuity()).thenCompose(cut -> {
             requireCurrent(cut);
             if (!cut.equals(registered)) {

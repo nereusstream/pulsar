@@ -82,6 +82,23 @@ public class NereusOwnershipIdentityTest {
                 .isTrue();
     }
 
+    @Test
+    public void orphanAssignmentRequiresExactSourceAndFreshDestinationIdentity() {
+        var owned = state(ServiceUnitState.Owned, BROKER, ACQUISITION);
+        var next = new ServiceUnitStateData(ServiceUnitState.Assigning, "target", "broker", null, true, 1, 2,
+                NEXT_BROKER, NEXT_ACQUISITION);
+        assertThat(NereusOwnershipTransitionValidator.shouldReject(owned, next)).isFalse();
+        assertThat(NereusOwnershipTransitionValidator.shouldReject(owned,
+                new ServiceUnitStateData(ServiceUnitState.Assigning, "target", "broker", null, false, 1, 2,
+                        NEXT_BROKER, NEXT_ACQUISITION))).isTrue();
+        assertThat(NereusOwnershipTransitionValidator.shouldReject(owned,
+                new ServiceUnitStateData(ServiceUnitState.Assigning, "target", "different", null, true, 1, 2,
+                        NEXT_BROKER, NEXT_ACQUISITION))).isTrue();
+        assertThat(NereusOwnershipTransitionValidator.shouldReject(owned,
+                new ServiceUnitStateData(ServiceUnitState.Assigning, "target", "broker", null, true, 1, 2,
+                        NEXT_BROKER, ACQUISITION))).isTrue();
+    }
+
     private static ServiceUnitStateData state(
             ServiceUnitState state, NereusOwnershipId broker, NereusOwnershipId acquisition) {
         String destination = switch (state) {

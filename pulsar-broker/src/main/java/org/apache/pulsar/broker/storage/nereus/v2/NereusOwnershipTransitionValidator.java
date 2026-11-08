@@ -46,6 +46,10 @@ public final class NereusOwnershipTransitionValidator {
             case Assigning -> to.state() != ServiceUnitState.Owned || !sameIdentity(from, to);
             case Owned -> switch (to.state()) {
                 case Releasing, Splitting -> !sameIdentity(from, to);
+                case Assigning -> !fromQualified || !to.force() || !Objects.equals(from.dstBroker(), to.sourceBroker())
+                        || Objects.equals(from.dstBroker(), to.dstBroker())
+                        || Objects.equals(from.brokerIncarnationId(), to.brokerIncarnationId())
+                        || Objects.equals(from.acquisitionId(), to.acquisitionId());
                 default -> true;
             };
             case Releasing -> switch (to.state()) {
