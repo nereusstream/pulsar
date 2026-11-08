@@ -136,15 +136,19 @@ public class ServiceUnitStateMetadataStoreTableViewImpl extends ServiceUnitState
 
     @Override
     public CompletableFuture<Void> put(String key, @NonNull ServiceUnitStateData value) {
-        if (!isValidState()) {
-            return CompletableFuture.failedFuture(new IllegalStateException(INVALID_STATE_ERROR_MSG));
-        }
-        return tableview.put(key, value).exceptionally(e -> {
+        return putQualified(key, value).exceptionally(e -> {
             if (e.getCause() instanceof MetadataStoreTableView.ConflictException) {
                 return null;
             }
             throw FutureUtil.wrapToCompletionException(e);
         });
+    }
+
+    CompletableFuture<Void> putQualified(String key, @NonNull ServiceUnitStateData value) {
+        if (!isValidState()) {
+            return CompletableFuture.failedFuture(new IllegalStateException(INVALID_STATE_ERROR_MSG));
+        }
+        return tableview.put(key, value);
     }
 
     @Override

@@ -113,6 +113,11 @@ public class OxiaMetadataStore extends AbstractMetadataStore {
         super.registerSyncListener(synchronizer);
     }
 
+    /** Used by the qualified ownership backend to observe this exact native notification connection. */
+    protected final AsyncOxiaClient ownershipClient() {
+        return client;
+    }
+
     private void notificationCallback(Notification notification) {
         if (notification instanceof Notification.KeyCreated keyCreated) {
             receivedNotification(

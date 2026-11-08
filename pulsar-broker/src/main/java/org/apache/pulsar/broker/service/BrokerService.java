@@ -85,6 +85,7 @@ import lombok.CustomLog;
 import lombok.Getter;
 import lombok.Setter;
 import org.apache.bookkeeper.common.util.OrderedExecutor;
+import org.apache.bookkeeper.mledger.AsyncCallbacks.CloseCallback;
 import org.apache.bookkeeper.mledger.AsyncCallbacks.DeleteLedgerCallback;
 import org.apache.bookkeeper.mledger.AsyncCallbacks.OpenLedgerCallback;
 import org.apache.bookkeeper.mledger.LedgerOffloader;
@@ -144,6 +145,7 @@ import org.apache.pulsar.broker.stats.prometheus.metrics.ObserverGauge;
 import org.apache.pulsar.broker.stats.prometheus.metrics.Summary;
 import org.apache.pulsar.broker.storage.ManagedLedgerStorage;
 import org.apache.pulsar.broker.storage.ManagedLedgerStorageClass;
+import org.apache.pulsar.broker.storage.nereus.v2.NereusPulsarManagedLedgerStorage;
 import org.apache.pulsar.broker.topiclistlimit.TopicListMemoryLimiter;
 import org.apache.pulsar.broker.topiclistlimit.TopicListSizeResultCache;
 import org.apache.pulsar.broker.validator.BindAddressValidator;
@@ -229,6 +231,7 @@ public class BrokerService implements Closeable {
     private final ManagedLedgerStorage managedLedgerStorage;
 
     private final Map<String, CompletableFuture<Optional<Topic>>> topics = new ConcurrentHashMap<>();
+    private final Map<String, CompletableFuture<Void>> nativeOpeningTopics = new ConcurrentHashMap<>();
 
     private final Map<String, PulsarClient> replicationClients = new ConcurrentHashMap<>();
     private final Map<String, PulsarAdmin> clusterAdmins = new ConcurrentHashMap<>();
@@ -1121,6 +1124,7 @@ public class BrokerService implements Closeable {
         if (unloaded) {
             return;
         }
+        boolean completed = false;
         try {
             log.info("Unloading namespace-bundles...");
             // make broker-node unavailable from the cluster
@@ -1140,6 +1144,10 @@ public class BrokerService implements Closeable {
                     .attr("disableBrokerTimeSeconds", disableBrokerTimeSeconds)
                     .log("Disable broker in load manager completed in seconds");
 
+            if (managedLedgerStorage instanceof NereusPulsarManagedLedgerStorage) {
+                completed = true;
+                return;
+            }
             // unload all namespace-bundles gracefully
             long closeTopicsStartTime = System.nanoTime();
             Set<NamespaceBundle> serviceUnits =
@@ -1176,13 +1184,17 @@ public class BrokerService implements Closeable {
                         .attr("closeTopicsTimeSeconds", closeTopicsTimeSeconds)
                         .log("Unloading namespace-bundles completed in seconds");
             }
+            completed = true;
         } catch (Exception e) {
+            if (managedLedgerStorage instanceof NereusPulsarManagedLedgerStorage) {
+                throw FutureUtil.wrapToCompletionException(e);
+            }
             log.error()
 
                     .exception(e)
                     .log("Failed to disable broker from loadbalancer list");
         } finally {
-            unloaded = true;
+            unloaded = completed || !(managedLedgerStorage instanceof NereusPulsarManagedLedgerStorage);
         }
     }
 
@@ -2027,15 +2039,27 @@ public class BrokerService implements Closeable {
                 loggerContextBuilder.attr("topic", topicName.toString());
             }
             managedLedgerConfig.setLoggerContext(loggerContextBuilder.build());
-            managedLedgerFactory.asyncOpen(topicName.getPersistenceNamingEncoding(), managedLedgerConfig,
-                    new OpenLedgerCallback() {
+            var nativeStorage = managedLedgerStorage instanceof NereusPulsarManagedLedgerStorage selected
+                    && selected.selects(topicName) ? selected : null;
+            CompletableFuture<Void> nativeTerminal = nativeStorage != null ? new CompletableFuture<>() : null;
+            if (nativeTerminal != null) {
+                if (nativeOpeningTopics.putIfAbsent(topic, nativeTerminal) != null) {
+                    throw new IllegalStateException("A native ledger open is still settling for " + topic);
+                }
+                nativeTerminal.thenRun(() -> nativeOpeningTopics.remove(topic, nativeTerminal));
+            }
+            var callback = new OpenLedgerCallback() {
                         @Override
                         public void openLedgerComplete(ManagedLedger ledger, Object ctx) {
+                            var opened = (NereusPulsarManagedLedgerStorage.OpenedLedger) ctx;
                             try {
                                 PersistentTopic persistentTopic = isSystemTopic(topic)
                                         ? new SystemTopic(topic, ledger, BrokerService.this)
                                         : newTopic(topic, ledger, BrokerService.this, PersistentTopic.class);
                                 persistentTopic.setCreateFuture(topicFuture);
+                                if (opened != null) {
+                                    persistentTopic.setNativeStorageAuthority(opened);
+                                }
                                 persistentTopic
                                         .initialize()
                                         .thenCompose(__ -> persistentTopic.preCreateSubscriptionForCompactionIfNeeded())
@@ -2044,7 +2068,15 @@ public class BrokerService implements Closeable {
                                             // Also check dedup status
                                             return persistentTopic.checkDeduplicationStatus();
                                         })
+                                        .thenCompose(unused -> persistentTopic.usesNativeStorage()
+                                                ? persistentTopic.refreshStorageAuthority()
+                                                : CompletableFuture.completedFuture(null))
                                         .thenRun(() -> {
+                                            if (persistentTopic.usesNativeStorage()
+                                                    && !persistentTopic.hasCurrentStorageAuthority()) {
+                                                throw new IllegalStateException(
+                                                        "Native ownership changed while loading " + topic);
+                                            }
                                             long nowInNanos = System.nanoTime();
                                             long topicLoadLatencyMs = context.latencyMs(nowInNanos);
                                             log.info()
@@ -2071,6 +2103,7 @@ public class BrokerService implements Closeable {
                                                 }
                                                 executor().submit(() -> {
                                                     persistentTopic.close().whenComplete((ignore, ex) -> {
+                                                        settleNativeOpen(nativeTerminal, ex);
                                                         topics.remove(topic, topicFuture);
                                                         if (ex != null) {
                                                             log.warn()
@@ -2082,6 +2115,7 @@ public class BrokerService implements Closeable {
                                                 });
                                             } else {
                                                 addTopicToStatsMaps(topicName, persistentTopic);
+                                                settleNativeOpen(nativeTerminal, null);
                                             }
                                         })
                                         .exceptionally((ex) -> {
@@ -2092,6 +2126,7 @@ public class BrokerService implements Closeable {
                                                             + "Removing topic from topics list");
                                             executor().submit(() -> {
                                                 persistentTopic.close().whenComplete((ignore, closeEx) -> {
+                                                    settleNativeOpen(nativeTerminal, closeEx);
                                                     topics.remove(topic, topicFuture);
                                                     if (closeEx != null) {
                                                         log.warn()
@@ -2104,6 +2139,9 @@ public class BrokerService implements Closeable {
                                             return null;
                                         });
                             } catch (Exception e) {
+                                if (opened != null) {
+                                    closeUninstalledNativeLedger(opened, nativeTerminal);
+                                }
                                 log.warn()
                                         .attr("topic", topic)
                                         .exceptionMessage(e)
@@ -2115,6 +2153,7 @@ public class BrokerService implements Closeable {
 
                         @Override
                         public void openLedgerFailed(ManagedLedgerException exception, Object ctx) {
+                            settleNativeOpen(nativeTerminal, ctx instanceof Throwable unsettled ? unsettled : null);
                             if (!createIfMissing && exception instanceof ManagedLedgerNotFoundException) {
                                 // We were just trying to load a topic and the topic doesn't exist
                                 pulsar.getExecutor().execute(() -> topics.remove(topic, topicFuture));
@@ -2126,7 +2165,25 @@ public class BrokerService implements Closeable {
                                 topicFuture.completeExceptionally(new PersistenceException(exception));
                             }
                         }
-                    }, () -> isTopicNsOwnedByBrokerAsync(topicName), null);
+                    };
+            if (nativeStorage == null) {
+                managedLedgerFactory.asyncOpen(topicName.getPersistenceNamingEncoding(), managedLedgerConfig,
+                        callback, () -> isTopicNsOwnedByBrokerAsync(topicName), null);
+            } else {
+                CompletableFuture.completedFuture(nativeStorage)
+                        .thenCompose(storage -> storage.openTopic(pulsar, topicName, managedLedgerFactory,
+                                managedLedgerConfig, () -> isTopicNsOwnedByBrokerAsync(topicName)))
+                        .whenComplete((opened, error) -> {
+                            if (error != null) {
+                                var cause = FutureUtil.unwrapCompletionException(error);
+                                callback.openLedgerFailed(ManagedLedgerException.getManagedLedgerException(cause),
+                                        cause instanceof NereusPulsarManagedLedgerStorage.UnsettledOpenException
+                                                ? cause : null);
+                            } else {
+                                callback.openLedgerComplete(opened.ledger(), opened);
+                            }
+                        });
+            }
             return null;
         }).exceptionally((exception) -> {
             boolean migrationFailure = exception.getCause() instanceof TopicMigratedException;
@@ -2142,6 +2199,39 @@ public class BrokerService implements Closeable {
             topicFuture.completeExceptionally(exception);
             return null;
         });
+    }
+
+    private static void settleNativeOpen(CompletableFuture<Void> terminal, Throwable error) {
+        if (terminal != null) {
+            if (error == null) {
+                terminal.complete(null);
+            } else {
+                terminal.completeExceptionally(error);
+            }
+        }
+    }
+
+    private static void closeUninstalledNativeLedger(
+            NereusPulsarManagedLedgerStorage.OpenedLedger opened,
+            CompletableFuture<Void> terminal) {
+        var authority = opened.authority();
+        authority.stop();
+        opened.ledger().asyncClose(new CloseCallback() {
+            @Override
+            public void closeComplete(Object ctx) {
+                try {
+                    authority.closeAsync().thenCompose(unused -> opened.closeScope().get())
+                            .whenComplete((unused, error) -> settleNativeOpen(terminal, error));
+                } catch (Exception error) {
+                    settleNativeOpen(terminal, error);
+                }
+            }
+
+            @Override
+            public void closeFailed(ManagedLedgerException error, Object ctx) {
+                settleNativeOpen(terminal, error);
+            }
+        }, null);
     }
 
     private CompletableFuture<Void> checkTopicAlreadyMigrated(TopicName topicName) {
@@ -2639,7 +2729,7 @@ public class BrokerService implements Closeable {
      *                                           and forcefully close managed-ledger
      * @return
      */
-    private CompletableFuture<Integer> unloadServiceUnit(NamespaceBundle serviceUnit,
+    public CompletableFuture<Integer> unloadServiceUnit(NamespaceBundle serviceUnit,
                                                          boolean disconnectClients,
                                                          boolean closeWithoutWaitingClientDisconnect) {
         List<CompletableFuture<Void>> closeFutures = new ArrayList<>();
@@ -2699,6 +2789,13 @@ public class BrokerService implements Closeable {
                     .forEach(tcId -> closeFutures.add(metadataStoreService.removeTransactionMetadataStore(tcId)));
         }
 
+        if (managedLedgerStorage instanceof NereusPulsarManagedLedgerStorage) {
+            nativeOpeningTopics.forEach((name, terminal) -> {
+                if (serviceUnit.includes(TopicName.get(name))) {
+                    closeFutures.add(terminal.copy());
+                }
+            });
+        }
         return FutureUtil.waitForAll(closeFutures).thenApply(v -> closeFutures.size());
     }
 

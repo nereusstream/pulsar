@@ -61,6 +61,7 @@ import java.util.concurrent.Executor;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.stream.Collectors;
@@ -77,6 +78,7 @@ import org.apache.pulsar.broker.ServiceConfiguration;
 import org.apache.pulsar.broker.loadbalance.LeaderBroker;
 import org.apache.pulsar.broker.loadbalance.LeaderElectionService;
 import org.apache.pulsar.broker.loadbalance.extensions.BrokerRegistry;
+import org.apache.pulsar.broker.loadbalance.extensions.BrokerRegistryImpl;
 import org.apache.pulsar.broker.loadbalance.extensions.ExtensibleLoadManagerImpl;
 import org.apache.pulsar.broker.loadbalance.extensions.ExtensibleLoadManagerWrapper;
 import org.apache.pulsar.broker.loadbalance.extensions.LoadManagerContext;
@@ -87,6 +89,7 @@ import org.apache.pulsar.broker.loadbalance.impl.LoadManagerShared;
 import org.apache.pulsar.broker.namespace.LookupOptions;
 import org.apache.pulsar.broker.namespace.NamespaceService;
 import org.apache.pulsar.broker.service.BrokerServiceException;
+import org.apache.pulsar.broker.storage.nereus.v2.NereusP1BundleFence;
 import org.apache.pulsar.client.admin.PulsarAdmin;
 import org.apache.pulsar.client.admin.PulsarAdminException;
 import org.apache.pulsar.client.api.Schema;
@@ -121,6 +124,14 @@ public class ServiceUnitStateChannelImpl implements ServiceUnitStateChannel {
     private final String brokerId;
     private final Map<String, CompletableFuture<Void>> cleanupJobs;
     private final StateChangeListeners stateChangeListeners;
+    private final Map<String, NereusP1BundleFence> nativeBundleFences = new ConcurrentHashMap<>();
+    private final Map<String, NativeRelease> nativeReleases = new ConcurrentHashMap<>();
+
+    private record NativeRelease(long version, AtomicBoolean started, CompletableFuture<Void> terminal) {
+        private NativeRelease(long version) {
+            this(version, new AtomicBoolean(), new CompletableFuture<>());
+        }
+    }
 
     private BrokerRegistry brokerRegistry;
     private LeaderElectionService leaderElectionService;
@@ -261,9 +272,38 @@ public class ServiceUnitStateChannelImpl implements ServiceUnitStateChannel {
     @Override
     public void cleanOwnerships() {
         disable();
-        doCleanup(brokerId, true);
+        if (qualifiedRegistry().isEmpty()) {
+            doCleanup(brokerId, true);
+            return;
+        }
+        var releases = new ArrayList<CompletableFuture<Void>>();
+        for (var row : tableview.entrySet()) {
+            var serviceUnit = row.getKey();
+            var data = tableview.get(serviceUnit);
+            if (state(data) == Owned && isTargetBroker(data.dstBroker())) {
+                var next = new ServiceUnitStateData(Releasing, null, brokerId, true, getNextVersionId(data));
+                var release = nativeRelease(serviceUnit, next.versionId());
+                releases.add(pubAsync(serviceUnit, next).thenCompose(unused -> release.terminal()));
+            } else if (state(data) == Releasing && isTargetBroker(data.sourceBroker())) {
+                var release = nativeRelease(serviceUnit, data.versionId());
+                handleReleaseEvent(serviceUnit, data);
+                releases.add(release.terminal());
+            }
+        }
+        try {
+            FutureUtil.waitForAll(releases).get(config.getNamespaceBundleUnloadingTimeoutMs(), MILLISECONDS);
+        } catch (InterruptedException failure) {
+            Thread.currentThread().interrupt();
+            throw new IllegalStateException("Interrupted while draining native P1 ownership", failure);
+        } catch (ExecutionException | TimeoutException failure) {
+            throw new IllegalStateException("Native P1 ownership still has unsettled work", failure);
+        }
     }
 
+    private NativeRelease nativeRelease(String serviceUnit, long version) {
+        return nativeReleases.compute(serviceUnit,
+                (unit, prior) -> prior != null && prior.version() == version ? prior : new NativeRelease(version));
+    }
     @Override
     public synchronized boolean started() {
         return validateChannelState(Started, true);
@@ -315,6 +355,11 @@ public class ServiceUnitStateChannelImpl implements ServiceUnitStateChannel {
                             pulsar.getConfiguration().getDefaultNumberOfNamespaceBundles());
 
             tableview = createServiceUnitStateTableView();
+            if (qualifiedRegistry().isPresent() && (!(tableview instanceof ServiceUnitStateMetadataStoreTableViewImpl)
+                    || config.getLoadBalancerServiceUnitTableViewSyncer()
+                    != ServiceConfiguration.ServiceUnitTableViewSyncerType.None)) {
+                throw new IllegalStateException("native P1 ownership requires MetadataStore ELM without a syncer");
+            }
             tableview.start(pulsar, this::handleEvent, this::handleExisting, this::handleInvalidate);
 
             if (debug) {
@@ -366,6 +411,8 @@ public class ServiceUnitStateChannelImpl implements ServiceUnitStateChannel {
     public synchronized void close() throws PulsarServerException {
         channelState = Closed;
         try {
+            nativeBundleFences.values().forEach(NereusP1BundleFence::revoke);
+            nativeBundleFences.clear();
             leaderElectionService = null;
 
             if (tableview != null) {
@@ -541,6 +588,9 @@ public class ServiceUnitStateChannelImpl implements ServiceUnitStateChannel {
         var data = tableview.get(serviceUnit);
         ServiceUnitState state = state(data);
         ownerLookUpCounters.get(state).getTotal().incrementAndGet();
+        if (state == Owned && !canReturnOwned(serviceUnit, data)) {
+            return CompletableFuture.failedFuture(unqualifiedOwner(serviceUnit));
+        }
         switch (state) {
             case Owned -> {
                 return getActiveOwnerAsync(serviceUnit, state, Optional.of(data.dstBroker()));
@@ -723,6 +773,13 @@ public class ServiceUnitStateChannelImpl implements ServiceUnitStateChannel {
     }
 
     private void handleEvent(String serviceUnit, ServiceUnitStateData data) {
+        nativeBundleFences.computeIfPresent(serviceUnit, (unit, fence) -> {
+            if (fence.matches(data)) {
+                return fence;
+            }
+            fence.revoke();
+            return null;
+        });
 
         long totalHandledRequests = getHandlerTotalCounter(data).incrementAndGet();
         if (debug()) {
@@ -732,7 +789,13 @@ public class ServiceUnitStateChannelImpl implements ServiceUnitStateChannel {
         }
 
         ServiceUnitState state = state(data);
-        if (channelState == Disabled && (data == null || !data.force())) {
+        if (state != Releasing) {
+            nativeReleases.computeIfPresent(serviceUnit,
+                    (unit, release) -> data != null && data.versionId() <= release.version() ? release : null);
+        }
+        boolean drainingNativeSource = qualifiedRegistry().isPresent() && state == Releasing
+                && isTargetBroker(data.sourceBroker());
+        if (channelState == Disabled && (data == null || !data.force()) && !drainingNativeSource) {
             final var request = getOwnerRequests.remove(serviceUnit);
             if (request != null) {
                 request.completeExceptionally(new BrokerServiceException.ServiceUnitNotReadyException(
@@ -766,7 +829,7 @@ public class ServiceUnitStateChannelImpl implements ServiceUnitStateChannel {
                     .log("Loaded the service unit state data");
         }
         ServiceUnitState state = state(data);
-        if (state.equals(Owned) && isTargetBroker(data.dstBroker())) {
+        if (state.equals(Owned) && isTargetBroker(data.dstBroker()) && canReturnOwned(serviceUnit, data)) {
             pulsar.getNamespaceService()
                     .onNamespaceBundleOwned(LoadManagerShared.getNamespaceBundle(pulsar, serviceUnit));
         } else if (state.equals(Assigning) && isTargetBroker(data.dstBroker())) {
@@ -782,6 +845,10 @@ public class ServiceUnitStateChannelImpl implements ServiceUnitStateChannel {
      * Often happens when the current broker can not connect to others.
      */
     private void handleInvalidate(String serviceUnit, ServiceUnitStateData data) {
+        nativeBundleFences.computeIfPresent(serviceUnit, (unit, fence) -> {
+            fence.revoke();
+            return fence;
+        });
         closeServiceUnit(serviceUnit, true).whenComplete((__, ex) -> {
             if (ex == null) {
                 log.info().attr("serviceUnit", serviceUnit)
@@ -859,15 +926,25 @@ public class ServiceUnitStateChannelImpl implements ServiceUnitStateChannel {
         if (getOwnerRequest != null) {
             var data = tableview.get(serviceUnit);
             if (data != null && data.state() == Owned) {
-                getOwnerRequest.complete(data.dstBroker());
-                getOwnerRequests.remove(serviceUnit);
-                stateChangeListeners.notify(serviceUnit, data, null);
+                getOwnerRequests.remove(serviceUnit, getOwnerRequest);
+                if (canReturnOwned(serviceUnit, data)) {
+                    getOwnerRequest.complete(data.dstBroker());
+                    stateChangeListeners.notify(serviceUnit, data, null);
+                } else {
+                    getOwnerRequest.completeExceptionally(unqualifiedOwner(serviceUnit));
+                }
             }
         }
     }
 
     private void handleOwnEvent(String serviceUnit, ServiceUnitStateData data) {
         var getOwnerRequest = getOwnerRequests.remove(serviceUnit);
+        if (!canReturnOwned(serviceUnit, data)) {
+            if (getOwnerRequest != null) {
+                getOwnerRequest.completeExceptionally(unqualifiedOwner(serviceUnit));
+            }
+            return;
+        }
         if (getOwnerRequest != null) {
             if (debug()) {
                 log.info().attr("serviceUnit", serviceUnit).log("Returned owner request for serviceUnit");
@@ -895,6 +972,13 @@ public class ServiceUnitStateChannelImpl implements ServiceUnitStateChannel {
 
     private void handleAssignEvent(String serviceUnit, ServiceUnitStateData data) {
         if (isTargetBroker(data.dstBroker())) {
+            if (!canReturnOwned(serviceUnit, data)) {
+                var getOwnerRequest = getOwnerRequests.remove(serviceUnit);
+                if (getOwnerRequest != null) {
+                    getOwnerRequest.completeExceptionally(unqualifiedOwner(serviceUnit));
+                }
+                return;
+            }
             ServiceUnitStateData next = new ServiceUnitStateData(
                     Owned, data.dstBroker(), data.sourceBroker(), getNextVersionId(data));
             stateChangeListeners.notifyOnCompletion(pubAsync(serviceUnit, next), serviceUnit, data)
@@ -904,13 +988,18 @@ public class ServiceUnitStateChannelImpl implements ServiceUnitStateChannel {
 
     private void handleReleaseEvent(String serviceUnit, ServiceUnitStateData data) {
         if (isTargetBroker(data.sourceBroker())) {
+            var release = qualifiedRegistry().isPresent() ? nativeRelease(serviceUnit, data.versionId()) : null;
+            if (release != null && !release.started().compareAndSet(false, true)) {
+                return;
+            }
             ServiceUnitStateData next;
             CompletableFuture<Integer> unloadFuture;
             if (isTransferCommand(data)) {
                 next = new ServiceUnitStateData(
                         Assigning, data.dstBroker(), data.sourceBroker(), getNextVersionId(data));
                 // If the optimized bundle unload is disabled, disconnect the clients at time of RELEASE.
-                var disconnectClients = !pulsar.getConfig().isLoadBalancerMultiPhaseBundleUnload();
+                var disconnectClients = qualifiedRegistry().isPresent()
+                        || !pulsar.getConfig().isLoadBalancerMultiPhaseBundleUnload();
                 unloadFuture = closeServiceUnit(serviceUnit, disconnectClients);
             } else {
                 next = new ServiceUnitStateData(
@@ -920,13 +1009,25 @@ public class ServiceUnitStateChannelImpl implements ServiceUnitStateChannel {
             // If the optimized bundle unload is disabled, disconnect the clients at time of RELEASE.
             stateChangeListeners.notifyOnCompletion(unloadFuture
                             .thenCompose(__ -> pubAsync(serviceUnit, next)), serviceUnit, data)
-                    .whenComplete((__, e) -> log(e, serviceUnit, data, next));
+                    .whenComplete((__, e) -> {
+                        if (release != null) {
+                            if (e == null) {
+                                release.terminal().complete(null);
+                            } else {
+                                release.terminal().completeExceptionally(e);
+                            }
+                        }
+                        log(e, serviceUnit, data, next);
+                    });
         }
     }
 
     private void handleSplitEvent(String serviceUnit, ServiceUnitStateData data) {
         if (isTargetBroker(data.sourceBroker())) {
-            stateChangeListeners.notifyOnCompletion(splitServiceUnit(serviceUnit, data), serviceUnit, data)
+            var split = qualifiedRegistry().isPresent()
+                    ? closeServiceUnit(serviceUnit, true).thenCompose(__ -> splitServiceUnit(serviceUnit, data))
+                    : splitServiceUnit(serviceUnit, data);
+            stateChangeListeners.notifyOnCompletion(split, serviceUnit, data)
                     .whenComplete((__, e) -> log(e, serviceUnit, data, null));
         }
     }
@@ -976,8 +1077,81 @@ public class ServiceUnitStateChannelImpl implements ServiceUnitStateChannel {
         log(null, serviceUnit, null, null);
     }
 
+    private Optional<BrokerRegistryImpl> qualifiedRegistry() {
+        return brokerRegistry instanceof BrokerRegistryImpl registry && registry.nativeOwnership().isPresent()
+                ? Optional.of(registry) : Optional.empty();
+    }
+
+    private boolean canReturnOwned(String serviceUnit, ServiceUnitStateData data) {
+        return qualifiedRegistry().map(registry -> data.hasNereusOwnershipIdentity()
+                && (!isTargetBroker(data.dstBroker()) || (registry.nativeOwnership().orElseThrow().isLocal(data)
+                        && isUnrevoked(serviceUnit, data))))
+                .orElse(true);
+    }
+
+    private boolean isUnrevoked(String serviceUnit, ServiceUnitStateData data) {
+        var fence = nativeBundleFences.get(serviceUnit);
+        return fence == null || !fence.matches(data) || !fence.isRevoked();
+    }
+
+    public NereusP1BundleFence captureNativeBundleFence(String serviceUnit) throws
+            BrokerServiceException.ServiceUnitNotReadyException {
+        if (channelState != Started || qualifiedRegistry().isEmpty()) {
+            throw unqualifiedOwner(serviceUnit);
+        }
+        var fence = nativeBundleFences.compute(serviceUnit, (unit, prior) -> {
+            var data = tableview.get(unit);
+            if (state(data) != Owned || !isTargetBroker(data.dstBroker()) || !canReturnOwned(unit, data)) {
+                return prior;
+            }
+            if (prior != null && prior.matches(data) && prior.isCurrent()) {
+                return prior;
+            }
+            if (prior != null) {
+                prior.revoke();
+            }
+            return new NereusP1BundleFence(data, qualifiedRegistry().orElseThrow().nativeOwnership().orElseThrow());
+        });
+        var current = tableview.get(serviceUnit);
+        if (fence == null || !fence.matches(current) || !fence.isCurrent()) {
+            throw unqualifiedOwner(serviceUnit);
+        }
+        return fence;
+    }
+
+    private static BrokerServiceException.ServiceUnitNotReadyException unqualifiedOwner(String serviceUnit) {
+        return new BrokerServiceException.ServiceUnitNotReadyException(
+                "Current service unit owner has no qualified native acquisition: " + serviceUnit);
+    }
+
     private CompletableFuture<Void> pubAsync(String serviceUnit, ServiceUnitStateData data) {
-        return tableview.put(serviceUnit, data)
+        return qualifiedRegistry().map(registry -> {
+            var transitions = registry.nativeOwnership().orElseThrow();
+            var previous = tableview.get(serviceUnit);
+            if (data.versionId() != getNextVersionId(previous)) {
+                return CompletableFuture.<Void>failedFuture(unqualifiedOwner(serviceUnit));
+            }
+            return transitions.prepare(previous, data, registry::readNativeIncarnation)
+                    .thenCompose(prepared -> transitions.publish(prepared, state -> {
+                        if (state(previous) == Owned) {
+                            if (!isTargetBroker(previous.dstBroker())
+                                    || !isTargetBroker(state.sourceBroker())
+                                    || !transitions.isLocal(previous)) {
+                                return CompletableFuture.failedFuture(unqualifiedOwner(serviceUnit));
+                            }
+                            nativeBundleFences.compute(serviceUnit, (unit, prior) -> {
+                                if (prior != null) {
+                                    prior.revoke();
+                                }
+                                var blocked = new NereusP1BundleFence(previous, transitions);
+                                blocked.revoke();
+                                return blocked;
+                            });
+                        }
+                        return ((ServiceUnitStateMetadataStoreTableViewImpl) tableview)
+                                .putQualified(serviceUnit, state);
+                    }));
+        }).orElseGet(() -> tableview.put(serviceUnit, data))
                 .whenComplete((__, e) -> {
                     if (e != null) {
                         log.error().attr("serviceUnit", serviceUnit).attr("data", data).exception(e)
@@ -1071,20 +1245,23 @@ public class ServiceUnitStateChannelImpl implements ServiceUnitStateChannel {
         long startTime = System.nanoTime();
         MutableInt unloadedTopics = new MutableInt();
         NamespaceBundle bundle = LoadManagerShared.getNamespaceBundle(pulsar, serviceUnit);
-        return pulsar.getBrokerService().unloadServiceUnit(
+        var brokerService = pulsar.getBrokerService();
+        var close = qualifiedRegistry().isPresent()
+                ? brokerService.unloadServiceUnit(bundle, true, false)
+                : brokerService.unloadServiceUnit(
                         bundle,
                         disconnectClients,
                         true,
                         pulsar.getConfig().getNamespaceBundleUnloadingTimeoutMs(),
-                        TimeUnit.MILLISECONDS)
-                .thenApply(numUnloadedTopics -> {
+                        TimeUnit.MILLISECONDS);
+        return close.thenApply(numUnloadedTopics -> {
                     unloadedTopics.setValue(numUnloadedTopics);
                     return numUnloadedTopics;
                 })
                 .whenComplete((__, ex) -> {
                     if (disconnectClients) {
                         // clean up topics that failed to unload from the broker ownership cache
-                        pulsar.getBrokerService().cleanUnloadedTopicFromCache(bundle);
+                        brokerService.cleanUnloadedTopicFromCache(bundle);
                     }
                     pulsar.getNamespaceService().onNamespaceBundleUnload(bundle);
                     double unloadBundleTime = TimeUnit.NANOSECONDS
@@ -1094,7 +1271,7 @@ public class ServiceUnitStateChannelImpl implements ServiceUnitStateChannel {
                                 .exception(ex)
                                 .log("Failed to close topics under bundle");
                         if (!disconnectClients) {
-                            pulsar.getBrokerService().cleanUnloadedTopicFromCache(bundle);
+                            brokerService.cleanUnloadedTopicFromCache(bundle);
                         }
                     } else {
                         log.info().attr("bundle", bundle).attr("topicCount", unloadedTopics)
@@ -1156,7 +1333,7 @@ public class ServiceUnitStateChannelImpl implements ServiceUnitStateChannel {
                         namespaceService, bundleFactory, parentBundle, namespaceBundles))
                 .thenAccept(__ -> // Update bundled_topic cache for load-report-generation
                         pulsar.getBrokerService().refreshTopicToStatsMaps(parentBundle))
-                .thenAccept(__ -> pubAsync(parentBundle.toString(), new ServiceUnitStateData(
+                .thenCompose(__ -> pubAsync(parentBundle.toString(), new ServiceUnitStateData(
                         Deleted, null, parentData.sourceBroker(), getNextVersionId(parentData))))
                 .thenAccept(__ -> {
                     double splitBundleTime = TimeUnit.NANOSECONDS.toMillis((System.nanoTime() - startTime));
@@ -1202,6 +1379,13 @@ public class ServiceUnitStateChannelImpl implements ServiceUnitStateChannel {
                 if (debug) {
                     log.info().attr("bundle", childBundleStr).log("Already owned child bundle");
                 }
+            } else if (qualifiedRegistry().isPresent()) {
+                futures.add(publishAssignEventAsync(childBundleStr, parentData.sourceBroker())
+                        .thenAccept(owner -> {
+                            if (!parentData.sourceBroker().equals(owner)) {
+                                throw new IllegalStateException("P1 split child belongs to another broker");
+                            }
+                        }));
             } else {
                 childData = new ServiceUnitStateData(Owned, parentData.sourceBroker(),
                         VERSION_ID_INIT);
@@ -1459,6 +1643,14 @@ public class ServiceUnitStateChannelImpl implements ServiceUnitStateChannel {
                                                       boolean gracefully) {
 
         final var version = getNextVersionId(orphanData);
+        if (qualifiedRegistry().isPresent()) {
+            if (gracefully && isTargetBroker(inactiveBroker)
+                    && orphanData.state() == Owned && isTargetBroker(orphanData.dstBroker())) {
+                return publishOverrideEventAsync(serviceUnit,
+                        new ServiceUnitStateData(Releasing, null, inactiveBroker, true, version));
+            }
+            return CompletableFuture.failedFuture(unqualifiedOwner(serviceUnit));
+        }
         return selectBroker(serviceUnit, inactiveBroker)
                 .thenApply(selectedOpt ->
                         selectedOpt.map(selectedBroker -> {

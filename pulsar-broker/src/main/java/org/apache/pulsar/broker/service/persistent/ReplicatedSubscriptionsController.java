@@ -42,6 +42,7 @@ import org.apache.commons.lang3.mutable.MutableBoolean;
 import org.apache.pulsar.broker.service.Replicator;
 import org.apache.pulsar.broker.service.Topic;
 import org.apache.pulsar.broker.stats.OpenTelemetryReplicatedSubscriptionStats;
+import org.apache.pulsar.broker.storage.nereus.v2.NereusPulsarActiveFence.ValidWord;
 import org.apache.pulsar.common.api.proto.ClusterMessageId;
 import org.apache.pulsar.common.api.proto.CommandAck.AckType;
 import org.apache.pulsar.common.api.proto.CommandSubscribe.InitialPosition;
@@ -328,9 +329,33 @@ public class ReplicatedSubscriptionsController implements AutoCloseable, Topic.P
 
     void writeMarker(ByteBuf marker) {
         try {
-            topic.publishMessage(marker, this);
+            topic.publishMessage(marker, topic.usesNativeStorage() ? new MarkerPublishContext() : this);
         } finally {
             marker.release();
+        }
+    }
+
+    private final class MarkerPublishContext implements Topic.PublishContext {
+        private ValidWord word;
+
+        @Override
+        public boolean isMarkerMessage() {
+            return true;
+        }
+
+        @Override
+        public void setStorageAuthorityWord(ValidWord value) {
+            word = value;
+        }
+
+        @Override
+        public ValidWord getStorageAuthorityWord() {
+            return word;
+        }
+
+        @Override
+        public void completed(Exception error, long ledgerId, long entryId) {
+            ReplicatedSubscriptionsController.this.completed(error, ledgerId, entryId);
         }
     }
 

@@ -20,12 +20,14 @@ package org.apache.pulsar.broker.loadbalance.extensions;
 
 import static org.apache.pulsar.broker.loadbalance.LoadManager.LOADBALANCE_BROKERS_ROOT;
 import com.google.common.annotations.VisibleForTesting;
+import java.io.IOException;
 import java.util.ArrayList;
 import java.util.EnumSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.RejectedExecutionException;
@@ -39,12 +41,16 @@ import org.apache.pulsar.broker.PulsarServerException;
 import org.apache.pulsar.broker.PulsarService;
 import org.apache.pulsar.broker.ServiceConfiguration;
 import org.apache.pulsar.broker.loadbalance.extensions.data.BrokerLookupData;
+import org.apache.pulsar.broker.storage.nereus.v2.NereusOwnershipId;
+import org.apache.pulsar.broker.storage.nereus.v2.NereusP1OwnershipTransitions;
 import org.apache.pulsar.common.util.FutureUtil;
+import org.apache.pulsar.common.util.ObjectMapperFactory;
 import org.apache.pulsar.metadata.api.MetadataCache;
 import org.apache.pulsar.metadata.api.MetadataStoreException;
 import org.apache.pulsar.metadata.api.Notification;
 import org.apache.pulsar.metadata.api.NotificationType;
 import org.apache.pulsar.metadata.api.extended.CreateOption;
+import org.apache.pulsar.metadata.api.extended.NereusOwnershipMetadataStore;
 import org.apache.pulsar.metadata.api.extended.SessionEvent;
 
 /**
@@ -62,6 +68,7 @@ public class BrokerRegistryImpl implements BrokerRegistry {
     private final BrokerLookupData brokerLookupData;
 
     private final MetadataCache<BrokerLookupData> brokerLookupDataMetadataCache;
+    private final Optional<NereusP1OwnershipTransitions> nativeOwnership;
 
     private final String brokerIdKeyPath;
 
@@ -88,6 +95,8 @@ public class BrokerRegistryImpl implements BrokerRegistry {
         this.scheduler = pulsar.getLoadManagerExecutor();
         this.listeners = new ArrayList<>();
         this.brokerIdKeyPath = keyPath(pulsar.getBrokerId());
+        this.nativeOwnership = pulsar.getLocalMetadataStore() instanceof NereusOwnershipMetadataStore qualified
+                ? Optional.of(new NereusP1OwnershipTransitions(qualified)) : Optional.empty();
         this.brokerLookupData = new BrokerLookupData(
                 pulsar.getBrokerId(),
                 pulsar.getWebServiceAddress(),
@@ -131,7 +140,8 @@ public class BrokerRegistryImpl implements BrokerRegistry {
     @Override
     public boolean isRegistered() {
         final var state = this.state.get();
-        return state == State.Registered;
+        return state == State.Registered
+                && nativeOwnership.map(NereusP1OwnershipTransitions::isRegistered).orElse(true);
     }
 
     @Override
@@ -144,7 +154,8 @@ public class BrokerRegistryImpl implements BrokerRegistry {
         }
         log.info().attr("broker", getBrokerId()).attr("brokerIdKeyPath", brokerIdKeyPath).attr("state", state)
                 .log("Started registering self");
-        return brokerLookupDataMetadataCache.put(brokerIdKeyPath, brokerLookupData, EnumSet.of(CreateOption.Ephemeral))
+        return nativeOwnership.map(this::registerNative).orElseGet(() -> brokerLookupDataMetadataCache.put(
+                        brokerIdKeyPath, brokerLookupData, EnumSet.of(CreateOption.Ephemeral)))
                 .orTimeout(pulsar.getConfiguration().getMetadataStoreOperationTimeoutSeconds(), TimeUnit.SECONDS)
                 .whenComplete((__, ex) -> {
                     if (ex == null) {
@@ -154,6 +165,33 @@ public class BrokerRegistryImpl implements BrokerRegistry {
                         log.error().attr("broker", getBrokerId()).exception(ex).log("Failed registering self");
                     }
                 });
+    }
+
+    private CompletableFuture<Void> registerNative(NereusP1OwnershipTransitions owner) {
+        var store = pulsar.getLocalMetadataStore();
+        var cut = owner.continuity();
+        return store.get(brokerIdKeyPath).thenCompose(existing -> {
+            if (existing.isPresent() && (!existing.get().getStat().isCreatedBySelf()
+                    || !existing.get().getStat().isEphemeral())) {
+                throw new IllegalStateException("native P1 broker ID is registered by another session");
+            }
+            var properties = owner.registrationProperties(brokerLookupData.properties(), cut, existing.isPresent());
+            byte[] bytes;
+            try {
+                bytes = ObjectMapperFactory.getMapper().writer()
+                        .writeValueAsBytes(brokerLookupData.withProperties(properties));
+            } catch (IOException failure) {
+                return CompletableFuture.failedFuture(failure);
+            }
+            long version = existing.map(value -> value.getStat().getVersion()).orElse(-1L);
+            return store.put(brokerIdKeyPath, bytes, Optional.of(version), EnumSet.of(CreateOption.Ephemeral))
+                    .thenAccept(stat -> {
+                        if (!stat.isEphemeral() || !stat.isCreatedBySelf()) {
+                            throw new IllegalStateException("native P1 registration was not bound to this session");
+                        }
+                        owner.registered(cut, properties.get(NereusP1OwnershipTransitions.INCARNATION_PROPERTY));
+                    });
+        });
     }
 
     private void doRegisterAsyncWithRetries(int retry, CompletableFuture<Void> future) {
@@ -178,7 +216,8 @@ public class BrokerRegistryImpl implements BrokerRegistry {
     public synchronized void unregister() throws MetadataStoreException {
         if (state.compareAndSet(State.Registered, State.Unregistering)) {
             try {
-                brokerLookupDataMetadataCache.delete(brokerIdKeyPath)
+                nativeOwnership.map(this::unregisterNative).orElseGet(() ->
+                                brokerLookupDataMetadataCache.delete(brokerIdKeyPath))
                         .get(conf.getMetadataStoreOperationTimeoutSeconds(), TimeUnit.SECONDS);
             } catch (ExecutionException e) {
                 if (e.getCause() instanceof MetadataStoreException.NotFoundException) {
@@ -192,6 +231,15 @@ public class BrokerRegistryImpl implements BrokerRegistry {
                 state.set(State.Started);
             }
         }
+    }
+
+    private CompletableFuture<Void> unregisterNative(NereusP1OwnershipTransitions owner) {
+        owner.loseRegistration();
+        var store = pulsar.getLocalMetadataStore();
+        return store.get(brokerIdKeyPath).thenCompose(result ->
+                result.filter(value -> value.getStat().isCreatedBySelf() && value.getStat().isEphemeral())
+                        .map(value -> store.delete(brokerIdKeyPath, Optional.of(value.getStat().getVersion())))
+                        .orElseGet(() -> CompletableFuture.completedFuture(null)));
     }
 
     @Override
@@ -209,6 +257,30 @@ public class BrokerRegistryImpl implements BrokerRegistry {
     public CompletableFuture<Optional<BrokerLookupData>> lookupAsync(String broker) {
         this.checkState();
         return brokerLookupDataMetadataCache.get(keyPath(broker));
+    }
+
+    public Optional<NereusP1OwnershipTransitions> nativeOwnership() {
+        return nativeOwnership;
+    }
+
+    /** Read the exact registration from the qualified native store, independently of the load-manager cache. */
+    public CompletableFuture<Optional<NereusOwnershipId>> readNativeIncarnation(String broker) {
+        return pulsar.getLocalMetadataStore().get(keyPath(broker)).thenApply(result -> result
+                .filter(value -> value.getStat().isEphemeral())
+                .flatMap(value -> {
+                    try {
+                        BrokerLookupData registration = ObjectMapperFactory.getMapper().reader()
+                                .readValue(value.getValue(), BrokerLookupData.class);
+                        if (!broker.equals(registration.brokerId())) {
+                            throw new IllegalStateException("native broker registration belongs to another broker");
+                        }
+                        return Optional.ofNullable(registration.properties())
+                                .map(properties -> properties.get(NereusP1OwnershipTransitions.INCARNATION_PROPERTY))
+                                .map(NereusOwnershipId::new);
+                    } catch (IOException failure) {
+                        throw new CompletionException(failure);
+                    }
+                }));
     }
 
     @Override
@@ -248,6 +320,13 @@ public class BrokerRegistryImpl implements BrokerRegistry {
             log.error().exception(ex).log("Unexpected error when unregistering the broker registry");
         } finally {
             this.state.set(State.Closed);
+            if (nativeOwnership.isPresent()) {
+                try {
+                    nativeOwnership.orElseThrow().close();
+                } catch (Exception failure) {
+                    throw PulsarServerException.from(failure);
+                }
+            }
         }
     }
 
@@ -263,6 +342,7 @@ public class BrokerRegistryImpl implements BrokerRegistry {
 
             CompletableFuture<Void> register;
             if (t.getType() == NotificationType.Deleted && getBrokerId().equals(brokerId)) {
+                nativeOwnership.ifPresent(NereusP1OwnershipTransitions::loseRegistration);
                 this.state.set(State.Started);
                 register = registerAsyncWithRetries();
             } else {

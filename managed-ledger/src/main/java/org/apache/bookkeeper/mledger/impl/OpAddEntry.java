@@ -56,6 +56,7 @@ public class OpAddEntry implements AddCallback, CloseCallback, Runnable, Managed
             AtomicReferenceFieldUpdater.newUpdater(OpAddEntry.class, AddEntryCallback.class, "callback");
     protected volatile AddEntryCallback callback;
     Object ctx;
+    Object nativeWritePermit;
     volatile long addOpCount;
     private static final AtomicLongFieldUpdater<OpAddEntry> ADD_OP_COUNT_UPDATER = AtomicLongFieldUpdater
             .newUpdater(OpAddEntry.class, "addOpCount");
@@ -107,6 +108,7 @@ public class OpAddEntry implements AddCallback, CloseCallback, Runnable, Managed
         op.dataLength = data.readableBytes();
         op.callback = callback;
         op.ctx = ctx;
+        op.nativeWritePermit = null;
         op.addOpCount = ManagedLedgerImpl.ADD_OP_COUNT_UPDATER.incrementAndGet(ml);
         op.closeWhenDone = false;
         op.entryId = -1;
@@ -384,6 +386,7 @@ public class OpAddEntry implements AddCallback, CloseCallback, Runnable, Managed
         STATE_UPDATER.set(OpAddEntry.this, State.CLOSED);
         OpAddEntry duplicate =
                 OpAddEntry.createNoRetainBuffer(ml, data, getNumberOfMessages(), callback, ctx, timeoutTriggered);
+        duplicate.nativeWritePermit = nativeWritePermit;
         return duplicate;
     }
 
@@ -433,6 +436,7 @@ public class OpAddEntry implements AddCallback, CloseCallback, Runnable, Managed
         dataLength = -1;
         callback = null;
         ctx = null;
+        nativeWritePermit = null;
         addOpCount = -1;
         closeWhenDone = false;
         entryId = -1;

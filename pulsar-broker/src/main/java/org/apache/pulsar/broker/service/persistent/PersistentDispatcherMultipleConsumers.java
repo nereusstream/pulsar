@@ -70,6 +70,7 @@ import org.apache.pulsar.broker.service.RedeliveryTrackerDisabled;
 import org.apache.pulsar.broker.service.SendMessageInfo;
 import org.apache.pulsar.broker.service.SharedConsumerAssignor;
 import org.apache.pulsar.broker.service.Subscription;
+import org.apache.pulsar.broker.storage.nereus.v2.NereusPulsarActiveFence.ValidWord;
 import org.apache.pulsar.broker.transaction.exception.buffer.TransactionBufferException;
 import org.apache.pulsar.common.api.proto.CommandSubscribe.SubType;
 import org.apache.pulsar.common.api.proto.MessageMetadata;
@@ -98,6 +99,13 @@ public class PersistentDispatcherMultipleConsumers extends AbstractPersistentDis
 
     protected volatile boolean havePendingRead = false;
     protected volatile boolean havePendingReplayRead = false;
+    private ValidWord normalReadAuthority;
+    private ValidWord replayReadAuthority;
+    private ValidWord sendingStorageAuthority;
+
+    protected ValidWord sendingStorageAuthority() {
+        return sendingStorageAuthority;
+    }
     protected volatile Position minReplayedPosition = null;
     protected boolean shouldRewindBeforeReadingOrReplaying = false;
     protected final String name;
@@ -339,6 +347,11 @@ public class PersistentDispatcherMultipleConsumers extends AbstractPersistentDis
     }
 
     public synchronized void readMoreEntries() {
+        var word = topic.captureStorageAuthority();
+        if (topic.usesNativeStorage() && !topic.isCurrentStorageAuthority(word)) {
+            topic.refreshStorageAuthority().thenRun(this::readMoreEntriesAsync);
+            return;
+        }
         if (cursor.isClosed()) {
             log.debug("Cursor is already closed, skipping read more entries");
             return;
@@ -382,6 +395,7 @@ public class PersistentDispatcherMultipleConsumers extends AbstractPersistentDis
                         .attr("consumerCount", consumerList.size())
                         .log("Schedule replay of messages for consumers");
                 havePendingReplayRead = true;
+                replayReadAuthority = word;
                 updateMinReplayedPosition();
                 Set<? extends Position> deletedMessages = topic.isDelayedDeliveryEnabled()
                         ? asyncReplayEntriesInOrder(messagesToReplayNow)
@@ -414,6 +428,7 @@ public class PersistentDispatcherMultipleConsumers extends AbstractPersistentDis
                         .attr("consumersCount", consumerList.size())
                         .log("Schedule read of messages");
                 havePendingRead = true;
+                normalReadAuthority = word;
                 updateMinReplayedPosition();
 
                 messagesToRead = Math.min(messagesToRead, getMaxEntriesReadLimit());
@@ -676,6 +691,12 @@ public class PersistentDispatcherMultipleConsumers extends AbstractPersistentDis
             havePendingReplayRead = false;
         }
 
+        var readAuthority = readType == ReadType.Normal ? normalReadAuthority : replayReadAuthority;
+        if (topic.usesNativeStorage() && !topic.isCurrentStorageAuthority(readAuthority)) {
+            discardStaleStorageRead(entries, readType);
+            return;
+        }
+
         if (readBatchSize < serviceConfig.getDispatcherMaxReadBatchSize()) {
             int newReadBatchSize = Math.min(readBatchSize * 2, serviceConfig.getDispatcherMaxReadBatchSize());
             log.debug()
@@ -713,17 +734,18 @@ public class PersistentDispatcherMultipleConsumers extends AbstractPersistentDis
             // in a separate thread, and we want to prevent more reads
             acquireSendInProgress();
             dispatchMessagesThread.execute(() -> {
-                handleSendingMessagesAndReadingMore(readType, entries, false, totalBytesSize);
+                handleSendingMessagesAndReadingMore(readType, entries, false, totalBytesSize, readAuthority);
             });
         } else {
-            handleSendingMessagesAndReadingMore(readType, entries, true, totalBytesSize);
+            handleSendingMessagesAndReadingMore(readType, entries, true, totalBytesSize, readAuthority);
         }
     }
 
     private synchronized void handleSendingMessagesAndReadingMore(ReadType readType, List<Entry> entries,
                                                                   boolean needAcquireSendInProgress,
-                                                                  long totalBytesSize) {
-        boolean triggerReadingMore = sendMessagesToConsumers(readType, entries, needAcquireSendInProgress);
+                                                                  long totalBytesSize, ValidWord readAuthority) {
+        boolean triggerReadingMore = sendMessagesToConsumers(readType, entries, needAcquireSendInProgress,
+                readAuthority);
         int entriesProcessed = lastNumberOfEntriesProcessed;
         updatePendingBytesToDispatch(-totalBytesSize);
         boolean canReadMoreImmediately = false;
@@ -757,14 +779,33 @@ public class PersistentDispatcherMultipleConsumers extends AbstractPersistentDis
         return sendInProgress;
     }
 
+    private void discardStaleStorageRead(List<Entry> entries, ReadType readType) {
+        entries.forEach(Entry::release);
+        if (readType == ReadType.Normal) {
+            cursor.rewind();
+        }
+        topic.refreshStorageAuthority().thenRun(this::readMoreEntriesAsync);
+    }
+
     protected final synchronized boolean sendMessagesToConsumers(ReadType readType, List<Entry> entries,
                                                                  boolean needAcquireSendInProgress) {
+        return sendMessagesToConsumers(readType, entries, needAcquireSendInProgress, null);
+    }
+
+    private synchronized boolean sendMessagesToConsumers(ReadType readType, List<Entry> entries,
+                                                         boolean needAcquireSendInProgress, ValidWord readAuthority) {
         if (needAcquireSendInProgress) {
             acquireSendInProgress();
         }
         try {
+            if (topic.usesNativeStorage() && !topic.isCurrentStorageAuthority(readAuthority)) {
+                discardStaleStorageRead(entries, readType);
+                return false;
+            }
+            sendingStorageAuthority = readAuthority;
             return trySendMessagesToConsumers(readType, entries);
         } finally {
+            sendingStorageAuthority = null;
             releaseSendInProgress();
         }
     }
@@ -860,6 +901,7 @@ public class PersistentDispatcherMultipleConsumers extends AbstractPersistentDis
             SendMessageInfo sendMessageInfo = SendMessageInfo.getThreadLocal();
 
             EntryBatchSizes batchSizes = EntryBatchSizes.get(entriesForThisConsumer.size());
+            batchSizes.setStorageAuthorityWord(sendingStorageAuthority());
             EntryBatchIndexesAcks batchIndexesAcks = EntryBatchIndexesAcks.get(entriesForThisConsumer.size());
 
             totalEntries += filterEntriesForConsumer(metadataArray, start,
@@ -969,6 +1011,7 @@ public class PersistentDispatcherMultipleConsumers extends AbstractPersistentDis
             }
             final SendMessageInfo sendMessageInfo = SendMessageInfo.getThreadLocal();
             final EntryBatchSizes batchSizes = EntryBatchSizes.get(messagesForC);
+            batchSizes.setStorageAuthorityWord(sendingStorageAuthority());
             final EntryBatchIndexesAcks batchIndexesAcks = EntryBatchIndexesAcks.get(messagesForC);
 
             totalEntries += filterEntriesForConsumer(entryAndMetadataList, batchSizes, sendMessageInfo,

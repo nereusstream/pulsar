@@ -19,9 +19,19 @@
 package org.apache.pulsar.broker.service;
 
 import io.netty.util.Recycler;
+import org.apache.pulsar.broker.storage.nereus.v2.NereusPulsarActiveFence.ValidWord;
 
 public class EntryBatchSizes {
     private int[] sizes = new int[100];
+    private ValidWord storageAuthorityWord;
+
+    public void setStorageAuthorityWord(ValidWord word) {
+        this.storageAuthorityWord = word;
+    }
+
+    public ValidWord getStorageAuthorityWord() {
+        return storageAuthorityWord;
+    }
 
     public int getBatchSize(int entryIdx) {
         return sizes[entryIdx];
@@ -32,6 +42,7 @@ public class EntryBatchSizes {
     }
 
     public void recyle() {
+        storageAuthorityWord = null;
         handle.recycle(this);
     }
 

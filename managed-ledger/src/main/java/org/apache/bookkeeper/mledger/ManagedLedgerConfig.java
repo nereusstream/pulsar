@@ -24,6 +24,7 @@ import java.nio.charset.StandardCharsets;
 import java.time.Clock;
 import java.util.Arrays;
 import java.util.Map;
+import java.util.concurrent.CompletionStage;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
@@ -44,6 +45,19 @@ import org.apache.pulsar.common.util.collections.OpenLongPairRangeSet;
 @InterfaceAudience.LimitedPrivate
 @InterfaceStability.Stable
 public class ManagedLedgerConfig implements Cloneable {
+
+    /** Optional Broker authority at physical write dispatch, after any native ledger rollover. */
+    public interface NativeWriteAuthority {
+        CompletionStage<Void> refresh();
+
+        Object capture(Object publishContext);
+
+        boolean isCurrent(Object permit);
+    }
+
+    @Getter
+    @Setter
+    private NativeWriteAuthority nativeWriteAuthority;
 
     private boolean createIfMissing = true;
     private int maxUnackedRangesToPersist = 10000;

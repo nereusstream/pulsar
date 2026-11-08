@@ -78,6 +78,37 @@ public class NereusPulsarAuthorityInstallerTest {
     }
 
     @Test
+    public void refreshCannotAuthorizeACompletionCapturedBeforeInvalidation() {
+        var control = new ArrayDeque<Runnable>();
+        var topic = new NereusPulsarTopicAuthority(control::add,
+                invalidated -> installer.install(SERVICE_UNIT, INCARNATION, null, invalidated));
+        var started = topic.requestRefresh();
+        control.remove().run();
+        started.join();
+        var original = topic.captureOrNull();
+        assertThat(topic.isCurrent(original)).isTrue();
+
+        bindings.invalidate();
+        assertThat(topic.isCurrent(original)).isFalse();
+        witnesses.add(witness("11111111111111111111111111111111", 7));
+        witnesses.add(witness("11111111111111111111111111111111", 7));
+        control.remove().run();
+        var refreshed = topic.captureOrNull();
+        assertThat(refreshed).isNotNull().isNotSameAs(original);
+        assertThat(topic.isCurrent(original)).isFalse();
+        assertThat(topic.isCurrent(refreshed)).isTrue();
+
+        bindings.invalidate();
+        var closing = topic.closeAsync();
+        assertThat(closing).isNotDone();
+        witnesses.add(witness("11111111111111111111111111111111", 7));
+        witnesses.add(witness("11111111111111111111111111111111", 7));
+        control.remove().run();
+        closing.join();
+        assertThat(topic.captureOrNull()).isNull();
+    }
+
+    @Test
     public void closingInstallationInvalidatesItsWordBeforeClosingRegistration() throws Exception {
         var installation = installer.install(SERVICE_UNIT, INCARNATION).toCompletableFuture().join();
 

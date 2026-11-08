@@ -59,6 +59,18 @@ public final class NereusPulsarAuthorityInstaller {
 
     public CompletionStage<Installation> install(
             String serviceUnit, PulsarTopicIncarnationIdentity expectedIncarnation) {
+        return install(serviceUnit, expectedIncarnation, null);
+    }
+
+    public CompletionStage<Installation> install(
+            String serviceUnit, PulsarTopicIncarnationIdentity expectedIncarnation,
+            NereusP1BundleFence nativeBundleFence) {
+        return install(serviceUnit, expectedIncarnation, nativeBundleFence, () -> { });
+    }
+
+    public CompletionStage<Installation> install(
+            String serviceUnit, PulsarTopicIncarnationIdentity expectedIncarnation,
+            NereusP1BundleFence nativeBundleFence, Runnable invalidated) {
         Objects.requireNonNull(serviceUnit, "serviceUnit");
         Objects.requireNonNull(expectedIncarnation, "expectedIncarnation");
         NereusPulsarActiveFence.Word initial = fence.current();
@@ -68,10 +80,7 @@ public final class NereusPulsarAuthorityInstaller {
 
         AutoCloseable registration;
         try {
-            registration = bindingProvider.armInvalidation(
-                    expectedIncarnation,
-                    invalidationEpoch ->
-                            fence.invalidateIfSequenceCurrent(expectedInvalid.sequence(), invalidationEpoch));
+            registration = armInvalidations(expectedIncarnation, nativeBundleFence, expectedInvalid, invalidated);
         } catch (RuntimeException failure) {
             return CompletableFuture.failedFuture(failure);
         }
@@ -94,7 +103,8 @@ public final class NereusPulsarAuthorityInstaller {
                                                         permit,
                                                         first,
                                                         active,
-                                                        last))))))
+                                                        last,
+                                                        nativeBundleFence))))))
                 .toCompletableFuture();
         return result.whenComplete((installed, failure) -> {
             if (failure != null) {
@@ -103,15 +113,44 @@ public final class NereusPulsarAuthorityInstaller {
         }).thenApply(word -> new Installation(word, fence, registration));
     }
 
+    private AutoCloseable armInvalidations(
+            PulsarTopicIncarnationIdentity incarnation, NereusP1BundleFence bundleFence,
+            NereusPulsarActiveFence.InvalidWord expected, Runnable invalidated) {
+        java.util.function.LongConsumer invalidate = epoch -> {
+            if (fence.invalidateIfSequenceCurrent(expected.sequence(), epoch)) {
+                invalidated.run();
+            }
+        };
+        var binding = bindingProvider.armInvalidation(incarnation, invalidate);
+        if (bundleFence == null) {
+            return binding;
+        }
+        try {
+            var nativeRegistration = bundleFence.arm(() -> invalidate.accept(expected.continuityEpoch()));
+            return () -> {
+                try (binding; nativeRegistration) {
+                    // Close both registrations even if one fails.
+                }
+            };
+        } catch (RuntimeException failure) {
+            closeQuietly(binding);
+            throw failure;
+        }
+    }
+
     private NereusPulsarActiveFence.ValidWord verifyAndInstall(
             NereusPulsarActiveFence.InvalidWord expectedInvalid,
             PulsarTopicIncarnationIdentity expectedIncarnation,
             NereusContinuityPermit permit,
             NereusOwnershipWitness first,
             NereusPulsarBindingAuthority binding,
-            NereusOwnershipWitness last) {
+            NereusOwnershipWitness last,
+            NereusP1BundleFence bundleFence) {
         if (!first.equals(last)) {
             throw new IllegalStateException("authoritative ownership changed across A/read/B");
+        }
+        if (bundleFence != null && (!bundleFence.matches(last) || !bundleFence.isCurrent())) {
+            throw new IllegalStateException("authoritative witness does not match the current native acquisition");
         }
         if (!binding.incarnation().equals(expectedIncarnation)) {
             throw new IllegalStateException("ACTIVE binding authority does not match the expected incarnation");

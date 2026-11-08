@@ -944,6 +944,9 @@ public class ManagedLedgerImpl implements ManagedLedger, CreateCallback {
         } else {
             checkArgument(state == State.LedgerOpened, "ledger=%s is not opened", state);
 
+            if (!admitNativeWrite(addOperation)) {
+                return;
+            }
             // Write into lastLedger
             addOperation.setLedger(currentLedger);
             addOperation.setTimeoutTriggered(currentLedgerTimeoutTriggered);
@@ -964,6 +967,22 @@ public class ManagedLedgerImpl implements ManagedLedger, CreateCallback {
         }
         // mark add entry activity
         lastAddEntryTimeMs = System.currentTimeMillis();
+    }
+
+    private boolean admitNativeWrite(OpAddEntry operation) {
+        var authority = config.getNativeWriteAuthority();
+        if (authority == null) {
+            return true;
+        }
+        if (operation.nativeWritePermit == null) {
+            operation.nativeWritePermit = authority.capture(operation.getCtx());
+        }
+        if (!authority.isCurrent(operation.nativeWritePermit)) {
+            pendingAddEntries.remove(operation);
+            operation.failed(new ManagedLedgerException("Native write authority is no longer current"));
+            return false;
+        }
+        return true;
     }
 
     protected void afterFailedAddEntry(int numOfMessages) {
@@ -1944,6 +1963,36 @@ public class ManagedLedgerImpl implements ManagedLedger, CreateCallback {
     }
 
     protected synchronized void updateLedgersIdsComplete(@Nullable LedgerHandle originalCurrentLedger) {
+        var authority = config.getNativeWriteAuthority();
+        if (authority == null || pendingAddEntries.isEmpty()) {
+            activateRolledLedger(originalCurrentLedger, null);
+            return;
+        }
+        var ledger = currentLedger;
+        var terminal = new CompletableFuture<Void>();
+        synchronized (nativeCreationOperations) {
+            nativeCreationOperations.add(terminal);
+        }
+        CompletableFuture.completedFuture(authority).thenCompose(ManagedLedgerConfig.NativeWriteAuthority::refresh)
+                .whenCompleteAsync((unused, failure) -> {
+                    synchronized (this) {
+                        if (currentLedger == ledger && STATE_UPDATER.get(this) == State.CreatingLedger) {
+                            activateRolledLedger(originalCurrentLedger, failure);
+                        }
+                    }
+                }, executor).whenComplete((unused, failure) -> {
+                    if (failure == null) {
+                        terminal.complete(null);
+                    } else {
+                        terminal.completeExceptionally(failure);
+                    }
+                    synchronized (nativeCreationOperations) {
+                        nativeCreationOperations.remove(terminal);
+                    }
+                });
+    }
+
+    private void activateRolledLedger(@Nullable LedgerHandle originalCurrentLedger, Throwable refreshFailure) {
         STATE_UPDATER.set(this, State.LedgerOpened);
         // Delete original "currentLedger" if it has been removed from "ledgers".
         if (originalCurrentLedger != null && !ledgers.containsKey(originalCurrentLedger.getId())){
@@ -1954,6 +2003,10 @@ public class ManagedLedgerImpl implements ManagedLedger, CreateCallback {
             }, null);
         }
         updateLastLedgerCreatedTimeAndScheduleRolloverTask();
+        if (refreshFailure != null) {
+            clearPendingAddEntries(new ManagedLedgerException(refreshFailure));
+            return;
+        }
 
         log.debug().attr("count", pendingAddEntries.size()).log("Resending pending messages");
 
@@ -1961,6 +2014,9 @@ public class ManagedLedgerImpl implements ManagedLedger, CreateCallback {
 
         // Process all the pending addEntry requests
         for (OpAddEntry op : pendingAddEntries) {
+            if (!admitNativeWrite(op)) {
+                continue;
+            }
             ++currentLedgerEntries;
             currentLedgerSize += op.data.readableBytes();
 

@@ -239,6 +239,24 @@ public class PulsarCommandSenderImpl implements PulsarCommandSender {
         final ChannelHandlerContext ctx = cnx.ctx();
         final ChannelPromise writePromise = ctx.newPromise();
         ctx.channel().eventLoop().execute(() -> {
+            if (subscription.getTopic()
+                    instanceof org.apache.pulsar.broker.service.persistent.PersistentTopic persistent
+                    && persistent.usesNativeStorage()
+                    && !persistent.isCurrentStorageAuthority(batchSizes.getStorageAuthorityWord())) {
+                entries.forEach(entry -> {
+                    if (entry != null) {
+                        entry.release();
+                    }
+                });
+                batchSizes.recyle();
+                if (batchIndexesAcks != null) {
+                    batchIndexesAcks.recycle();
+                }
+                writePromise.setFailure(new BrokerServiceException.TopicFencedException(
+                        "Native storage ownership changed before delivery"));
+                ctx.close();
+                return;
+            }
             // this list is always accessed in the same thread (the eventLoop here)
             // and in the completion of the writePromise
             // it is safe to use a simple ArrayList

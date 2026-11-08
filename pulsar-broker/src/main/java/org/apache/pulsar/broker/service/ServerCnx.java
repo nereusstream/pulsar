@@ -2706,10 +2706,25 @@ public class ServerCnx extends PulsarHandler implements TransportCnx {
                         .log("Ignoring message acks during topic transfer. Total ignored ack count");
                 return;
             }
-            consumer.messageAcked(ack, hasRequestId).thenRun(() -> {
+            var nativeTopic = subscription.getTopic() instanceof PersistentTopic value && value.usesNativeStorage()
+                    ? value : null;
+            var authority = nativeTopic == null ? null : nativeTopic.captureStorageAuthority();
+            var result = nativeTopic == null ? consumer.messageAcked(ack, hasRequestId)
+                    : consumer.messageAcked(ack, hasRequestId, nativeTopic, authority);
+            result.thenRun(() -> {
                 if (hasRequestId) {
-                    writeAndFlush(Commands.newAckResponse(
-                            requestId, null, null, consumerId));
+                    if (nativeTopic == null) {
+                        writeAndFlush(Commands.newAckResponse(requestId, null, null, consumerId));
+                    } else {
+                        ctx.executor().execute(() -> {
+                            if (nativeTopic.isCurrentStorageAuthority(authority)) {
+                                writeAndFlush(Commands.newAckResponse(requestId, null, null, consumerId));
+                            } else {
+                                writeAndFlush(Commands.newAckResponse(requestId, ServerError.ServiceNotReady,
+                                        "Native storage ownership changed before acknowledgment receipt", consumerId));
+                            }
+                        });
+                    }
                 }
                 if (brokerInterceptor != null) {
                     try {

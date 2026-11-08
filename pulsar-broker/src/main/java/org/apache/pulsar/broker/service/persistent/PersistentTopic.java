@@ -143,6 +143,8 @@ import org.apache.pulsar.broker.service.schema.exceptions.NotExistSchemaExceptio
 import org.apache.pulsar.broker.stats.ClusterReplicationMetrics;
 import org.apache.pulsar.broker.stats.NamespaceStats;
 import org.apache.pulsar.broker.stats.ReplicationMetrics;
+import org.apache.pulsar.broker.storage.nereus.v2.NereusPulsarActiveFence.ValidWord;
+import org.apache.pulsar.broker.storage.nereus.v2.NereusPulsarManagedLedgerStorage;
 import org.apache.pulsar.broker.transaction.buffer.TransactionBuffer;
 import org.apache.pulsar.broker.transaction.buffer.impl.TopicTransactionBuffer;
 import org.apache.pulsar.broker.transaction.buffer.impl.TransactionBufferDisable;
@@ -217,6 +219,7 @@ public class PersistentTopic extends AbstractTopic implements Topic, AddEntryCal
 
     // Managed ledger associated with the topic
     protected final ManagedLedger ledger;
+    private volatile NereusPulsarManagedLedgerStorage.OpenedLedger nativeStorage;
 
     // Subscriptions to this topic
     private final Map<String, PersistentSubscription> subscriptions = new ConcurrentHashMap<>();
@@ -641,13 +644,59 @@ public class PersistentTopic extends AbstractTopic implements Topic, AddEntryCal
         return COMPACTION_SUBSCRIPTION.equals(subscriptionName);
     }
 
+    public void setNativeStorageAuthority(NereusPulsarManagedLedgerStorage.OpenedLedger opened) {
+        if (nativeStorage != null) {
+            throw new IllegalStateException("Native storage authority was already set");
+        }
+        nativeStorage = Objects.requireNonNull(opened);
+    }
+
+    public boolean hasCurrentStorageAuthority() {
+        var opened = nativeStorage;
+        return opened == null || opened.authority().captureOrNull() != null;
+    }
+
+    public ValidWord captureStorageAuthority() {
+        var opened = nativeStorage;
+        return opened == null ? null : opened.authority().captureOrNull();
+    }
+
+    public boolean usesNativeStorage() {
+        return nativeStorage != null;
+    }
+
+    public boolean isCurrentStorageAuthority(ValidWord word) {
+        var opened = nativeStorage;
+        return opened == null || opened.authority().isCurrent(word);
+    }
+
+    public CompletableFuture<Void> refreshStorageAuthority() {
+        var opened = nativeStorage;
+        return opened == null ? CompletableFuture.completedFuture(null) : opened.authority().requestRefresh();
+    }
+
+    private void completeNativeCheckedPublish(PublishContext context, long ledgerId, long entryId) {
+        if (isCurrentStorageAuthority(context.getStorageAuthorityWord())) {
+            context.completed(null, ledgerId, entryId);
+        } else {
+            context.completed(new TopicFencedException("Native storage ownership changed"), -1, -1);
+        }
+    }
+
     @Override
     public void publishMessage(ByteBuf headersAndPayload, PublishContext publishContext) {
         pendingWriteOps.incrementAndGet();
-        if (isFenced) {
+        var word = captureStorageAuthority();
+        if (isFenced || !isCurrentStorageAuthority(word)) {
+            if (!isFenced) {
+                refreshStorageAuthority();
+            }
             publishContext.completed(new TopicFencedException("fenced"), -1, -1);
             decrementPendingWriteOpsAndCheck();
             return;
+        }
+        if (word != null) {
+            publishContext.setStorageAuthorityWord(word);
         }
         if (isExceedMaximumMessageSize(headersAndPayload.readableBytes(), publishContext)) {
             publishContext.completed(new NotAllowedException("Exceed maximum message size"), -1, -1);
@@ -671,7 +720,7 @@ public class PersistentTopic extends AbstractTopic implements Topic, AddEntryCal
                 break;
             case Dup:
                 // Immediately acknowledge duplicated message
-                publishContext.completed(null, -1, -1);
+                completeNativeCheckedPublish(publishContext, -1, -1);
                 decrementPendingWriteOpsAndCheck();
                 break;
             default:
@@ -755,7 +804,7 @@ public class PersistentTopic extends AbstractTopic implements Topic, AddEntryCal
         transactionBuffer.syncMaxReadPositionForNormalPublish(ledger.getLastConfirmedEntry(),
                 publishContext.isMarkerMessage());
         publishContext.setMetadataFromEntryData(entryData);
-        publishContext.completed(null, position.getLedgerId(), position.getEntryId());
+        completeNativeCheckedPublish(publishContext, position.getLedgerId(), position.getEntryId());
         decrementPendingWriteOpsAndCheck();
     }
 
@@ -1785,6 +1834,11 @@ public class PersistentTopic extends AbstractTopic implements Topic, AddEntryCal
     @Override
     public CompletableFuture<Void> close(
             boolean disconnectClients, boolean closeWithoutWaitingClientDisconnect) {
+        var opened = nativeStorage;
+        var authority = opened == null ? null : opened.authority();
+        if (authority != null) {
+            authority.stop();
+        }
         lock.writeLock().lock();
         // Choose the close type.
         CloseTypes closeType;
@@ -1896,6 +1950,21 @@ public class PersistentTopic extends AbstractTopic implements Topic, AddEntryCal
         Runnable closeLedgerAfterCloseClients = (() -> ledger.asyncClose(new CloseCallback() {
             @Override
             public void closeComplete(Object ctx) {
+                if (opened != null) {
+                    try {
+                        authority.closeAsync().thenCompose(unused -> opened.closeScope().get())
+                                .whenComplete((unused, error) -> {
+                            if (error == null) {
+                                disposeTopic(closeFuture);
+                            } else {
+                                closeFuture.completeExceptionally(error);
+                            }
+                        });
+                    } catch (Exception e) {
+                        closeFuture.completeExceptionally(e);
+                    }
+                    return;
+                }
                 if (closeType != CloseTypes.transferring) {
                     // Everything is now closed, remove the topic from map
                     disposeTopic(closeFuture);
@@ -1906,6 +1975,10 @@ public class PersistentTopic extends AbstractTopic implements Topic, AddEntryCal
 
             @Override
             public void closeFailed(ManagedLedgerException exception, Object ctx) {
+                if (authority != null) {
+                    closeFuture.completeExceptionally(exception);
+                    return;
+                }
                 log.error()
                         .exception(exception)
                         .log("Failed to close managed ledger, proceeding anyway.");
@@ -4776,10 +4849,17 @@ public class PersistentTopic extends AbstractTopic implements Topic, AddEntryCal
     public void publishTxnMessage(TxnID txnID, ByteBuf headersAndPayload, PublishContext publishContext) {
         pendingWriteOps.incrementAndGet();
 
-        if (isFenced) {
+        var word = captureStorageAuthority();
+        if (isFenced || !isCurrentStorageAuthority(word)) {
+            if (!isFenced) {
+                refreshStorageAuthority();
+            }
             publishContext.completed(new TopicFencedException("fenced"), -1, -1);
             decrementPendingWriteOpsAndCheck();
             return;
+        }
+        if (word != null) {
+            publishContext.setStorageAuthorityWord(word);
         }
         if (isExceedMaximumMessageSize(headersAndPayload.readableBytes(), publishContext)) {
             publishContext.completed(new NotAllowedException("Exceed maximum message size"), -1, -1);
@@ -4805,7 +4885,7 @@ public class PersistentTopic extends AbstractTopic implements Topic, AddEntryCal
                             messageDeduplication.recordMessagePersisted(publishContext,
                                     position);
                             publishContext.setProperty("txn_id", txnID.toString());
-                            publishContext.completed(null, position.getLedgerId(),
+                            completeNativeCheckedPublish(publishContext, position.getLedgerId(),
                                     position.getEntryId());
 
                             decrementPendingWriteOpsAndCheck();
@@ -4823,7 +4903,7 @@ public class PersistentTopic extends AbstractTopic implements Topic, AddEntryCal
                 break;
             case Dup:
                 // Immediately acknowledge duplicated message
-                publishContext.completed(null, -1, -1);
+                completeNativeCheckedPublish(publishContext, -1, -1);
                 decrementPendingWriteOpsAndCheck();
                 break;
             default:

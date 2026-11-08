@@ -131,6 +131,7 @@ import org.apache.pulsar.broker.stats.prometheus.PulsarPrometheusMetricsServlet;
 import org.apache.pulsar.broker.storage.BookkeeperManagedLedgerStorageClass;
 import org.apache.pulsar.broker.storage.ManagedLedgerStorage;
 import org.apache.pulsar.broker.storage.ManagedLedgerStorageClass;
+import org.apache.pulsar.broker.storage.nereus.v2.NereusPulsarManagedLedgerStorage;
 import org.apache.pulsar.broker.transaction.buffer.TransactionBufferProvider;
 import org.apache.pulsar.broker.transaction.buffer.impl.TransactionBufferClientImpl;
 import org.apache.pulsar.broker.transaction.coordinator.v5.TransactionCoordinatorV5;
@@ -624,6 +625,9 @@ public class PulsarService implements AutoCloseable, ShutdownService {
                 try {
                     this.managedLedgerStorage.close();
                 } catch (Exception e) {
+                    if (this.managedLedgerStorage instanceof NereusPulsarManagedLedgerStorage) {
+                        throw e;
+                    }
                     log.warn().exceptionMessage(e).log("ManagedLedgerClientFactory closing failed");
                 }
                 this.managedLedgerStorage = null;

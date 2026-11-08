@@ -54,6 +54,7 @@ import org.apache.pulsar.broker.authentication.AuthenticationDataSubscription;
 import org.apache.pulsar.broker.loadbalance.extensions.data.BrokerLookupData;
 import org.apache.pulsar.broker.service.persistent.PersistentSubscription;
 import org.apache.pulsar.broker.service.persistent.PersistentTopic;
+import org.apache.pulsar.broker.storage.nereus.v2.NereusPulsarActiveFence.ValidWord;
 import org.apache.pulsar.client.api.MessageId;
 import org.apache.pulsar.client.api.transaction.TxnID;
 import org.apache.pulsar.common.api.proto.CommandAck;
@@ -521,6 +522,19 @@ public class Consumer {
     }
 
     public CompletableFuture<Void> messageAcked(CommandAck ack, boolean requirePersistedAck) {
+        var persistent = subscription.getTopic() instanceof PersistentTopic value && value.usesNativeStorage()
+                ? value : null;
+        var word = persistent == null ? null : persistent.captureStorageAuthority();
+        return messageAcked(ack, requirePersistedAck, persistent, word);
+    }
+
+    CompletableFuture<Void> messageAcked(
+            CommandAck ack, boolean requirePersistedAck, PersistentTopic persistent, ValidWord word) {
+        if (persistent != null && !persistent.isCurrentStorageAuthority(word)) {
+            persistent.refreshStorageAuthority();
+            return CompletableFuture.failedFuture(new BrokerServiceException.TopicFencedException(
+                    "Native storage ownership changed before acknowledgment"));
+        }
         CompletableFuture<Long> future;
 
         this.lastAckedTimestamp = System.currentTimeMillis();
@@ -571,6 +585,11 @@ public class Consumer {
 
         return future
                 .thenApply(v -> {
+                    if (persistent != null && !persistent.isCurrentStorageAuthority(word)) {
+                        throw new java.util.concurrent.CompletionException(
+                                new BrokerServiceException.TopicFencedException(
+                                        "Native storage ownership changed during acknowledgment"));
+                    }
                     this.messageAckRate.recordEvent(v);
                     this.messageAckCounter.add(v);
                     return null;

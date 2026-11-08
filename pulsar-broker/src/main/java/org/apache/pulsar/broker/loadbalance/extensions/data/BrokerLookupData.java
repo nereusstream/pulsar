@@ -43,6 +43,12 @@ public record BrokerLookupData (String brokerId,
                                 long startTimestamp,
                                 String brokerVersion,
                                 Map<String, String> properties) implements ServiceLookupData {
+    public BrokerLookupData withProperties(Map<String, String> updated) {
+        return new BrokerLookupData(brokerId, webServiceUrl, webServiceUrlTls, pulsarServiceUrl,
+                pulsarServiceUrlTls, advertisedListeners, protocols, persistentTopicsEnabled,
+                nonPersistentTopicsEnabled, loadManagerClassName, startTimestamp, brokerVersion, updated);
+    }
+
     @Override
     public String getBrokerId() {
         return this.brokerId;

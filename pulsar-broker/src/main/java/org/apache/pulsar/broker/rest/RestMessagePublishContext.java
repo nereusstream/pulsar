@@ -25,6 +25,7 @@ import lombok.CustomLog;
 import org.apache.bookkeeper.mledger.Position;
 import org.apache.bookkeeper.mledger.PositionFactory;
 import org.apache.pulsar.broker.service.Topic;
+import org.apache.pulsar.broker.storage.nereus.v2.NereusPulsarActiveFence.ValidWord;
 
 /**
  * PublishContext implementation for REST message publishing.
@@ -35,6 +36,17 @@ public class RestMessagePublishContext implements Topic.PublishContext {
     private Topic topic;
     private long startTimeNs;
     private CompletableFuture<Position> positionFuture;
+    private ValidWord storageAuthorityWord;
+
+    @Override
+    public void setStorageAuthorityWord(ValidWord word) {
+        this.storageAuthorityWord = word;
+    }
+
+    @Override
+    public ValidWord getStorageAuthorityWord() {
+        return storageAuthorityWord;
+    }
 
     /**
      * Executed from managed ledger thread when the message is persisted.
@@ -78,6 +90,7 @@ public class RestMessagePublishContext implements Topic.PublishContext {
 
     public void recycle() {
         topic = null;
+        storageAuthorityWord = null;
         startTimeNs = -1;
         recyclerHandle.recycle(this);
     }

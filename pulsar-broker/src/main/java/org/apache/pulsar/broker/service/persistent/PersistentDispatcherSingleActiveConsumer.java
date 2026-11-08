@@ -50,6 +50,7 @@ import org.apache.pulsar.broker.service.RedeliveryTracker;
 import org.apache.pulsar.broker.service.RedeliveryTrackerDisabled;
 import org.apache.pulsar.broker.service.SendMessageInfo;
 import org.apache.pulsar.broker.service.Subscription;
+import org.apache.pulsar.broker.storage.nereus.v2.NereusPulsarActiveFence.ValidWord;
 import org.apache.pulsar.broker.transaction.exception.buffer.TransactionBufferException;
 import org.apache.pulsar.client.api.MessageId;
 import org.apache.pulsar.common.api.proto.CommandSubscribe.SubType;
@@ -159,13 +160,21 @@ public class PersistentDispatcherSingleActiveConsumer extends AbstractDispatcher
         }
     }
 
-    private synchronized void readEntriesComplete(List<Entry> entries, Consumer readConsumer, long epoch) {
+    private synchronized void readEntriesComplete(
+            List<Entry> entries, Consumer readConsumer, long epoch,
+            ValidWord word) {
         log.debug()
                 .attr("readConsumer", readConsumer)
                 .attr("size", entries.size())
                 .log("Got messages");
 
         havePendingRead = false;
+        if (topic.usesNativeStorage() && !topic.isCurrentStorageAuthority(word)) {
+            entries.forEach(Entry::release);
+            cursor.rewind(readConsumer.readCompacted());
+            topic.refreshStorageAuthority().thenRunAsync(() -> readMoreEntries(getActiveConsumer()), executor);
+            return;
+        }
         isFirstRead = false;
 
         if (readBatchSize < serviceConfig.getDispatcherMaxReadBatchSize()) {
@@ -215,6 +224,7 @@ public class PersistentDispatcherSingleActiveConsumer extends AbstractDispatcher
             }
         } else {
             EntryBatchSizes batchSizes = EntryBatchSizes.get(entries.size());
+            batchSizes.setStorageAuthorityWord(word);
             SendMessageInfo sendMessageInfo = SendMessageInfo.getThreadLocal();
             EntryBatchIndexesAcks batchIndexesAcks = EntryBatchIndexesAcks.get(entries.size());
             filterEntriesForConsumer(entries, batchSizes, sendMessageInfo, batchIndexesAcks, cursor, false,
@@ -313,6 +323,11 @@ public class PersistentDispatcherSingleActiveConsumer extends AbstractDispatcher
 
     @VisibleForTesting
     void readMoreEntries(Consumer consumer) {
+        var word = topic.captureStorageAuthority();
+        if (topic.usesNativeStorage() && !topic.isCurrentStorageAuthority(word)) {
+            topic.refreshStorageAuthority().thenRunAsync(() -> readMoreEntries(getActiveConsumer()), executor);
+            return;
+        }
         if (cursor.isClosed()) {
             log.debug("Cursor is already closed, skipping read more entries");
             return;
@@ -379,7 +394,7 @@ public class PersistentDispatcherSingleActiveConsumer extends AbstractDispatcher
                 }
                 entriesFuture.whenCompleteAsync((entries, e) -> {
                     if (e == null) {
-                        readEntriesComplete(entries, consumer, epoch);
+                        readEntriesComplete(entries, consumer, epoch, word);
                     } else {
                         readEntriesFailed(e, consumer);
                     }

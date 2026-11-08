@@ -51,6 +51,7 @@ import org.apache.pulsar.broker.service.BrokerServiceException.TopicTerminatedEx
 import org.apache.pulsar.broker.service.Topic.PublishContext;
 import org.apache.pulsar.broker.service.nonpersistent.NonPersistentTopic;
 import org.apache.pulsar.broker.service.persistent.PersistentTopic;
+import org.apache.pulsar.broker.storage.nereus.v2.NereusPulsarActiveFence.ValidWord;
 import org.apache.pulsar.client.api.transaction.TxnID;
 import org.apache.pulsar.common.api.proto.CommandTopicMigrated.ResourceType;
 import org.apache.pulsar.common.api.proto.MessageMetadata;
@@ -412,6 +413,17 @@ public class Producer {
         private long originalHighestSequenceId;
 
         private long entryTimestamp;
+        private ValidWord storageAuthorityWord;
+
+        @Override
+        public void setStorageAuthorityWord(ValidWord word) {
+            this.storageAuthorityWord = word;
+        }
+
+        @Override
+        public ValidWord getStorageAuthorityWord() {
+            return storageAuthorityWord;
+        }
 
         @Override
         public long getLedgerId() {
@@ -556,6 +568,17 @@ public class Producer {
          */
         @Override
         public void run() {
+            if (producer.topic instanceof PersistentTopic persistent
+                    && persistent.usesNativeStorage()
+                    && !persistent.isCurrentStorageAuthority(storageAuthorityWord)) {
+                producer.cnx.getCommandSender().sendSendError(producer.producerId,
+                        Math.max(highestSequenceId, sequenceId), ServerError.PersistenceError,
+                        "Native storage ownership changed before send receipt");
+                producer.cnx.completedSendOperation(producer.isNonPersistentTopic, msgSize);
+                producer.publishOperationCompleted();
+                recycle();
+                return;
+            }
             producer.log.debug()
                     .attr("sequenceId", sequenceId)
                     .log("Persisted message");
@@ -622,6 +645,7 @@ public class Producer {
                                          boolean chunked, long startTimeNs, boolean isMarker, Position position,
                                          boolean supportsReplDedupByLidAndEid) {
             MessagePublishContext callback = RECYCLER.get();
+            callback.storageAuthorityWord = null;
             callback.producer = producer;
             callback.sequenceId = sequenceId;
             callback.msgSize = msgSize;
@@ -644,6 +668,7 @@ public class Producer {
                              int batchSize, boolean chunked, long startTimeNs, boolean isMarker, Position position,
                              boolean supportsReplDedupByLidAndEid) {
             MessagePublishContext callback = RECYCLER.get();
+            callback.storageAuthorityWord = null;
             callback.producer = producer;
             callback.sequenceId = lowestSequenceId;
             callback.highestSequenceId = highestSequenceId;
