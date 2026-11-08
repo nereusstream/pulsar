@@ -31,6 +31,14 @@ import org.apache.bookkeeper.client.api.ReadHandle;
  * Optional sealed-ledger offloader contract for whole-range dual-source reads and verified BookKeeper deletion.
  */
 public interface SourceSafeLedgerOffloader extends LedgerOffloader {
+    /**
+     * The enrolled provider persists and resolves the original attempt, including a response with unknown outcome.
+     * An incomplete native offload must keep that attempt and its charged objects across retries.
+     */
+    default boolean preservesIncompleteAttempt() {
+        return false;
+    }
+
     /** Owner-serialized admission; actualCleanup remains pending through SDK, delivered buffers and callback return. */
     @FunctionalInterface
     interface NativeReadAdmission {

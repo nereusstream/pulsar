@@ -1281,6 +1281,56 @@ public class ManagedLedgerTest extends MockedBookKeeperTestCase {
     }
 
     @Test(timeOut = 20000)
+    public void testNativeCloseWaitsForAppliedRolloverAndSealsItsLateLedger() throws Exception {
+        String name = "close-native-rollover";
+        String rootPath = "/managed-ledgers/" + name;
+        var acknowledgement = new CompletableFuture<Void>();
+        var parentApplied = new CountDownLatch(1);
+        var holdNext = new AtomicBoolean();
+        FaultInjectionMetadataStore heldStore = new FaultInjectionMetadataStore(metadataStore) {
+            @Override
+            public CompletableFuture<Stat> put(String metadataPath, byte[] value, Optional<Long> expectedVersion,
+                    Set<Option> options) {
+                var stored = super.put(metadataPath, value, expectedVersion, options);
+                if (metadataPath.equals(rootPath) && holdNext.compareAndSet(true, false)) {
+                    return stored.thenCompose(stat -> {
+                        parentApplied.countDown();
+                        return acknowledgement.thenApply(ignored -> stat);
+                    });
+                }
+                return stored;
+            }
+        };
+        var localFactory = new ManagedLedgerFactoryImpl(heldStore, bkc);
+        var offloader = mock(SourceSafeLedgerOffloader.class);
+        when(offloader.isAppendable()).thenReturn(true);
+        var config = new ManagedLedgerConfig().setMaxEntriesPerLedger(1).setLedgerOffloader(offloader);
+        config.setMinimumRolloverTime(0, TimeUnit.SECONDS);
+        var ledger = (ManagedLedgerImpl) localFactory.open(name, config);
+        try {
+            holdNext.set(true);
+            Position first = ledger.addEntry("first".getBytes(UTF_8));
+            assertThat(parentApplied.await(5, TimeUnit.SECONDS)).isTrue();
+            var bytes = metadataStore.get(rootPath).get(5, TimeUnit.SECONDS).orElseThrow().getValue();
+            var directory = ((MetaStoreImpl) localFactory.getMetaStore()).parseManagedLedgerInfo(bytes);
+            assertThat(directory.getLedgerInfosCount()).isEqualTo(2);
+            assertThat(directory.getLedgerInfoAt(0).getLedgerId()).isEqualTo(first.getLedgerId());
+            long originalRollover = directory.getLedgerInfoAt(1).getLedgerId();
+
+            var closing = new Futures.CloseFuture();
+            ledger.asyncClose(closing, null);
+            assertThatThrownBy(() -> closing.get(1, TimeUnit.SECONDS)).isInstanceOf(TimeoutException.class);
+            acknowledgement.complete(null);
+            closing.get(5, TimeUnit.SECONDS);
+
+            assertThat(bkc.getLedgerMap().get(originalRollover).getLedgerMetadata().isClosed()).isTrue();
+        } finally {
+            acknowledgement.complete(null);
+            localFactory.shutdown();
+        }
+    }
+
+    @Test(timeOut = 20000)
     public void testCloseWaitsForNativeOffloadCompletion() throws Exception {
         verifyNativeOffloadClose(false, false);
     }

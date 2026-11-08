@@ -1808,8 +1808,17 @@ public class ManagedLedgerImpl implements ManagedLedger, CreateCallback {
 
     @Override
     public synchronized void createComplete(int rc, final LedgerHandle lh, Object ctx) {
-        if (STATE_UPDATER.get(this) == State.Closed) {
-            if (lh != null) {
+        completeRolloverCreate(rc, lh, ctx, null);
+    }
+
+    private synchronized void completeRolloverCreate(int rc, final LedgerHandle lh, Object ctx,
+                                                      NativeCreationOperation original) {
+        State stateAtCompletion = STATE_UPDATER.get(this);
+        if (stateAtCompletion == State.Closed || original != null && (closeStarted || stateAtCompletion.isFenced())) {
+            if (original != null) {
+                ((CompletableFuture<?>) ctx).complete(null);
+                original.closeHandle(null);
+            } else if (lh != null) {
                 log.warn().attr("rc", rc)
                         .attr("ledgerId", lh != null ? lh.getId() : -1)
                         .log("Ledger create completed after the managed ledger is closed,"
@@ -1821,7 +1830,12 @@ public class ManagedLedgerImpl implements ManagedLedger, CreateCallback {
 
         log.debug().attr("rc", rc).attr("ledgerId", lh != null ? lh.getId() : -1).log("createComplete");
 
-        if (checkAndCompleteLedgerOpTask(rc, lh, ctx)) {
+        if (original != null) {
+            if (!original.acceptRollover(lh, ctx)) {
+                original.closeHandle(null);
+                return;
+            }
+        } else if (checkAndCompleteLedgerOpTask(rc, lh, ctx)) {
             return;
         }
 
@@ -1853,19 +1867,26 @@ public class ManagedLedgerImpl implements ManagedLedger, CreateCallback {
                             State state = STATE_UPDATER.get(ManagedLedgerImpl.this);
                             if (state == State.Closed || state.isFenced()) {
                                 log.debug().log("skip ledger update after create complete ledger is closed or fenced");
-                                lh.closeAsync().exceptionally(e -> {
+                                if (original != null) {
+                                    original.closeHandle(null);
+                                } else {
+                                    lh.closeAsync().exceptionally(e -> {
                                     if (e != null) {
                                         log.error()
                                             .attr("ledgerId", lh.getId())
                                             .attr("error", e.getMessage())
                                             .log("Failed to close ledger");
                                     }
-                                    return null;
-                                });
+                                        return null;
+                                    });
+                                }
                             } else {
                                 LedgerHandle originalCurrentLedger = currentLedger;
                                 ledgers.put(lh.getId(), newLedger);
                                 currentLedger = lh;
+                                if (original != null) {
+                                    original.complete(null);
+                                }
                                 currentLedgerTimeoutTriggered = new AtomicBoolean();
                                 currentLedgerEntries = 0;
                                 currentLedgerSize = 0;
@@ -1885,15 +1906,20 @@ public class ManagedLedgerImpl implements ManagedLedger, CreateCallback {
                 public void operationFailed(MetaStoreException e) {
                     log.warn().exceptionMessage(e).log("Error updating meta data with the new list of ledgers");
                     handleBadVersion(e);
-                    mbean.startDataLedgerDeleteOp();
-                    asyncDeleteLedgerWithConcurrencyLimit(lh.getId(), (rc1, ctx1) -> {
-                        mbean.endDataLedgerDeleteOp();
-                        if (rc1 != BKException.Code.OK) {
-                            log.warn().attr("ledgerId", lh.getId())
-                                    .attr("rc", BKException.getMessage(rc1))
-                                    .log("Failed to delete ledger");
-                        }
-                    }, null);
+                    if (original != null) {
+                        // The parent response may be unknown. Retain the allocated ID and drain its original handle.
+                        original.closeHandle(null);
+                    } else {
+                        mbean.startDataLedgerDeleteOp();
+                        asyncDeleteLedgerWithConcurrencyLimit(lh.getId(), (rc1, ctx1) -> {
+                            mbean.endDataLedgerDeleteOp();
+                            if (rc1 != BKException.Code.OK) {
+                                log.warn().attr("ledgerId", lh.getId())
+                                        .attr("rc", BKException.getMessage(rc1))
+                                        .log("Failed to delete ledger");
+                            }
+                        }, null);
+                    }
                     if (e instanceof BadVersionException) {
                         synchronized (ManagedLedgerImpl.this) {
                             log.error("Failed to update ledger list. z-node version mismatch. Closing managed ledger");
@@ -6289,7 +6315,11 @@ public class ManagedLedgerImpl implements ManagedLedger, CreateCallback {
                 return;
             }
             long ledgerId = info.getLedgerId();
-            UUID uuid = UUID.randomUUID();
+            var previous = info.getOffloadContext();
+            boolean preserve = config.getLedgerOffloader() instanceof SourceSafeLedgerOffloader sourceSafe
+                    && sourceSafe.preservesIncompleteAttempt();
+            UUID uuid = preserve && previous.hasUidMsb() && previous.hasUidLsb()
+                    ? new UUID(previous.getUidMsb(), previous.getUidLsb()) : UUID.randomUUID();
             Map<String, String> extraMetadata = Map.of("ManagedLedgerName", name);
 
             String driverName = config.getLedgerOffloader().getOffloadDriverName();
@@ -6306,6 +6336,12 @@ public class ManagedLedgerImpl implements ManagedLedger, CreateCallback {
                                            scheduledExecutor, name)
                             .whenComplete((ignore2, exception) -> {
                                     if (exception != null) {
+                                        if (preserve) {
+                                            log.error().attr("ledgerId", ledgerId).attr("uuid", uuid)
+                                                    .exception(exception)
+                                                    .log("Original enrolled offload is unresolved");
+                                            return;
+                                        }
                                         Throwable e = FutureUtil.unwrapCompletionException(exception);
                                         if (e instanceof MetaStoreException) {
                                             // When a MetaStore exception happens, we can not make sure the metadata
@@ -6412,6 +6448,10 @@ public class ManagedLedgerImpl implements ManagedLedger, CreateCallback {
                 } else {
                     try {
                         LedgerInfo newInfo = transformation.transform(oldInfo);
+                        if (newInfo == oldInfo) {
+                            unlockingPromise.complete(null);
+                            return;
+                        }
                         final HashMap<Long, LedgerInfo> newLedgers = new HashMap<>(ledgers);
                         newLedgers.put(ledgerId, newInfo);
                         store.asyncUpdateLedgerIds(name, buildManagedLedgerInfo(newLedgers), ledgersStat,
@@ -6442,9 +6482,17 @@ public class ManagedLedgerImpl implements ManagedLedger, CreateCallback {
         log.info().attr("ledgerId", ledgerId).attr("uuid", uuid).log("Preparing metadata to offload ledger");
         return transformLedgerInfo(ledgerId,
                                    (oldInfo) -> {
-                                       if (oldInfo.getOffloadContext().hasUidMsb()) {
-                                           UUID oldUuid = new UUID(oldInfo.getOffloadContext().getUidMsb(),
-                                                                   oldInfo.getOffloadContext().getUidLsb());
+                                       var previous = oldInfo.getOffloadContext();
+                                       var offloader = config.getLedgerOffloader();
+                                       if (offloader instanceof SourceSafeLedgerOffloader sourceSafe
+                                               && sourceSafe.preservesIncompleteAttempt()
+                                               && (previous.hasUidMsb() || previous.hasUidLsb())) {
+                                           validateOriginalIncompleteOffload(
+                                                   oldInfo, uuid, sourceSafe, offloadDriverName, offloadDriverMetadata);
+                                           return oldInfo;
+                                       }
+                                       if (previous.hasUidMsb()) {
+                                           UUID oldUuid = new UUID(previous.getUidMsb(), previous.getUidLsb());
                                            log.info().attr("ledgerId", ledgerId)
                                                    .attr("uuid", uuid)
                                                    .log("Found previous offload attempt, cleaning up");
@@ -6497,6 +6545,24 @@ public class ManagedLedgerImpl implements ManagedLedger, CreateCallback {
                 });
     }
 
+    private static void validateOriginalIncompleteOffload(
+            LedgerInfo oldInfo, UUID expected, SourceSafeLedgerOffloader sourceSafe, String driver,
+            Map<String, String> driverMetadata) throws OffloadConflict {
+        var previous = oldInfo.getOffloadContext();
+        if (!previous.hasUidMsb() || !previous.hasUidLsb()
+                || !expected.equals(new UUID(previous.getUidMsb(), previous.getUidLsb()))
+                || previous.isComplete() || previous.isBookkeeperDeleted()
+                || !previous.hasBookkeeperRetentionClass()
+                || !previous.getBookkeeperRetentionClass().name()
+                        .equals(sourceSafe.getBookKeeperRetentionClass().name())
+                || !previous.hasBookkeeperDeleteState()
+                || previous.getBookkeeperDeleteState() != BookKeeperDeleteState.BK_DELETE_NONE
+                || !driver.equals(OffloadUtils.getOffloadDriverName(oldInfo, ""))
+                || !driverMetadata.equals(OffloadUtils.getOffloadDriverMetadata(oldInfo, Map.of()))) {
+            throw new OffloadConflict("Original enrolled offload attempt or policy differs");
+        }
+    }
+
     private CompletableFuture<Void> completeLedgerInfoForOffloaded(long ledgerId, UUID uuid) {
         log.info().attr("ledgerId", ledgerId).attr("uuid", uuid).log("Completing metadata for offload");
         return transformLedgerInfo(ledgerId,
@@ -6504,6 +6570,12 @@ public class ManagedLedgerImpl implements ManagedLedger, CreateCallback {
                                        UUID existingUuid = new UUID(oldInfo.getOffloadContext().getUidMsb(),
                                                                     oldInfo.getOffloadContext().getUidLsb());
                                        if (existingUuid.equals(uuid)) {
+                                           if (oldInfo.getOffloadContext().isComplete()
+                                                   && config.getLedgerOffloader()
+                                                   instanceof SourceSafeLedgerOffloader sourceSafe
+                                                   && sourceSafe.preservesIncompleteAttempt()) {
+                                               return oldInfo;
+                                           }
                                            LedgerInfo newInfo = new LedgerInfo();
                                            newInfo.copyFrom(oldInfo);
                                            newInfo.setOffloadContext()
@@ -7247,6 +7319,11 @@ public class ManagedLedgerImpl implements ManagedLedger, CreateCallback {
             }
         }
 
+        @SuppressWarnings("unchecked")
+        private boolean acceptRollover(LedgerHandle ledger, Object context) {
+            return ((CompletableFuture<LedgerHandle>) context).complete(ledger);
+        }
+
         private void callbackComplete() {
             // Initial data/cursor callbacks transfer their handle on this existing executor. Stay enrolled until
             // those queued callbacks have observed close, or transferred the handle to the Native owner.
@@ -7351,12 +7428,17 @@ public class ManagedLedgerImpl implements ManagedLedger, CreateCallback {
                             return;
                         }
                         try {
-                            if (ex != null) {
-                                cb.createComplete(BKException.getExceptionCode(ex), null, ledgerFutureHook);
+                            if (ex == null && cb == this) {
+                                // The actual parent write and late handle close outlive createComplete's stack.
+                                completeRolloverCreate(Code.OK, (LedgerHandle) writeHandle, ledgerFutureHook, creation);
                             } else {
-                                cb.createComplete(Code.OK, (LedgerHandle) writeHandle, ledgerFutureHook);
+                                if (ex != null) {
+                                    cb.createComplete(BKException.getExceptionCode(ex), null, ledgerFutureHook);
+                                } else {
+                                    cb.createComplete(Code.OK, (LedgerHandle) writeHandle, ledgerFutureHook);
+                                }
+                                creation.callbackComplete();
                             }
-                            creation.callbackComplete();
                         } catch (Throwable callbackFailure) {
                             if (writeHandle != null) {
                                 creation.closeHandle(callbackFailure);
