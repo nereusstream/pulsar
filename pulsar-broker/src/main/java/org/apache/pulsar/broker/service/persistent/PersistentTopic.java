@@ -1990,9 +1990,13 @@ public class PersistentTopic extends AbstractTopic implements Topic, AddEntryCal
             }
         }, null));
 
-        disconnectClientsInCurrentCall.thenRun(closeLedgerAfterCloseClients).exceptionally(exception -> {
+        disconnectClientsInCurrentCall.thenCompose(unused -> opened == null
+                        ? CompletableFuture.completedFuture(null) : opened.beforeLedgerClose().get())
+                .thenRun(closeLedgerAfterCloseClients).exceptionally(exception -> {
             log.error().exception(exception).log("Error closing topic");
-            unfenceTopicToResume();
+            if (opened == null) {
+                unfenceTopicToResume();
+            }
             closeFuture.completeExceptionally(exception);
             return null;
         });

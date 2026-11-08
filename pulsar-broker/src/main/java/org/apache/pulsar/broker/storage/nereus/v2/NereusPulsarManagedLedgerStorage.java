@@ -39,6 +39,7 @@ public interface NereusPulsarManagedLedgerStorage extends ManagedLedgerStorage {
     record OpenedLedger(
             ManagedLedger ledger,
             NereusPulsarTopicAuthority authority,
+            Supplier<? extends CompletionStage<Void>> beforeLedgerClose,
             Supplier<? extends CompletionStage<Void>> closeScope) {
     }
 

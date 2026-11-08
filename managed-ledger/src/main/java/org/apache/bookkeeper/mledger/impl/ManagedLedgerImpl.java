@@ -5825,7 +5825,6 @@ public class ManagedLedgerImpl implements ManagedLedger, CreateCallback {
         private ManagedLedgerInfo candidate;
         private LedgerInfo candidateLedger;
         private Stat predecessor;
-        private long candidateVersion;
 
         private NativeBookKeeperDeleteTransition(NativeBookKeeperSourceDeletion source, boolean done) {
             this.source = source;
@@ -5917,7 +5916,6 @@ public class ManagedLedgerImpl implements ManagedLedger, CreateCallback {
                     result.whenComplete((ignored, failure) -> metadataMutex.unlock());
                     try {
                         predecessor = ledgersStat;
-                        candidateVersion = Math.addExact(predecessor.getVersion(), 1);
                         candidateLedger = new LedgerInfo().copyFrom(ledgers.get(source.ledgerId));
                         candidateLedger.getOffloadContext().setBookkeeperDeleted(true).setBookkeeperDeleteState(
                                 done ? BookKeeperDeleteState.BK_DELETE_DONE : BookKeeperDeleteState.BK_DELETE_INTENT);
@@ -5976,9 +5974,11 @@ public class ManagedLedgerImpl implements ManagedLedger, CreateCallback {
 
         private void accept(Stat stat) throws OffloadConflict {
             synchronized (ManagedLedgerImpl.this) {
-                if (stat == null || stat.getVersion() != candidateVersion
+                // A successful CAS or an exact candidate reread supplies the actual backend version.
+                // Native metadata stores can use a namespace-wide sequence rather than a per-key increment.
+                if (stat == null || stat.getVersion() <= predecessor.getVersion()
                         || ledgersStat.getVersion() != predecessor.getVersion()
-                        && ledgersStat.getVersion() != candidateVersion) {
+                        && ledgersStat.getVersion() != stat.getVersion()) {
                     throw new OffloadConflict("Original Native BK delete CAS version changed");
                 }
                 ledgersStat = stat;
@@ -6329,12 +6329,15 @@ public class ManagedLedgerImpl implements ManagedLedger, CreateCallback {
                 .thenCompose((ignore) -> getLedgerHandle(ledgerId))
                 .thenCompose(readHandle -> config.getLedgerOffloader().offload(readHandle, uuid, extraMetadata))
                 .thenCompose((ignore) -> {
-                        return Retries.run(Backoff.exponentialJittered(TimeUnit.SECONDS.toMillis(1),
+                        // The enrolled guard owns the original versioned publication and its readback.
+                        // Starting another native mutation here would create a second reference operation.
+                        var publication = preserve ? completeLedgerInfoForOffloaded(ledgerId, uuid)
+                                : Retries.run(Backoff.exponentialJittered(TimeUnit.SECONDS.toMillis(1),
                                                                        TimeUnit.HOURS.toMillis(1)).limit(10),
                                            FAIL_ON_CONFLICT,
                                            () -> completeLedgerInfoForOffloaded(ledgerId, uuid),
-                                           scheduledExecutor, name)
-                            .whenComplete((ignore2, exception) -> {
+                                           scheduledExecutor, name);
+                        return publication.whenComplete((ignore2, exception) -> {
                                     if (exception != null) {
                                         if (preserve) {
                                             log.error().attr("ledgerId", ledgerId).attr("uuid", uuid)

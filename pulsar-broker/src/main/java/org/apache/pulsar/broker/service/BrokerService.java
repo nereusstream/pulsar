@@ -2216,22 +2216,26 @@ public class BrokerService implements Closeable {
             CompletableFuture<Void> terminal) {
         var authority = opened.authority();
         authority.stop();
-        opened.ledger().asyncClose(new CloseCallback() {
-            @Override
-            public void closeComplete(Object ctx) {
-                try {
-                    authority.closeAsync().thenCompose(unused -> opened.closeScope().get())
-                            .whenComplete((unused, error) -> settleNativeOpen(terminal, error));
-                } catch (Exception error) {
-                    settleNativeOpen(terminal, error);
-                }
-            }
+        CompletableFuture.<Void>completedFuture(null).thenCompose(unused -> opened.beforeLedgerClose().get())
+                .thenRun(() -> opened.ledger().asyncClose(new CloseCallback() {
+                    @Override
+                    public void closeComplete(Object ctx) {
+                        try {
+                            authority.closeAsync().thenCompose(unused -> opened.closeScope().get())
+                                    .whenComplete((unused, error) -> settleNativeOpen(terminal, error));
+                        } catch (Exception error) {
+                            settleNativeOpen(terminal, error);
+                        }
+                    }
 
-            @Override
-            public void closeFailed(ManagedLedgerException error, Object ctx) {
-                settleNativeOpen(terminal, error);
-            }
-        }, null);
+                    @Override
+                    public void closeFailed(ManagedLedgerException error, Object ctx) {
+                        settleNativeOpen(terminal, error);
+                    }
+                }, null)).exceptionally(error -> {
+                    settleNativeOpen(terminal, error);
+                    return null;
+                });
     }
 
     private CompletableFuture<Void> checkTopicAlreadyMigrated(TopicName topicName) {
