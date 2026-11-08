@@ -207,6 +207,7 @@ public class ManagedLedgerImpl implements ManagedLedger, CreateCallback {
     private final Map<CompletableFuture<Void>, Long> readHandleCloses = new HashMap<>();
     private final Set<CompletableFuture<Void>> offloadOperations = new HashSet<>();
     private final Set<CompletableFuture<Void>> ordinaryReadOperations = new HashSet<>();
+    private final Set<CompletableFuture<Void>> nativeAppendCallbacks = ConcurrentHashMap.newKeySet();
     private final Set<CompletableFuture<Void>> nativeCreationOperations = new HashSet<>();
     private final Futures.CloseFuture closeFuture = new Futures.CloseFuture();
     // Guarded by this monitor; fenced owners retain their Fenced state while cleanup drains.
@@ -910,7 +911,7 @@ public class ManagedLedgerImpl implements ManagedLedger, CreateCallback {
         } else if (state == State.Terminated) {
             addOperation.failed(new ManagedLedgerTerminatedException("Managed ledger was already terminated"));
             return;
-        } else if (state == State.Closed) {
+        } else if (closeStarted || state == State.Closed) {
             addOperation.failed(new ManagedLedgerAlreadyClosedException("Managed ledger was already closed"));
             return;
         } else if (state == State.WriteFailed) {
@@ -977,7 +978,7 @@ public class ManagedLedgerImpl implements ManagedLedger, CreateCallback {
         if (operation.nativeWritePermit == null) {
             operation.nativeWritePermit = authority.capture(operation.getCtx());
         }
-        if (!authority.isCurrent(operation.nativeWritePermit)) {
+        if (closeStarted || !authority.isCurrent(operation.nativeWritePermit)) {
             pendingAddEntries.remove(operation);
             operation.failed(new ManagedLedgerException("Native write authority is no longer current"));
             return false;
@@ -1721,6 +1722,36 @@ public class ManagedLedgerImpl implements ManagedLedger, CreateCallback {
         synchronized (nativeCreationOperations) {
             closeStarted = true;
         }
+        if (!nativeAppendCallbacks.isEmpty()) {
+            // An observer can be cancelled while its real BookKeeper callback still owns this ledger.
+            CompletableFuture.allOf(nativeAppendCallbacks.toArray(CompletableFuture[]::new))
+                    .thenRunAsync(this::closeAfterNativeAppends, executor)
+                    .exceptionally(failure -> {
+                        closeFuture.closeFailed(ManagedLedgerException.getManagedLedgerException(failure), null);
+                        return null;
+                    });
+        } else {
+            closeAfterNativeAppends();
+        }
+    }
+
+    CompletableFuture<Void> beginNativeAppendCallback() throws ManagedLedgerException {
+        if (config.getNativeWriteAuthority() == null) {
+            return null;
+        }
+        synchronized (this) {
+            if (closeStarted) {
+                throw new ManagedLedgerAlreadyClosedException("Managed ledger is closing");
+            }
+            var terminal = new CompletableFuture<Void>();
+            nativeAppendCallbacks.add(terminal);
+            terminal.thenRun(() -> nativeAppendCallbacks.remove(terminal));
+            return terminal;
+        }
+    }
+
+    private synchronized void closeAfterNativeAppends() {
+        State state = STATE_UPDATER.get(this);
         final ManagedLedgerException ownerFailure = state.isFenced() ? new ManagedLedgerFencedException() : null;
 
         log.info("Closing managed ledger");
@@ -2146,7 +2177,7 @@ public class ManagedLedgerImpl implements ManagedLedger, CreateCallback {
     }
 
     synchronized void createLedgerAfterClosed() {
-        if (isNeededCreateNewLedgerAfterCloseLedger()) {
+        if (!closeStarted && isNeededCreateNewLedgerAfterCloseLedger()) {
             log.info().attr("previousLedgerId", currentLedger == null ? "null" : currentLedger.getId())
                     .log("Creating a new ledger after closed");
             STATE_UPDATER.set(this, State.CreatingLedger);
@@ -4432,7 +4463,8 @@ public class ManagedLedgerImpl implements ManagedLedger, CreateCallback {
 
     private synchronized OrdinaryReadOperation admitOrdinaryRead(
             ReadEntryCallback entryCallback, ReadEntriesCallback entriesCallback) throws ManagedLedgerException {
-        if (!(config.getLedgerOffloader() instanceof SourceSafeLedgerOffloader)) {
+        if (config.getNativeWriteAuthority() == null
+                && !(config.getLedgerOffloader() instanceof SourceSafeLedgerOffloader)) {
             return null;
         }
         requireOffloadReadOwner();
