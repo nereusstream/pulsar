@@ -231,6 +231,19 @@ jobs:
     timeout-minutes: ${{ matrix.timeout || 60 }}
     needs: ['preconditions', 'build-and-license-check']
     if: ${{ needs.preconditions.outputs.docs_only != 'true' }}
+    services:
+      p6localstack:
+        image: >-
+          ${{ matrix.group == 'OTHER'
+          && 'localstack/localstack@sha256:3ebc37595918b8accb852f8048fef2aff047d465167edd655528065b07bc364a'
+          || '' }}
+        env:
+          SERVICES: s3
+        ports:
+          - 4566/tcp
+        options: >-
+          --health-cmd "curl -fsS http://127.0.0.1:4566/_localstack/health"
+          --health-interval 5s --health-timeout 3s --health-retries 12
     strategy:
       fail-fast: false
       matrix:
@@ -308,6 +321,11 @@ jobs:
           ${{ matrix.setup }}
 
       - name: Run unit test group '${{ matrix.group }}'
+        env:
+          NEREUS_P6_LOCALSTACKENDPOINT: >-
+            ${{ matrix.group == 'OTHER' && format('http://127.0.0.1:{0}', job.services.p6localstack.ports['4566']) || '' }}
+          NEREUS_P6_NATIVEEVIDENCEOUTPUT: ${{ runner.temp }}/p6-native-baseline.json
+          NEREUS_P6_PULSARSOURCECOMMIT: ${{ github.sha }}
         run: |
           ./pulsar-build/run_unit_group_gradle.sh ${{ matrix.group }}
 
