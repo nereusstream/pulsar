@@ -485,9 +485,13 @@ The Apache Software License, Version 2.0
     - dev.failsafe-failsafe-3.3.2.jar
   * Prometheus
     - io.prometheus-simpleclient_httpserver-0.16.0.jar
+  * Nereus
+    - com.nereusstream-nereus-domain-0.2.0-n1.330aaec349c51fb2ace52b1085e8a9e5a60b5e3e.jar
+    - com.nereusstream-nereus-metadata-spi-0.2.0-n1.330aaec349c51fb2ace52b1085e8a9e5a60b5e3e.jar
+    - com.nereusstream-nereus-metadata-oxia-p1-0.2.0-p1.17497c37901288d60d5d221e73f672a314371a45.jar
   * Oxia
-    - io.github.oxia-db-oxia-client-api-0.8.0.jar
-    - io.github.oxia-db-oxia-client-0.8.0.jar
+    - io.github.oxia-db-oxia-client-api-0.9.4.jar
+    - io.github.oxia-db-oxia-client-0.9.4.jar
   * OpenHFT
     - net.openhft-zero-allocation-hashing-0.16.jar
   * Java JSON WebTokens
