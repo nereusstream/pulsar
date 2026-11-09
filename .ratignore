@@ -18,6 +18,9 @@ bin/proto/MLDataFormats_pb2.py
 src/main/java/org/apache/bookkeeper/mledger/util/AbstractCASReferenceCounted.java
 # Maven build artifacts
 **/dependency-reduced-pom.xml
+# Generated Gradle module metadata and checksums in the immutable Maven repositories
+gradle/locked-artifacts/*/*/manifest.sha256
+gradle/locked-artifacts/*/*/m2/**/*.module
 # HdrHistogram output files
 **/*.hgrm
 # ProGuard/R8 rules
