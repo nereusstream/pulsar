@@ -194,7 +194,8 @@ public class P6NativeLocalStackEvidenceTest {
                         + "  \"randomP99Micros\": %d,\n"
                         + "  \"sequential1000Micros\": %d,\n"
                         + "  \"randomSamples\": 20,\n"
-                        + "  \"claimBoundary\": \"Pinned Pulsar jcloud path on LocalStack; request bytes are source-declared, not wire-observed\"\n"
+                        + "  \"claimBoundary\": \"Pinned Pulsar jcloud path on LocalStack; "
+                        + "request bytes are source-declared, not wire-observed\"\n"
                         + "}\n",
                 Instant.now(),
                 sourceCommit,
